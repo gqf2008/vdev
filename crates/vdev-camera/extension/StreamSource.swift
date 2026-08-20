@@ -33,14 +33,18 @@ final class StreamSource: NSObject, CMIOExtensionStreamSource {
     func setStreamProperties(_ streamProperties: CMIOExtensionStreamProperties) throws {}
 
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
-        delegate?.streamSourceShouldAuthorizeStartOfStream(self) ?? true
+        let ok = delegate?.streamSourceShouldAuthorizeStartOfStream(self) ?? true
+        NSLog("vdev-camera: authorizedToStartStream client=%@ -> %d", String(describing: client), ok ? 1 : 0)
+        return ok
     }
 
     func startStream() throws {
+        NSLog("vdev-camera: startStream called")
         delegate?.streamSourceDidStartStream(self)
     }
 
     func stopStream() throws {
+        NSLog("vdev-camera: stopStream called")
         delegate?.streamSourceDidStopStream(self)
     }
 }
