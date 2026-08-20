@@ -1,0 +1,59 @@
+name: VDCamera
+options:
+  bundleIdPrefix: com.vdev
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Developer ID Application"
+    DEVELOPMENT_TEAM: XFXU84HVK3
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  VDCameraExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: extension
+        excludes:
+          - "*.entitlements"
+    settings:
+      base:
+        PRODUCT_NAME: VDCameraExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.vdev.camera.host.extension
+        INFOPLIST_FILE: extension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: extension/VDCameraExtension.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: extension/RustBridge.h
+        OTHER_LDFLAGS:
+          - "$(SRCROOT)/../../target/release/libvdev_camera.a"
+
+  VDCameraHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: host
+        excludes:
+          - "*.entitlements"
+    dependencies:
+      - target: VDCameraExtension
+        embed: true
+    settings:
+      base:
+        PRODUCT_NAME: VDCameraHost
+        PRODUCT_BUNDLE_IDENTIFIER: com.vdev.camera.host
+        INFOPLIST_FILE: host/Info.plist
+        CODE_SIGN_ENTITLEMENTS: host/VDCameraHost.entitlements
+
+schemes:
+  VDCameraHost:
+    build:
+      targets:
+        VDCameraHost: all
+    run:
+      config: Release
