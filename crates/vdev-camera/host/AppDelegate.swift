@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 高度留出顶部 12pt：去掉标题栏后红绿灯悬浮在内容区左上角，28pt 足够避开
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 512))
 
-        let title = NSTextField(labelWithString: "vdev-camera")
+        let title = NSTextField(labelWithString: "VDCamera")
         title.font = .boldSystemFont(ofSize: 18)
         title.frame = NSRect(x: 24, y: 458, width: 360, height: 26)
         content.addSubview(title)
@@ -132,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window = NSWindow(contentRect: content.bounds,
                           styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
-        window.title = "vdev-camera"
+        window.title = "VDCamera"
         // 去掉标题栏：透明 + 隐藏标题，保留左上角红绿灯，可拖动窗口背景
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden

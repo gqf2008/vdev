@@ -3,7 +3,7 @@ REPO_ROOT := $(abspath ../..)
 BUILD := build/extension
 DERIVED := $(BUILD)/DerivedData
 PRODUCTS := $(DERIVED)/Build/Products/Release
-APP := $(PRODUCTS)/vdev-camera.app
+APP := $(PRODUCTS)/VDCamera.app
 EXT := $(PRODUCTS)/VDCameraExtension.systemextension
 SIGN_IDENTITY := "Developer ID Application: qingfeng gao (XFXU84HVK3)"
 TEAM_ID := XFXU84HVK3
@@ -36,7 +36,7 @@ verify: sign
 
 install: verify
 	cp -R $(APP) /Applications/
-	open /Applications/vdev-camera.app
+	open /Applications/VDCamera.app
 
 run: verify
 	open $(APP)
@@ -53,9 +53,10 @@ build-autosign: rust
 		ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
 		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) CODE_SIGN_IDENTITY="Apple Development" \
 		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+	@if [ -d /Applications/VDCamera.app ]; then mv /Applications/VDCamera.app /tmp/VDCamera.app.old.$$(date +%s); fi
 	@if [ -d /Applications/vdev-camera.app ]; then mv /Applications/vdev-camera.app /tmp/vdev-camera.app.old.$$(date +%s); fi
 	@if [ -d /Applications/VDCameraHost.app ]; then mv /Applications/VDCameraHost.app /tmp/VDCameraHost.app.old.$$(date +%s); fi
 	cp -R $(APP) /Applications/
-	chmod -R a+rX /Applications/vdev-camera.app
-	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/vdev-camera.app
+	chmod -R a+rX /Applications/VDCamera.app
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCamera.app
 	@echo "autosigned & installed"
