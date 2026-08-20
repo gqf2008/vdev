@@ -5,7 +5,7 @@
 | 设备 | 技术路线 | 状态 |
 |---|---|---|
 | 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
-| 虚拟摄像头 | CoreMediaIO DAL 插件（ObjC++ 薄壳 + Rust 帧核心） | 🚧 插件已构建，待系统级安装验证 |
+| 虚拟摄像头 | ~~CoreMediaIO DAL~~（macOS 26 不再加载）→ 待转 CMIOExtension | 🚧 已确认 DAL 弃用，下一步 CMIOExtension |
 | 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
 
 ## 为什么不用 kext / DriverKit
@@ -50,15 +50,13 @@ vdev camera frame --out /tmp/frame.ppm
 vdev hid listen --seconds 10
 ```
 
-## 虚拟摄像头安装（需要 sudo，cameracaptured 只读 /Library）
+## 虚拟摄像头：DAL 已弃用，待转 CMIOExtension
 
-```bash
-cd crates/vdev-camera/dal
-make install-system   # 构建 + 安装到 /Library/CoreMediaIO/Plug-Ins/DAL/ + 重启 cameracaptured
-```
+**实测（macOS 26.5）**：DAL 插件可构建/签名/手动加载，但 `cameracaptured` 不再加载第三方 DAL 插件
+（macOS 12.3 起弃用，13+ 由 CMIOExtension 取代）。`crates/vdev-camera/dal/` 保留作学习样本。
 
-验证：打开 QuickTime（新建影片录制）应能看到 vdev-camera；或命令行枚举：
-`swift -e 'import AVFoundation; for d in AVCaptureDevice.devices(for: .video) { print(d.localizedName) }'`
+现代路线：**CMIOExtension（Camera Extension）**——Swift/ObjC 系统扩展 + Rust 核心（C ABI）。
+见 `docs/RESEARCH.md`。
 
 ## 权限说明
 
