@@ -273,7 +273,13 @@ func opt(_ name: String, default d: Int) -> Int {
     return d
 }
 func optDisplay() -> CGDirectDisplayID? {
-    if let i = args.firstIndex(of: "--display"), i + 1 < args.count, let v = UInt32(args[i + 1]) { return v }
+    if let i = args.firstIndex(of: "--display"), i + 1 < args.count {
+        let raw = args[i + 1]
+        if let v = UInt32(raw) { return v }
+        if raw.lowercased().hasPrefix("0x"), let v = UInt32(raw.dropFirst(2), radix: 16) { return v }
+        eprint("无法解析显示器 ID: \(raw)（支持十进制或 0x 十六进制）")
+        exit(1)
+    }
     return nil
 }
 
