@@ -7,6 +7,7 @@ import AVFoundation
 private enum CameraState {
     case idle          // 未安装
     case activating    // 正在安装/校验中
+    case verifying     // 安装/卸载请求完成，正在确认系统状态
     case awaitingApproval // 等待用户在系统设置批准
     case enabled       // 已安装且系统可见
     case uninstalling  // 正在卸载
@@ -172,6 +173,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quicktimeButton.isHidden = true
             installButton.isEnabled = false
             uninstallButton.isEnabled = false
+        case .verifying:
+            statusGlyph.stringValue = "⏳"
+            statusGlyph.textColor = .systemOrange
+            statusTitle.stringValue = "正在确认…"
+            statusDetail.stringValue = "请求已完成，正在确认系统是否能看到 vdev-camera，最长约 15 秒。"
+            settingsButton.isHidden = true
+            quicktimeButton.isHidden = true
+            installButton.isEnabled = false
+            uninstallButton.isEnabled = false
         case .awaitingApproval:
             statusGlyph.stringValue = "⚠️"
             statusGlyph.textColor = .systemOrange
@@ -279,12 +289,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || avCameraNames().contains { $0.localizedCaseInsensitiveContains("vdev-camera") }
     }
 
-    /// 轮询等待摄像头出现/消失（最多约 4 秒）
+    /// 轮询等待摄像头出现/消失（最多约 15 秒；重启用后 cmiod 注册可能较慢）
     private func waitForCamera(present: Bool, completion: @escaping (Bool) -> Void) {
         var tries = 0
         func tick() {
             tries += 1
-            if Self.cameraFound() == present || tries >= 8 {
+            if Self.cameraFound() == present || tries >= 30 {
                 completion(Self.cameraFound() == present)
                 return
             }
@@ -391,24 +401,27 @@ extension AppDelegate: OSSystemExtensionRequestDelegate {
         switch result {
         case .completed:
             if isUninstalling {
-                // 校验摄像头是否已消失
+                // 校验摄像头是否已消失（最长 15s）
                 state = .uninstalling
                 waitForCamera(present: false) { gone in
                     self.isUninstalling = false
-                    self.state = .disabled
-                    self.log(gone ? "vdev-camera 已从系统移除" : "卸载请求完成，摄像头可能稍后自动消失")
+                    if gone {
+                        self.state = .disabled
+                        self.log("vdev-camera 已从系统移除")
+                    } else {
+                        self.state = .error("卸载请求已完成，但摄像头仍在列表中。\n可点「刷新状态」重试；若仍未消失，请到 系统设置 → … → 相机扩展 手动关闭。")
+                    }
                 }
             } else {
-                // 校验系统是否真的能看到摄像头
-                state = .activating
+                // 校验系统是否真的能看到摄像头（最长 15s）
+                state = .verifying
                 waitForCamera(present: true) { ok in
                     if ok {
                         self.log("检测到 vdev-camera，安装成功")
                         self.state = .enabled
                     } else {
-                        self.log("请求完成但系统暂未检测到摄像头，可能仍需批准")
-                        self.state = .awaitingApproval
-                        self.openSettings()
+                        self.log("请求完成但 15 秒内未检测到摄像头")
+                        self.state = .error("安装请求已完成，但暂未检测到摄像头。\n请点「刷新状态」重试；若仍未出现，请到 系统设置 → 通用 → 登录项与扩展 → 扩展 → 按类别 → 相机扩展 确认 vdev-camera 已打开。")
                     }
                 }
             }
@@ -426,6 +439,11 @@ extension AppDelegate: OSSystemExtensionRequestDelegate {
         log("失败: \(error)")
         let ns = error as NSError
         let desc = error.localizedDescription
+        if ns.code == 3 {
+            state = .error("必须从 /Applications/VDCamera.app 启动本程序才能安装扩展。\n请退出当前窗口，打开 /Applications 里的 VDCamera.app 重试。")
+            log("错误：App 不在 /Applications 目录（Code=3），旧构建产物会被系统拒绝")
+            return
+        }
         if isUninstalling {
             isUninstalling = false
             if ns.code == 4 {
