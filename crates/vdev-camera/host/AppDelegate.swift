@@ -50,7 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - UI
 
     private func buildUI() {
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 500))
+        // 高度留出顶部 36pt：去掉标题栏后红绿灯会悬浮在内容区左上角
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 536))
 
         let title = NSTextField(labelWithString: "vdev-camera 宿主")
         title.font = .boldSystemFont(ofSize: 18)
@@ -129,9 +130,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         content.addSubview(scroll)
 
         window = NSWindow(contentRect: content.bounds,
-                          styleMask: [.titled, .closable, .miniaturizable],
+                          styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         window.title = "vdev-camera"
+        // 去掉标题栏：透明 + 隐藏标题，保留左上角红绿灯，可拖动窗口背景
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
         window.contentView = content
         window.center()
         window.makeKeyAndOrderFront(nil)
