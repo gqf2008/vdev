@@ -47,7 +47,8 @@ targets:
         embed: true
     settings:
       base:
-        PRODUCT_NAME: vdev-camera
+        PRODUCT_NAME: VDCamera
+        EXECUTABLE_NAME: vdev-camera
         PRODUCT_BUNDLE_IDENTIFIER: com.vdev.camera.host
         INFOPLIST_FILE: host/Info.plist
         CODE_SIGN_ENTITLEMENTS: host/vdev-camera.entitlements
