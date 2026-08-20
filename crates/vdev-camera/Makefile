@@ -53,6 +53,8 @@ build-autosign: rust
 		ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
 		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) CODE_SIGN_IDENTITY="Apple Development" \
 		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+	@if [ -d /Applications/VDCameraHost.app ]; then mv /Applications/VDCameraHost.app /tmp/VDCameraHost.app.old.$$(date +%s); fi
 	cp -R $(APP) /Applications/
 	chmod -R a+rX /Applications/VDCameraHost.app
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCameraHost.app
 	@echo "autosigned & installed"
