@@ -24,9 +24,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var uninstallButton: NSButton!
     private var settingsButton: NSButton!
     private var quicktimeButton: NSButton!
+    private var pushButton: NSButton!
     private var refreshButton: NSButton!
     private var logView: NSTextView!
     private var logs: [String] = []
+    private let pusher = ScreenPusher.shared
 
     private var state: CameraState = .idle {
         didSet { renderState() }
@@ -44,6 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         refreshStatus()
+        pusher.onStateChange = { [weak self] running, error in
+            self?.pushButton.title = running ? "停止推流" : "屏幕推流"
+            if let error {
+                self?.log(error)
+                self?.state = .error(error)
+            } else if running {
+                self?.log("屏幕推流已开始（1920x1080@60）")
+            } else {
+                self?.log("屏幕推流已停止")
+            }
+        }
         // 摄像头设备增删时自动刷新状态（不用重启 App）
         NotificationCenter.default.addObserver(
             self, selector: #selector(devicesDidChange),
@@ -127,12 +140,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 辅助按钮
         quicktimeButton = NSButton(title: "在 QuickTime 中打开", target: self, action: #selector(quicktimeTapped))
         quicktimeButton.bezelStyle = .inline
-        quicktimeButton.frame = NSRect(x: 24, y: 210, width: 180, height: 30)
+        quicktimeButton.frame = NSRect(x: 24, y: 210, width: 170, height: 30)
         content.addSubview(quicktimeButton)
+
+        pushButton = NSButton(title: "屏幕推流", target: self, action: #selector(pushTapped))
+        pushButton.bezelStyle = .inline
+        pushButton.frame = NSRect(x: 204, y: 210, width: 140, height: 30)
+        content.addSubview(pushButton)
 
         refreshButton = NSButton(title: "刷新状态", target: self, action: #selector(refreshTapped))
         refreshButton.bezelStyle = .inline
-        refreshButton.frame = NSRect(x: 214, y: 210, width: 120, height: 30)
+        refreshButton.frame = NSRect(x: 354, y: 210, width: 120, height: 30)
         content.addSubview(refreshButton)
 
         // 日志
@@ -179,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "点击「安装虚拟摄像头」，然后在系统弹出的提示中允许扩展。"
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .activating:
@@ -188,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "正在请求系统激活摄像头扩展，请稍候。"
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = false
             installButton.isEnabled = false
             uninstallButton.isEnabled = false
         case .verifying:
@@ -206,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "已为你打开「系统设置」。请进入：通用 → 登录项与扩展 → 扩展 → 按类别 → 相机扩展，打开 vdev-camera 的开关。\n没有看到入口？点下方「打开系统设置」重试。"
             settingsButton.isHidden = false
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = true
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .enabled:
@@ -215,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "系统已能看到 vdev-camera。打开 QuickTime → 新建影片录制 → 选择 vdev-camera，即可看到 Rust 生成的测试画面。"
             settingsButton.isHidden = false
             quicktimeButton.isHidden = false
+            pushButton.isEnabled = true
             installButton.isEnabled = false
             uninstallButton.isEnabled = true
         case .uninstalling:
@@ -224,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "正在从系统移除摄像头扩展，请稍候。"
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = false
             installButton.isEnabled = false
             uninstallButton.isEnabled = false
         case .disabled:
@@ -233,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = "vdev-camera 已从系统移除。"
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .error(let message):
@@ -242,6 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusDetail.stringValue = message
             settingsButton.isHidden = false
             quicktimeButton.isHidden = true
+            pushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = true
         }
@@ -343,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func uninstallTapped() {
+        if pusher.isRunning { pusher.stop() }
         guard let identifier = Self.extensionBundle()?.bundleIdentifier else {
             state = .error("找不到扩展 bundle，请重新安装 App。")
             log("错误：找不到扩展 bundle")
@@ -369,6 +395,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             log("打开 QuickTime 失败")
         }
+    }
+
+    @objc private func pushTapped() {
+        guard case .enabled = state else {
+            log("请先安装虚拟摄像头再推流")
+            return
+        }
+        pusher.toggle()
     }
 
     @objc private func refreshTapped() {
