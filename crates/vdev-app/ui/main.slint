@@ -1,6 +1,6 @@
 // VDCamera — vdev 摄像头宿主（Rust + Slint + slint-pixel）
-import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme, PixelScrollPanel } from "@slint_pixel";
-import { TextEdit } from "std-widgets.slint";
+import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme } from "@slint_pixel";
+import { ScrollView } from "std-widgets.slint";
 
 export global AppState {
     in-out property <string> status_glyph: "○";
@@ -21,9 +21,9 @@ export component MainWindow inherits Window {
     title: "VDCamera";
     no-frame: true;
     preferred-width: 580px;
-    preferred-height: 532px;
+    preferred-height: 580px;
     min-width: 580px;
-    min-height: 532px;
+    min-height: 580px;
     background: PixelTheme.bg;
 
     callback install();
@@ -85,11 +85,12 @@ export component MainWindow inherits Window {
             PixelButton { text: AppState.vd_push_btn_text; enabled: AppState.can_vd_push; clicked => { vd_push(); } }
         }
 
-        PixelScrollPanel {
-            TextEdit {
+        ScrollView {
+            height: 150px;
+            Text {
                 text: AppState.log_text;
-                read-only: true;
                 font-size: 11px;
+                wrap: word-wrap;
             }
         }
     }

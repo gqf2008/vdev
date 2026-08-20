@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use block2::RcBlock;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type OnFrame = Box<dyn FnMut(Vec<u8>, u32, u32, u32) + Send>;
 
@@ -27,6 +27,7 @@ unsafe impl Send for CFRunLoopSourceRef {}
 
 const KCV_PIXEL_FORMAT_BGRA: i32 = 0x42475241; // 'BGRA'
 const KCG_FRAME_COMPLETE: i32 = 0;
+const KCG_FRAME_IDLE: i32 = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -100,14 +101,33 @@ pub fn start(display_id: u32, on_frame: OnFrame) -> Result<()> {
         return Err(anyhow!("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制"));
     }
 
+    // 保存最后一帧：静止画面 CGDisplayStream 只回 FrameIdle（无 surface），
+    // 需要重发最后一帧避免摄像头回落到彩条
+    let last: Arc<Mutex<Option<(Vec<u8>, u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+    let last_idle: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
+    let last_cb = last.clone();
+    let idle_cb = last_idle.clone();
     let handler = RcBlock::new(move |status: i32, _t: u64, surface: *const c_void, _u: *const c_void| {
         if status == KCG_FRAME_COMPLETE && !surface.is_null() {
             if let Some((buf, w, h, stride)) = copy_surface(surface) {
-                // 统一缩放到摄像头主格式 1920x1080
                 let scaled = crate::vimage::scale_bgra(&buf, w as usize, h as usize, stride as usize, 1920, 1080)
                     .unwrap_or((buf, stride as usize));
+                let frame = (scaled.0, 1920u32, 1080u32, scaled.1 as u32);
                 if let Some(cb) = CB.get_or_init(|| Mutex::new(None)).lock().unwrap().as_mut() {
-                    cb(scaled.0, 1920, 1080, scaled.1 as u32);
+                    cb(frame.0.clone(), frame.1, frame.2, frame.3);
+                }
+                *last_cb.lock().unwrap() = Some(frame);
+                *idle_cb.lock().unwrap() = std::time::Instant::now();
+            }
+        } else if status == KCG_FRAME_IDLE {
+            // 静止帧：每 0.5s 重发一次最后一帧，保持摄像头画面
+            if let Some(frame) = last_cb.lock().unwrap().clone() {
+                let mut last_send = idle_cb.lock().unwrap();
+                if last_send.elapsed() >= std::time::Duration::from_millis(500) {
+                    if let Some(cb) = CB.get_or_init(|| Mutex::new(None)).lock().unwrap().as_mut() {
+                        cb(frame.0.clone(), frame.1, frame.2, frame.3);
+                    }
+                    *last_send = std::time::Instant::now();
                 }
             }
         }
