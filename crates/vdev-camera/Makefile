@@ -13,7 +13,7 @@ TEAM_ID := XFXU84HVK3
 all: verify
 
 rust:
-	cd $(REPO_ROOT) && cargo build -p vdev-camera --release
+	cd $(REPO_ROOT) && cargo build -p vdev-camera -p vdev-host --release
 
 project: rust
 	xcodegen generate

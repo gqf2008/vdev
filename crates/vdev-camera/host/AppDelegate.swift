@@ -25,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsButton: NSButton!
     private var quicktimeButton: NSButton!
     private var pushButton: NSButton!
+    private var videoPushButton: NSButton!
+    private var vdCreateButton: NSButton!
+    private var vdPushButton: NSButton!
     private var refreshButton: NSButton!
     private var logView: NSTextView!
     private var logs: [String] = []
@@ -52,10 +55,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.log(error)
                 self?.state = .error(error)
             } else if running {
-                self?.log("屏幕推流已开始（1920x1080@60）")
+                self?.log("屏幕推流已开始（1080p@30）")
             } else {
                 self?.log("屏幕推流已停止")
             }
+        }
+        VideoPusher.shared.onStateChange = { [weak self] running, error in
+            self?.videoPushButton.title = running ? "停止视频推流" : "视频推流"
+            if let error {
+                self?.log(error)
+                if !(error == "视频推流结束") { self?.state = .error(error) }
+            } else if running {
+                self?.log("视频推流已开始")
+            } else {
+                self?.log("视频推流已停止")
+            }
+        }
+        VirtualDisplayManager.shared.onStateChange = { [weak self] running, info, id in
+            self?.vdCreateButton.title = running ? "销毁虚拟屏幕" : "创建虚拟屏幕"
+            if let info { self?.log(info) }
+            self?.vdPushButton.isEnabled = (id != nil)
         }
         // 摄像头设备增删时自动刷新状态（不用重启 App）
         NotificationCenter.default.addObserver(
@@ -77,6 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        ScreenPusher.shared.stop()
+        VideoPusher.shared.stop()
+        VirtualDisplayManager.shared.destroy()
+    }
 
     // MARK: - UI
 
@@ -153,8 +178,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.frame = NSRect(x: 354, y: 210, width: 120, height: 30)
         content.addSubview(refreshButton)
 
+        // 推流/虚拟屏幕控制行
+        videoPushButton = NSButton(title: "视频推流", target: self, action: #selector(videoPushTapped))
+        videoPushButton.bezelStyle = .inline
+        videoPushButton.frame = NSRect(x: 24, y: 174, width: 160, height: 30)
+        content.addSubview(videoPushButton)
+
+        vdCreateButton = NSButton(title: "创建虚拟屏幕", target: self, action: #selector(vdCreateTapped))
+        vdCreateButton.bezelStyle = .inline
+        vdCreateButton.frame = NSRect(x: 194, y: 174, width: 150, height: 30)
+        content.addSubview(vdCreateButton)
+
+        vdPushButton = NSButton(title: "推虚拟屏幕", target: self, action: #selector(vdPushTapped))
+        vdPushButton.bezelStyle = .inline
+        vdPushButton.frame = NSRect(x: 354, y: 174, width: 170, height: 30)
+        content.addSubview(vdPushButton)
+
         // 日志
-        let scroll = NSScrollView(frame: NSRect(x: 24, y: 16, width: 532, height: 180))
+        let scroll = NSScrollView(frame: NSRect(x: 24, y: 16, width: 532, height: 150))
         logView = NSTextView(frame: scroll.bounds)
         logView.isEditable = false
         logView.isRichText = false
@@ -198,6 +239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
             pushButton.isEnabled = false
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .activating:
@@ -208,6 +251,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
             pushButton.isEnabled = false
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = false
             uninstallButton.isEnabled = false
         case .verifying:
@@ -227,6 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = false
             quicktimeButton.isHidden = true
             pushButton.isEnabled = true
+            videoPushButton.isEnabled = true
+            vdPushButton.isEnabled = (VirtualDisplayManager.shared.displayID != nil)
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .enabled:
@@ -237,6 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = false
             quicktimeButton.isHidden = false
             pushButton.isEnabled = true
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = false
             uninstallButton.isEnabled = true
         case .uninstalling:
@@ -247,6 +296,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
             pushButton.isEnabled = false
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = false
             uninstallButton.isEnabled = false
         case .disabled:
@@ -257,6 +308,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = true
             quicktimeButton.isHidden = true
             pushButton.isEnabled = false
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = false
         case .error(let message):
@@ -267,6 +320,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsButton.isHidden = false
             quicktimeButton.isHidden = true
             pushButton.isEnabled = false
+            videoPushButton.isEnabled = false
+            vdPushButton.isEnabled = false
             installButton.isEnabled = true
             uninstallButton.isEnabled = true
         }
@@ -397,12 +452,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func videoPushTapped() {
+        if VideoPusher.shared.isRunning {
+            VideoPusher.shared.stop()
+            return
+        }
+        guard case .enabled = state else {
+            log("请先安装虚拟摄像头再推流")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.allowedFileTypes = ["mp4", "mov", "m4v", "mkv"]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .OK, let url = panel.url else { return }
+            self?.log("视频推流: \(url.lastPathComponent)")
+            VideoPusher.shared.start(url: url)
+        }
+    }
+
+    @objc private func vdCreateTapped() {
+        if VirtualDisplayManager.shared.isRunning {
+            VirtualDisplayManager.shared.destroy()
+            return
+        }
+        VirtualDisplayManager.shared.create()
+    }
+
+    @objc private func vdPushTapped() {
+        guard let id = VirtualDisplayManager.shared.displayID else {
+            log("请先创建虚拟屏幕")
+            return
+        }
+        if ScreenPusher.shared.isRunning {
+            ScreenPusher.shared.stop()
+            return
+        }
+        guard case .enabled = state else {
+            log("请先安装虚拟摄像头再推流")
+            return
+        }
+        pusher.start(displayID: id)
+    }
+
     @objc private func pushTapped() {
         guard case .enabled = state else {
             log("请先安装虚拟摄像头再推流")
             return
         }
-        pusher.toggle()
+        if pusher.isRunning {
+            pusher.stop()
+        } else {
+            pusher.start()
+        }
     }
 
     @objc private func refreshTapped() {
