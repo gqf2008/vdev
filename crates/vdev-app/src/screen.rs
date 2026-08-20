@@ -165,6 +165,7 @@ pub fn main_display_id() -> u32 {
     unsafe { CGMainDisplayID() }
 }
 
+#[allow(dead_code)]
 pub fn is_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }

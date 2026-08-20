@@ -1,6 +1,7 @@
 //! 摄像头检测：AVFoundation（沙盒内可枚举设备）。
 use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeVideo};
 
+#[allow(deprecated)]
 pub fn camera_names() -> Vec<String> {
     unsafe {
         let devices = AVCaptureDevice::devicesWithMediaType(AVMediaTypeVideo.unwrap());
