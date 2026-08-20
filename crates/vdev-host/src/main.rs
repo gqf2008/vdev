@@ -55,6 +55,11 @@ enum HidCmd {
     },
     /// 滚轮滚动（正数向上）
     Scroll { delta_y: i32 },
+    /// 监听键盘/鼠标事件（需要辅助功能权限）
+    Listen {
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,6 +155,9 @@ fn run_hid(cmd: HidCmd) -> Result<()> {
         HidCmd::Scroll { delta_y } => {
             vdev_hid::scroll(delta_y)?;
             println!("scrolled {delta_y} lines");
+        }
+        HidCmd::Listen { seconds } => {
+            vdev_hid::listen(seconds)?;
         }
     }
     Ok(())
