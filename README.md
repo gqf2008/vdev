@@ -54,6 +54,19 @@ vdev hid listen --seconds 10
 
 **实测结论（macOS 26.5）**：DAL 插件已被系统停载（12.3 弃用），现代路线是 CMIOExtension。
 
+### 已知注意事项（开发/排障）
+
+- **扩展版本铁律**：扩展代码不变就**不要升扩展版本号**。升级宿主 App 不影响扩展；
+  升扩展会触发 macOS launchd 替换竞态（`Submit job failed: Operation already in progress`，
+  扩展显示已启用但进程不启动、摄像头消失），并通常需要重新批准一次。
+- **已内置自动修复**：激活完成但 15s 内摄像头未出现时，App 自动「停用→重新启用→轮询」；
+  需要批准会自动打开系统设置。也可 CLI 触发：`/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-recover`。
+- **同屏只能有一个虚拟屏**：CLI `vdev screen create` 与 App 互斥，占用时创建会失败（日志有提示）。
+- **崩溃排查**：App 回调全部 `catch_unwind`，panic 会落盘 `/tmp/vdev-panic.log`；崩溃报告在
+  `~/Library/Logs/DiagnosticReports/vdev-camera-*.ips`。
+- **旧版本残留**：多次迭代留下的僵尸扩展 `[terminated waiting to uninstall on reboot]` 无害，
+  重启一次自动清理。
+
 ### 使用步骤（普通用户）
 
 1. 打开 `/Applications/VDCamera.app`，点「**安装虚拟摄像头**」。
