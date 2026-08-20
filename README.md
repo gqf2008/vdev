@@ -4,9 +4,9 @@
 
 | 设备 | 技术路线 | 状态 |
 |---|---|---|
-| 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | 🚧 开发中 |
-| 虚拟摄像头 | CoreMediaIO DAL 插件（ObjC++ 薄壳 + Rust 帧核心） | 🚧 设计/骨架 |
-| 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | 🚧 开发中 |
+| 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
+| 虚拟摄像头 | CoreMediaIO DAL 插件（ObjC++ 薄壳 + Rust 帧核心） | 🚧 插件已构建，待系统级安装验证 |
+| 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
 
 ## 为什么不用 kext / DriverKit
 
@@ -45,7 +45,20 @@ vdev screen create --width 1920 --height 1080 --name vdev-demo
 
 # 虚拟摄像头（先出帧核心）
 vdev camera frame --out /tmp/frame.ppm
+
+# 监听键盘/鼠标（需要辅助功能权限）
+vdev hid listen --seconds 10
 ```
+
+## 虚拟摄像头安装（需要 sudo，cameracaptured 只读 /Library）
+
+```bash
+cd crates/vdev-camera/dal
+make install-system   # 构建 + 安装到 /Library/CoreMediaIO/Plug-Ins/DAL/ + 重启 cameracaptured
+```
+
+验证：打开 QuickTime（新建影片录制）应能看到 vdev-camera；或命令行枚举：
+`swift -e 'import AVFoundation; for d in AVCaptureDevice.devices(for: .video) { print(d.localizedName) }'`
 
 ## 权限说明
 

@@ -2,3 +2,5 @@
 .DS_Store
 *.plugin
 crates/vdev-camera/dal/build/
+
+._*

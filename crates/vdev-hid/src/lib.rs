@@ -5,7 +5,10 @@
 pub mod keycodes;
 
 use anyhow::{anyhow, Result};
-use cgevents::{KeyEvent, ModifierFlags, MouseEvent, Point, ScrollEvent, TapLocation};
+use cgevents::{
+    CGEventType, EventTap, KeyEvent, ModifierFlags, MouseEvent, Point, ScrollEvent, TapAction,
+    TapLocation,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -74,6 +77,62 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 /// 滚轮：delta_y 为正向上滚（行单位）。
 pub fn scroll(delta_y: i32) -> Result<()> {
     ScrollEvent::lines(delta_y).post(LOCATION).map_err(err)
+}
+
+/// 监听键盘/鼠标事件（需要「辅助功能」权限），持续 `seconds` 秒。
+pub fn listen(seconds: u64) -> Result<()> {
+    if !EventTap::preflight_listen_access() {
+        let _ = EventTap::request_listen_access();
+        eprintln!(
+            "需要「辅助功能」权限：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选当前终端，然后重试。"
+        );
+        return Ok(());
+    }
+
+    let tap = EventTap::new(
+        TapLocation::Session,
+        cgevents::CG_EVENT_MASK_FOR_ALL_EVENTS,
+        |ev| {
+            let ty = ev.event_type_typed();
+            match ty {
+                Some(
+                    CGEventType::KeyDown
+                    | CGEventType::KeyUp
+                    | CGEventType::FlagsChanged,
+                ) => {
+                    println!(
+                        "[key] {ty:?} code=0x{:02x} flags={:?}",
+                        ev.keycode(),
+                        ev.flags()
+                    );
+                }
+                Some(
+                    CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDown
+                    | CGEventType::LeftMouseUp
+                    | CGEventType::RightMouseDown
+                    | CGEventType::RightMouseUp
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged,
+                ) => {
+                    let p = ev.location();
+                    println!("[mouse] {ty:?} at=({:.0},{:.0})", p.x, p.y);
+                }
+                Some(CGEventType::ScrollWheel) => {
+                    println!("[scroll]");
+                }
+                _ => {}
+            }
+            TapAction::Pass
+        },
+    )
+    .map_err(err)?;
+
+    println!("监听 HID 事件中（{seconds}s 后自动退出，Ctrl-C 可提前结束）…");
+    std::thread::spawn(move || tap.run());
+    std::thread::sleep(Duration::from_secs(seconds));
+    println!("超时，退出");
+    std::process::exit(0);
 }
 
 /// 把修饰键名字符串列表解析成 `ModifierFlags`。
