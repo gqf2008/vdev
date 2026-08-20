@@ -4,3 +4,5 @@
 crates/vdev-camera/dal/build/
 
 ._*
+crates/vdev-camera/VDCamera.xcodeproj
+crates/vdev-camera/build/
