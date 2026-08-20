@@ -22,7 +22,7 @@
 ```
 crates/
   vdev-hid/     虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动
-  vdev-camera/  虚拟摄像头：Rust 帧生成核心 + DAL 插件薄壳（dal/）
+  vdev-camera/  虚拟摄像头：Rust 帧生成核心 + CMIOExtension Swift 薄壳（extension/）
   vdev-screen/  虚拟屏幕：CGVirtualDisplay 私有 API 封装
   vdev-host/    宿主进程 / 统一命令行入口（二进制名 vdev）
 docs/RESEARCH.md  三条技术路线的调研笔记与参考项目
@@ -149,7 +149,8 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
   `provider.addDevice`（否则零流设备、能枚举但 0 帧）；`legacyDeviceID` 填 UUID 字符串。
 - 详见 `docs/RESEARCH.md` 与 `~/.agents/rules/LESSON_CMIOExtension虚拟摄像头激活与出帧的连环坑.md`。
 
-`crates/vdev-camera/dal/` 的旧 DAL 插件保留作学习样本。
+历史遗留已清理：旧 DAL 插件（`dal/`，macOS 12.3 弃用）与旧 Swift 宿主（`host/`）已删除；
+构建只走 `crates/vdev-camera/extension/`（Swift 薄壳）+ Rust 宿主。
 
 ## 权限说明
 

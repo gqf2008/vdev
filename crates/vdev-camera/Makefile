@@ -1,65 +1,12 @@
-# vdev-camera CMIOExtension 构建：Rust 核心 → xcodegen → xcodebuild(不签名) → 手动 Developer ID 签名
+# vdev-camera CMIOExtension 构建：Rust 核心 → xcodegen → xcodebuild(自动签名) → 组装 Rust 宿主 App
 REPO_ROOT := $(abspath ../..)
 BUILD := build/extension
 DERIVED := $(BUILD)/DerivedData
-PRODUCTS := $(DERIVED)/Build/Products/Release
-APP := $(PRODUCTS)/VDCamera.app
-EXT := $(PRODUCTS)/VDCameraExtension.systemextension
-SIGN_IDENTITY := "Developer ID Application: qingfeng gao (XFXU84HVK3)"
 TEAM_ID := XFXU84HVK3
 
-.PHONY: all rust project build sign verify install run clean
+.PHONY: all build-rust install-rust test clean
 
-all: verify
-
-rust:
-	cd $(REPO_ROOT) && cargo build -p vdev-camera -p vdev-host --release
-
-project: rust
-	xcodegen generate
-
-build: project
-	xcodebuild -project VDCamera.xcodeproj -scheme vdev-camera -configuration Release \
-		-derivedDataPath $(DERIVED) \
-		CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build
-
-sign: build
-	mkdir -p $(BUILD)
-	sed 's/\$$(TeamIdentifierPrefix)/$(TEAM_ID)./g' extension/VDCameraExtension.entitlements > $(BUILD)/ext.entitlements
-	codesign --force --sign $(SIGN_IDENTITY) --entitlements $(BUILD)/ext.entitlements $(EXT)
-	codesign --force --sign $(SIGN_IDENTITY) --entitlements host/vdev-camera.entitlements $(APP)
-
-verify: sign
-	codesign --verify --deep --strict $(APP)
-	codesign --verify --strict $(EXT)
-	@echo "OK: signed & verified"
-
-install: verify
-	cp -R $(APP) /Applications/
-	open /Applications/VDCamera.app
-
-run: verify
-	open $(APP)
-
-clean:
-	rm -rf $(BUILD) VDCamera.xcodeproj
-
-# 自动签名（需要：Xcode 已登录 Apple 开发者账号，团队有 System Extension capability）
-# 用法：make build-autosign
-build-autosign: rust
-	xcodegen generate
-	xcodebuild -project VDCamera.xcodeproj -scheme vdev-camera -configuration Release \
-		-derivedDataPath $(BUILD)/DerivedData \
-		ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
-		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) CODE_SIGN_IDENTITY="Apple Development" \
-		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
-	@if [ -d /Applications/VDCamera.app ]; then mv /Applications/VDCamera.app /tmp/VDCamera.app.old.$$(date +%s); fi
-	@if [ -d /Applications/vdev-camera.app ]; then mv /Applications/vdev-camera.app /tmp/vdev-camera.app.old.$$(date +%s); fi
-	@if [ -d /Applications/VDCameraHost.app ]; then mv /Applications/VDCameraHost.app /tmp/VDCameraHost.app.old.$$(date +%s); fi
-	cp -R $(APP) /Applications/
-	chmod -R a+rX /Applications/VDCamera.app
-	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCamera.app
-	@echo "autosigned & installed"
+all: install-rust
 
 # ============ Rust + Slint 宿主 App（推荐）============
 # 构建：cargo 编 vdev-app → xcodebuild 编扩展 → 手工组装 VDCamera.app → 签名
@@ -67,8 +14,6 @@ RUST_APP_BIN := $(REPO_ROOT)/target/release/vdev-app
 RUST_EXT := $(DERIVED)/Build/Products/Release/com.vdev.camera.host.extension.systemextension
 ASSEMBLE := $(BUILD)/VDCamera.app
 SIGN_APP_IDENTITY := "Apple Development: qingfeng gao (7L8FV63FAP)"
-
-.PHONY: build-rust install-rust
 
 build-rust:
 	cd $(REPO_ROOT) && cargo build -p vdev-app --release
@@ -105,7 +50,6 @@ install-rust: build-rust
 
 # ============ 一键验证（make test）============
 # 视频自测需未沙盒 dev 二进制读任意文件；其余用安装版（含沙盒）
-.PHONY: test
 test: build-rust
 	@echo "== UI 接线（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --ui-selftest 2>&1 | grep ui-selftest
 	@echo "== 屏幕推流（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-screen --dur 3 2>&1 | tail -1
@@ -113,3 +57,6 @@ test: build-rust
 		$(REPO_ROOT)/target/release/vdev-app --selftest-video --file "$${VDEV_TEST_VIDEO:-/tmp/nonexistent.mp4}" --dur 3 2>&1 | tail -1
 	@echo "== sysext（安装版，须在 /Applications）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-sysext 2>&1 | tail -1
 	@echo "测试完成（视频 0 帧 = 没设 VDEV_TEST_VIDEO 或路径不在沙盒可读范围，UI 走 NSOpenPanel 不受限）"
+
+clean:
+	rm -rf $(BUILD) VDCamera.xcodeproj
