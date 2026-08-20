@@ -553,7 +553,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stop_current_push(&ui, &logs);
                 return;
             }
-            let Some(path) = video::pick_video_url() else { return };
+            append_log(&ui, &logs, "正在打开文件选择器…");
+            let Some(path) = video::pick_video_url() else {
+                append_log(&ui, &logs, "未选择视频（已取消）");
+                return;
+            };
+            append_log(&ui, &logs, format!("已选择: {}", path));
             stop_current_push(&ui, &logs);
             *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PushMode::Video);
             VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
