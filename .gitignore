@@ -1,7 +1,6 @@
 /target
 .DS_Store
 *.plugin
-crates/vdev-camera/dal/build/
 
 ._*
 crates/vdev-camera/VDCamera.xcodeproj

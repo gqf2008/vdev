@@ -19,7 +19,7 @@
   `cameracaptured` 在 macOS 26 上**完全不加载**第三方 DAL 插件（AVFoundation / CMIO 枚举均不可见）。
 - **根因**：macOS 12.3 弃用 DAL，13+ 由 **CMIOExtension（Camera Extension）** 取代；OBS 虚拟摄像头在 macOS 13+
   已切换（obsproject/obs-studio#7777）。签名、权限、UUID 均不是问题。
-- 结论：**不要再投入 DAL**。代码保留在 `crates/vdev-camera/dal/` 作为学习样本。
+- 结论：**不要再投入 DAL**。旧 DAL 插件代码（`crates/vdev-camera/dal/`）已于 2026-08-21 清理删除，调研结论见上。
 
 ### CMIOExtension（现代路线）
 
