@@ -50,8 +50,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - UI
 
     private func buildUI() {
-        // 高度留出顶部 36pt：去掉标题栏后红绿灯会悬浮在内容区左上角
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 536))
+        // 高度留出顶部 12pt：去掉标题栏后红绿灯悬浮在内容区左上角，28pt 足够避开
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 512))
 
         let title = NSTextField(labelWithString: "vdev-camera 宿主")
         title.font = .boldSystemFont(ofSize: 18)
