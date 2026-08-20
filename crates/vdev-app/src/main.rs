@@ -241,6 +241,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if n % 60 == 0 {
                             println!("selftest: 已推 {n} 帧");
                         }
+                    } else {
+                        *guard = None; // 连接断了，下一帧自动重连
                     }
                 }
             }),
@@ -248,6 +250,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_secs(dur));
         screen::stop();
         println!("selftest: 共推 {} 帧", sent.load(std::sync::atomic::Ordering::Relaxed));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--selftest-screen-vd") {
+        // 诊断：推虚拟屏（静态画面），验证 idle-hold 长时间是否仍发帧
+        let dur = args.iter().position(|a| a == "--dur")
+            .and_then(|i| args.get(i + 1)).and_then(|x| x.parse::<u64>().ok()).unwrap_or(20);
+        vscreen::destroy();
+        match vscreen::create_display() {
+            Ok(id) => {
+                println!("selftest-screen-vd: 虚拟屏 {:#x} 推 {dur}s …", id);
+                let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let sent_cb = sent.clone();
+                screen::start(id, Box::new(move |buf, w, h, stride| {
+                    let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.is_none() { *guard = frame::connect().ok(); }
+                    if let Some(c) = guard.as_mut() {
+                        if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
+                            let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if n % 60 == 0 { println!("selftest-screen-vd: 已推 {n} 帧"); }
+                        } else {
+                            *guard = None; // 连接断了，下一帧自动重连
+                        }
+                    }
+                }))?;
+                std::thread::sleep(std::time::Duration::from_secs(dur));
+                screen::stop();
+                vscreen::destroy();
+                println!("selftest-screen-vd: 共推 {} 帧", sent.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            Err(e) => println!("selftest-screen-vd: 创建虚拟屏失败: {}", e),
+        }
         return Ok(());
     }
     if args.iter().any(|a| a == "--selftest-sysext") {
@@ -318,7 +351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if guard.is_none() {
                     *guard = frame::connect().ok();
                 }
-                let send_ms = if let Some(c) = guard.as_mut() {
+                let _send_ms = if let Some(c) = guard.as_mut() {
                     let s0 = std::time::Instant::now();
                     let ok = c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok();
                     let ms = s0.elapsed().as_millis();
