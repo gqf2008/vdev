@@ -1,8 +1,7 @@
 import Cocoa
 import SystemExtensions
 
-@main
-class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var statusLabel: NSTextField!
     private var logView: NSTextView!
@@ -11,10 +10,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var logs: [String] = []
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSLog("vdev-host: willFinishLaunching")
         NSApp.setActivationPolicy(.regular)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSLog("vdev-host: didFinishLaunching")
         buildUI()
+        window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
+        NSLog("vdev-host: window shown, frame=\(window.frame)")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -61,6 +67,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = content
         window.center()
         window.makeKeyAndOrderFront(nil)
+        NSLog("vdev-host: buildUI done")
     }
 
     private func log(_ s: String) {
