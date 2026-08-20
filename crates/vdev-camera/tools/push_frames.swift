@@ -20,6 +20,13 @@ let kVersion: UInt32 = 1
 let kWidth = 1280
 let kHeight = 720
 
+func eprint(_ s: String) {
+    FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
+}
+
+// SCStream 必须全局持有，否则函数返回即释放导致采集停止
+var activeStream: SCStream?
+
 // MARK: - 帧发送器
 
 final class FrameSender: NSObject, SCStreamOutput {
@@ -48,15 +55,15 @@ final class FrameSender: NSObject, SCStreamOutput {
             c.start(queue: queue)
             if sem.wait(timeout: .now() + 2) == .timedOut || !connected {
                 c.cancel()
-                print("等待扩展就绪（127.0.0.1:\(kPort)）… 请确认已安装并激活 vdev-camera")
+                eprint("等待扩展就绪（127.0.0.1:\(kPort)）… 请确认已安装并激活 vdev-camera")
                 sleep(1)
                 continue
             }
             conn = c
-            print("已连接扩展 FrameChannel")
+            eprint("已连接扩展 FrameChannel")
             return
         }
-        print("连接失败：扩展未就绪")
+        eprint("连接失败：扩展未就绪")
         exit(1)
     }
 
@@ -69,7 +76,7 @@ final class FrameSender: NSObject, SCStreamOutput {
                 self.sent += 1
                 let now = Date()
                 if now.timeIntervalSince(self.lastLog) > 3 {
-                    print("已推 \(self.sent) 帧")
+                    eprint("已推 \(self.sent) 帧")
                     self.lastLog = now
                 }
             })
@@ -152,6 +159,7 @@ func startScreenStream(sender: FrameSender, fps: Int) async throws {
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
     try stream.addStreamOutput(sender, type: .screen, sampleHandlerQueue: DispatchQueue(label: "screen"))
     try await stream.startCapture()
+    activeStream = stream
     print("屏幕推流中（\(kWidth)x\(kHeight) @ \(fps)fps），Ctrl+C 停止")
 }
 
@@ -195,8 +203,8 @@ case "screen":
         do {
             try await startScreenStream(sender: sender, fps: fps)
         } catch {
-            print("屏幕推流失败: \(error)")
-            print("提示：需先在 系统设置 → 隐私与安全性 → 屏幕录制 中允许本终端/脚本。")
+            eprint("屏幕推流失败: \(error)")
+            eprint("提示：需先在 系统设置 → 隐私与安全性 → 屏幕录制 中允许本终端/脚本。")
             exit(1)
         }
     }
