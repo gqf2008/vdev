@@ -299,6 +299,7 @@ case "image":
 
 case "screen":
     let displayID = optDisplay()
+    let fps = fps > 30 ? 30 : fps // 屏幕采集默认 30fps，避免 WindowServer 过载
     let task = Task {
         do {
             try await startScreenStream(sender: sender, displayID: displayID,

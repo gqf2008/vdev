@@ -27,7 +27,7 @@ final class ScreenPusher: NSObject, SCStreamOutput {
         isRunning ? stop() : start()
     }
 
-    func start(width: Int = 1920, height: Int = 1080, fps: Int = 60) {
+    func start(width: Int = 1920, height: Int = 1080, fps: Int = 30) {
         guard stream == nil else { return }
         connectIfNeeded()
         let task = Task {
