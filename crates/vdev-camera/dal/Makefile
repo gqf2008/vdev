@@ -1,5 +1,8 @@
 # vdev-camera DAL 插件构建：Rust 帧核心 (staticlib) + ObjC++ 薄壳 -> .plugin bundle
 SDKROOT    := $(shell xcrun --sdk macosx --show-sdk-path)
+# 优先用 Developer ID 签名（DAL 插件需要 Team ID，ad-hoc 会被 cameracaptured 拒绝）
+SIGN_IDENTITY := $(shell security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | sed -E 's/.*"([^"]+)".*/\1/' | head -1)
+SIGN_IDENTITY ?= -
 REPO_ROOT  := $(abspath ../../..)
 DAL_DIR    := $(abspath .)
 BUILD      := $(DAL_DIR)/build
@@ -29,7 +32,7 @@ plugin: rust
 		-bundle -o $(PLUGIN)/Contents/MacOS/vdev-camera \
 		$(OBJCXX_SRCS:%= $(DAL_DIR)/%) \
 		$(RUST_LIB)
-	codesign --force --sign - $(PLUGIN)
+	codesign --force --sign "$(SIGN_IDENTITY)" $(PLUGIN)
 	@echo "built: $(PLUGIN)"
 
 install: plugin
