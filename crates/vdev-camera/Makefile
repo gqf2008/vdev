@@ -51,8 +51,8 @@ build-autosign: rust
 	xcodebuild -project VDCamera.xcodeproj -scheme VDCameraHost -configuration Release \
 		-derivedDataPath $(BUILD)/DerivedData \
 		ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
-		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) \
-		-allowProvisioningUpdates build
+		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) CODE_SIGN_IDENTITY="Apple Development" \
+		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
 	cp -R $(APP) /Applications/
 	chmod -R a+rX /Applications/VDCameraHost.app
 	@echo "autosigned & installed"
