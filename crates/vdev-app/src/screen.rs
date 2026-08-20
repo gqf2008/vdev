@@ -27,7 +27,6 @@ unsafe impl Send for CFRunLoopSourceRef {}
 
 const KCV_PIXEL_FORMAT_BGRA: i32 = 0x42475241; // 'BGRA'
 const KCG_FRAME_COMPLETE: i32 = 0;
-const KCG_FRAME_IDLE: i32 = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -101,12 +100,12 @@ pub fn start(display_id: u32, on_frame: OnFrame) -> Result<()> {
         return Err(anyhow!("需要屏幕录制权限：系统设置 → 隐私与安全性 → 屏幕录制"));
     }
 
-    // 保存最后一帧：静止画面 CGDisplayStream 只回 FrameIdle（无 surface），
-    // 需要重发最后一帧避免摄像头回落到彩条
+    // 保存最后一帧 + 保活线程：静止画面 CGDisplayStream 几乎不发回调（COMPLETE/IDLE
+    // 都停），不能依赖回调驱动重发；用独立线程每 500ms 重发最后一帧，避免摄像头回落彩条。
     let last: Arc<Mutex<Option<(Vec<u8>, u32, u32, u32)>>> = Arc::new(Mutex::new(None));
-    let last_idle: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
+    let last_sent: Arc<Mutex<std::time::Instant>> = Arc::new(Mutex::new(std::time::Instant::now()));
     let last_cb = last.clone();
-    let idle_cb = last_idle.clone();
+    let sent_cb = last_sent.clone();
     let handler = RcBlock::new(move |status: i32, _t: u64, surface: *const c_void, _u: *const c_void| {
         if status == KCG_FRAME_COMPLETE && !surface.is_null() {
             if let Some((buf, w, h, stride)) = copy_surface(surface) {
@@ -117,18 +116,7 @@ pub fn start(display_id: u32, on_frame: OnFrame) -> Result<()> {
                     cb(frame.0.clone(), frame.1, frame.2, frame.3);
                 }
                 *last_cb.lock().unwrap() = Some(frame);
-                *idle_cb.lock().unwrap() = std::time::Instant::now();
-            }
-        } else if status == KCG_FRAME_IDLE {
-            // 静止帧：每 0.5s 重发一次最后一帧，保持摄像头画面
-            if let Some(frame) = last_cb.lock().unwrap().clone() {
-                let mut last_send = idle_cb.lock().unwrap();
-                if last_send.elapsed() >= std::time::Duration::from_millis(500) {
-                    if let Some(cb) = CB.get_or_init(|| Mutex::new(None)).lock().unwrap().as_mut() {
-                        cb(frame.0.clone(), frame.1, frame.2, frame.3);
-                    }
-                    *last_send = std::time::Instant::now();
-                }
+                *sent_cb.lock().unwrap() = std::time::Instant::now();
             }
         }
     });
@@ -157,6 +145,28 @@ pub fn start(display_id: u32, on_frame: OnFrame) -> Result<()> {
             return Err(anyhow!("CGDisplayStreamStart 失败 rc={}", rc));
         }
     }
+
+    // 保活线程：无新帧超过 500ms 就重发最后一帧（与视频推流同款），RUNNING=false 时退出
+    let keep_last = last.clone();
+    let keep_sent = last_sent.clone();
+    std::thread::spawn(move || {
+        while RUNNING.load(Ordering::SeqCst) {
+            let stale = keep_sent
+                .lock()
+                .map(|s| s.elapsed() >= std::time::Duration::from_millis(500))
+                .unwrap_or(false);
+            if stale {
+                let frame = keep_last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some((buf, w, h, stride)) = frame {
+                    if let Some(cb) = CB.get_or_init(|| Mutex::new(None)).lock().unwrap().as_mut() {
+                        cb(buf, w, h, stride);
+                    }
+                    *keep_sent.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
 
     // 独立线程跑 CFRunLoop，驱动 block 回调
     std::thread::spawn(move || unsafe {
