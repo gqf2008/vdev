@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 高度留出顶部 12pt：去掉标题栏后红绿灯悬浮在内容区左上角，28pt 足够避开
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 580, height: 512))
 
-        let title = NSTextField(labelWithString: "vdev-camera 宿主")
+        let title = NSTextField(labelWithString: "vdev-camera")
         title.font = .boldSystemFont(ofSize: 18)
         title.frame = NSRect(x: 24, y: 458, width: 360, height: 26)
         content.addSubview(title)
