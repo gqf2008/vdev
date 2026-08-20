@@ -1,0 +1,3 @@
+# cgevents 依赖 Swift bridge，运行期需要 Swift 运行时库路径
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]

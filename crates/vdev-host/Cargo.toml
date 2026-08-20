@@ -1,0 +1,16 @@
+[package]
+name = "vdev-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vdev"
+path = "src/main.rs"
+
+[dependencies]
+vdev-hid = { path = "../vdev-hid" }
+vdev-screen = { path = "../vdev-screen" }
+vdev-camera = { path = "../vdev-camera" }
+clap = { version = "4.6.6", features = ["derive"] }
+anyhow = "1.0.104"
