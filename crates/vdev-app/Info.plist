@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>VDCamera</string>
+	<key>CFBundleExecutable</key>
+	<string>vdev-camera</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.vdev.camera.host</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>VDCamera</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.0</string>
+	<key>CFBundleVersion</key>
+	<string>20</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSCameraUsageDescription</key>
+	<string>vdev-camera 需要检测系统摄像头列表，以确认虚拟摄像头已安装。</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>vdev-camera 需要安装摄像头扩展，以向系统提供虚拟摄像头（Rust 生成测试画面）。</string>
+</dict>
+</plist>

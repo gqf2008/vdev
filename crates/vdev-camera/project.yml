@@ -75,5 +75,9 @@ schemes:
     build:
       targets:
         vdev-camera: all
+  VDCameraExtension:
+    build:
+      targets:
+        VDCameraExtension: all
     run:
       config: Release

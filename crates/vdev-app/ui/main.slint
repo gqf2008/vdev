@@ -1,0 +1,91 @@
+// VDCamera — vdev 摄像头宿主（Rust + Slint + slint-pixel）
+import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme, PixelScrollPanel } from "@slint_pixel";
+import { TextEdit } from "std-widgets.slint";
+
+export global AppState {
+    in-out property <string> status_glyph: "○";
+    in-out property <string> status_title: "虚拟摄像头未安装";
+    in-out property <string> status_detail: "点击「安装虚拟摄像头」，然后在系统提示中允许扩展。";
+    in-out property <bool> can_install: true;
+    in-out property <bool> can_uninstall: false;
+    in-out property <bool> can_push: false;
+    in-out property <bool> can_vd_push: false;
+    in-out property <string> vd_btn_text: "创建虚拟屏幕";
+    in-out property <string> log_text: "";
+}
+
+export component MainWindow inherits Window {
+    title: "VDCamera";
+    no-frame: true;
+    preferred-width: 580px;
+    preferred-height: 532px;
+    min-width: 580px;
+    min-height: 532px;
+    background: PixelTheme.bg;
+
+    callback install();
+    callback uninstall();
+    callback open_settings();
+    callback refresh();
+    callback open_quicktime();
+    callback screen_push();
+    callback video_push();
+    callback vd_create();
+    callback vd_push();
+    callback drag-start();
+    callback minimize();
+    callback toggle-maximize();
+    callback close-window();
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        PixelTitleBar {
+            title: "VDCamera · vdev 虚拟摄像头";
+            drag-start => { root.drag-start(); }
+            minimize => { root.minimize(); }
+            toggle-maximize => { root.toggle-maximize(); }
+            close-window => { root.close-window(); }
+        }
+
+        PixelPanel {
+            title: "状态";
+            VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    PixelText { text: AppState.status_glyph; font-size: 18px; }
+                    PixelText { text: AppState.status_title; font-weight: 700; }
+                }
+                PixelText { text: AppState.status_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+            }
+        }
+
+        HorizontalLayout { spacing: 8px;
+            PixelButton { text: "安装虚拟摄像头"; enabled: AppState.can_install; clicked => { install(); } }
+            PixelButton { text: "卸载虚拟摄像头"; enabled: AppState.can_uninstall; clicked => { uninstall(); } }
+            PixelButton { text: "打开系统设置"; clicked => { open_settings(); } }
+        }
+
+        HorizontalLayout { spacing: 8px;
+            PixelButton { text: "在 QuickTime 中打开"; clicked => { open_quicktime(); } }
+            PixelButton { text: "屏幕推流"; enabled: AppState.can_push; clicked => { screen_push(); } }
+            PixelButton { text: "刷新状态"; clicked => { refresh(); } }
+        }
+
+        HorizontalLayout { spacing: 8px;
+            PixelButton { text: "视频推流"; enabled: AppState.can_push; clicked => { video_push(); } }
+            PixelButton { text: AppState.vd_btn_text; clicked => { vd_create(); } }
+            PixelButton { text: "推虚拟屏幕"; enabled: AppState.can_vd_push; clicked => { vd_push(); } }
+        }
+
+        PixelScrollPanel {
+            TextEdit {
+                text: AppState.log_text;
+                read-only: true;
+                font-size: 11px;
+            }
+        }
+    }
+}
