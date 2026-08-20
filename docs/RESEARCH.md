@@ -29,6 +29,25 @@
 - **参考**：Apple 官方示例（WWDC22 "Create a camera extension with Core Media IO"）、obs-mac-virtualcam 的
   `mac-virtualcam` extension 实现。
 
+#### 已跑通的最小实现（vdev-camera，macOS 26，QuickTime 可见 Rust 彩条）
+
+- 宿主 App（含 `com.apple.developer.system-extension.install`）+ 扩展 `.systemextension`（文件名 = bundle ID）。
+- 激活三要素：
+  1. 宿主与扩展 Info.plist 都有 `NSSystemExtensionUsageDescription`；
+  2. 宿主与扩展 entitlements 都有**同名** `com.apple.security.application-groups`；
+  3. `CMIOExtensionMachServiceName` = `$(TeamIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)`，且必须以
+     App Group 为前缀（例：group=`XFXU84HVK3.com.vdev.camera`，service=`XFXU84HVK3.com.vdev.camera.host.extension`）。
+- 扩展 Info.plist **不要** `NSExtension` 块（对齐 Apple 模板/SimCam），只要 `CMIOExtension` + usage description。
+- 运行时五件事：
+  1. `CMIOExtensionProvider` 进程级单例，全进程只建一个（ProviderSource 里建，别处复用）；
+  2. `device.addStream(stream)` **先于** `provider.addDevice(device)`（否则零流设备，能枚举但 0 帧）；
+  3. `legacyDeviceID` 填 UUID 字符串；
+  4. `startStream()` 里启动帧定时器，`stream.send(...)` 发 `CMSampleBuffer`（BGRA32 + IOSurface）；
+  5. 换二进制必须递增 `CFBundleVersion` 强制 sysextd 替换，否则一直跑旧 staging。
+- 批准入口（macOS 26）：系统设置 → 通用 → 登录项与扩展 → 摄像头扩展。
+- 排障：`systemextensionsctl list` + `/usr/bin/log show --predicate 'process == "sysextd"' --info --debug`；
+  出帧用 QuickTime 新建影片录制验证最可信（沙盒扩展里 NSLog 可能不进 unified log）。
+
 ## 3. 虚拟屏幕（CGVirtualDisplay 私有 API）
 
 - **来源**：CoreGraphics.framework 私有头，DisplayLink 等厂商在用，跨版本较稳定。

@@ -54,6 +54,7 @@ final class RustFrameSource {
     }
 
     func startStreaming() {
+        NSLog("vdev-camera: frameSource.startStreaming")
         guard timer == nil else { return }
         let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         let intervalNs = 1_000_000_000 / Int(frameRate)
@@ -64,6 +65,7 @@ final class RustFrameSource {
     }
 
     func stopStreaming() {
+        NSLog("vdev-camera: frameSource.stopStreaming")
         timer?.cancel()
         timer = nil
     }

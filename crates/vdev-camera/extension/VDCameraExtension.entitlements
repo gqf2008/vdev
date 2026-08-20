@@ -6,7 +6,7 @@
 	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>$(TeamIdentifierPrefix)com.vdev.camera.shared</string>
+		<string>$(TeamIdentifierPrefix)com.vdev.camera</string>
 	</array>
 </dict>
 </plist>
