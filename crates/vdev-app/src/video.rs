@@ -41,6 +41,17 @@ mod ffi {
     }
 }
 
+fn error_description(e: &AnyObject) -> String {
+    unsafe {
+        let reason: *mut NSString = msg_send![e, reason];
+        if reason.is_null() {
+            "未知异常".to_string()
+        } else {
+            objc2::rc::Retained::from_raw(reason).unwrap().to_string()
+        }
+    }
+}
+
 pub fn host_time_ns() -> u64 {
     unsafe {
         let t = ffi::CMClockGetTime(ffi::CMClockGetHostTimeClock());
@@ -98,23 +109,34 @@ fn run(
         let reader = AVAssetReader::assetReaderWithAsset_error(&asset)
             .ok()
             .ok_or_else(|| anyhow!("AVAssetReader 创建失败"))?;
-        let track = asset
-            .tracksWithMediaType(AVMediaTypeVideo.unwrap())
+        let tracks = asset.tracksWithMediaType(AVMediaTypeVideo.unwrap());
+        let track = tracks
             .firstObject()
             .ok_or_else(|| anyhow!("没有视频轨"))?;
 
         // outputSettings = { kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA }
-        let key = NSString::from_str("kCVPixelBufferPixelFormatTypeKey");
+        let key = NSString::from_str("PixelFormatType");
         let val: Retained<AnyObject> = msg_send![
             objc2_foundation::NSNumber::class(),
             numberWithUnsignedInt: 0x42475241u32
         ];
         let dict: Retained<NSDictionary<NSString>> =
             msg_send![<NSDictionary<NSString>>::class(), dictionaryWithObject: &*val, forKey: &*key];
-        let output = AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
-            &track,
-            Some(&*dict),
-        );
+        let output = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+                AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
+                    &*track,
+                    Some(&*dict),
+                )
+            }
+        }))
+        .map_err(|e| {
+            let desc = e
+                .as_deref()
+                .map(|ex| error_description(ex))
+                .unwrap_or_else(|| "未知异常".to_string());
+            anyhow!("assetReaderTrackOutput 抛异常: {}", desc)
+        })?;
         reader.addOutput(&output);
         if !reader.startReading() {
             return Err(anyhow!("视频解码启动失败"));
