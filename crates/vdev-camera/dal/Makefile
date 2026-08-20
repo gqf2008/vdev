@@ -43,6 +43,8 @@ install-system: plugin
 	sudo mkdir -p /Library/CoreMediaIO/Plug-Ins/DAL
 	sudo rm -rf /Library/CoreMediaIO/Plug-Ins/DAL/vdev-camera.plugin
 	sudo cp -R $(PLUGIN) /Library/CoreMediaIO/Plug-Ins/DAL/
+	# ExFAT 卷复制出来的 bundle 权限过紧，_cmiodalassistants 读不了，必须放开
+	sudo chmod -R a+rX /Library/CoreMediaIO/Plug-Ins/DAL/vdev-camera.plugin
 	sudo killall cameracaptured 2>/dev/null || true
 	@echo "installed to /Library/CoreMediaIO/Plug-Ins/DAL/ (cameracaptured restarted)"
 
