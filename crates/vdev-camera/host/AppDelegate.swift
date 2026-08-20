@@ -171,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusGlyph.stringValue = "⚠️"
             statusGlyph.textColor = .systemOrange
             statusTitle.stringValue = "等待系统批准"
-            statusDetail.stringValue = "已为你打开「系统设置」。请进入：通用 → 登录项与扩展 → 摄像头扩展，打开 vdev-camera 的开关。\n没有看到入口？点下方「打开系统设置」重试。"
+            statusDetail.stringValue = "已为你打开「系统设置」。请进入：通用 → 登录项与扩展 → 扩展 → 按类别 → 相机扩展，打开 vdev-camera 的开关。\n没有看到入口？点下方「打开系统设置」重试。"
             settingsButton.isHidden = false
             quicktimeButton.isHidden = true
             installButton.isEnabled = true
@@ -348,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences") {
             NSWorkspace.shared.open(url)
-            log("已打开系统设置：通用 → 登录项与扩展 → 摄像头扩展")
+            log("已打开系统设置：通用 → 登录项与扩展 → 扩展 → 按类别 → 相机扩展")
         }
     }
 
