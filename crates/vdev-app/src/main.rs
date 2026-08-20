@@ -290,6 +290,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
         let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sent_cb = sent.clone();
+        // 诊断统计：帧间隔 + 发送耗时，暴露 >2s 停顿（会导致扩展回落彩条）
+        let last_cb: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let max_gap: Arc<Mutex<u128>> = Arc::new(Mutex::new(0));
+        let max_send: Arc<Mutex<u128>> = Arc::new(Mutex::new(0));
+        let diag_last = last_cb.clone();
+        let diag_gap = max_gap.clone();
+        let diag_send = max_send.clone();
         println!("selftest-video: {} 推流 {dur}s …", path);
         video::push_video(
             &path,
@@ -298,17 +305,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1080,
             60,
             move |buf, w, h, stride| {
+                let t0 = std::time::Instant::now();
+                let mut lg = diag_last.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(prev) = *lg {
+                    let gap = t0.duration_since(prev).as_millis();
+                    let mut mg = diag_gap.lock().unwrap_or_else(|e| e.into_inner());
+                    if gap > *mg { *mg = gap; }
+                }
+                *lg = Some(t0);
+                drop(lg);
                 let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.is_none() {
                     *guard = frame::connect().ok();
                 }
-                if let Some(c) = guard.as_mut() {
-                    if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
-                        let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if n % 60 == 0 {
-                            println!("selftest-video: 已推 {n} 帧");
-                        }
-                    }
+                let send_ms = if let Some(c) = guard.as_mut() {
+                    let s0 = std::time::Instant::now();
+                    let ok = c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok();
+                    let ms = s0.elapsed().as_millis();
+                    let mut msx = diag_send.lock().unwrap_or_else(|e| e.into_inner());
+                    if ms > *msx { *msx = ms; }
+                    if !ok { println!("selftest-video: send FAILED at #{}", sent_cb.load(std::sync::atomic::Ordering::Relaxed)); }
+                    ms
+                } else { 0 };
+                let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 60 == 0 {
+                    let g = *diag_gap.lock().unwrap_or_else(|e| e.into_inner());
+                    let s = *diag_send.lock().unwrap_or_else(|e| e.into_inner());
+                    println!("selftest-video: 已推 {n} 帧 | 最大帧间隔 {g}ms | 最大发送耗时 {s}ms");
+                    *diag_gap.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                    *diag_send.lock().unwrap_or_else(|e| e.into_inner()) = 0;
                 }
             },
             || {},

@@ -1,5 +1,6 @@
 //! 视频文件推流：NSOpenPanel 选文件 + AVAssetReader 解码 + vImage 缩放。
 use anyhow::{anyhow, Result};
+use std::sync::Mutex;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -169,6 +170,11 @@ pub fn openpanel_selftest() -> Result<(), String> {
 
 /// 解码并推流视频（后台线程）。on_frame 回调已缩放 BGRA32；
 /// 结束时（自然播完或被 stop）调用 on_done。
+///
+/// 保活机制：AVAssetReader 读网络挂载（ossfs 等）或解码复杂编码（AV1/HEVC）时
+/// 可能停顿 >2s，扩展端 2s 没收到新注入帧就回落到彩条，造成「彩条/视频交替」。
+/// 这里用保活线程：最后发送超过 500ms 就重发最后一帧（带新时间戳），
+/// 让扩展永远等不到 2s 超时；推流真正结束后 done=true，保活退出，扩展正常回落彩条。
 pub fn push_video(
     path: &str,
     access: FileAccess,
@@ -178,15 +184,63 @@ pub fn push_video(
     on_frame: impl FnMut(Vec<u8>, u32, u32, u32) + Send + 'static,
     on_done: impl FnOnce() + Send + 'static,
 ) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
     let path = path.to_string();
+    let cb: Arc<Mutex<Box<dyn FnMut(Vec<u8>, u32, u32, u32) + Send>>> =
+        Arc::new(Mutex::new(Box::new(on_frame)));
+    let last_frame: Arc<Mutex<Option<(Vec<u8>, u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+    let last_sent: Arc<Mutex<std::time::Instant>> =
+        Arc::new(Mutex::new(std::time::Instant::now()));
+    let done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    // 解码线程
+    let cb_d = cb.clone();
+    let frame_d = last_frame.clone();
+    let sent_d = last_sent.clone();
+    let done_d = done.clone();
     std::thread::spawn(move || {
         // access 随线程存活：沙盒内 security-scoped 权限保持到推流结束
         let _access = access;
-        let r = run(&path, width, height, fps, on_frame);
+        let r = run(&path, width, height, fps, move |buf, w, h, stride| {
+            let mut guard = cb_d.lock().unwrap_or_else(|e| e.into_inner());
+            let c = guard.as_mut();
+            c(buf.clone(), w, h, stride);
+            drop(guard);
+            *frame_d.lock().unwrap_or_else(|e| e.into_inner()) = Some((buf, w, h, stride));
+            *sent_d.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+        });
         if let Err(e) = &r {
             eprintln!("视频推流失败: {}", e);
         }
+        done_d.store(true, std::sync::atomic::Ordering::SeqCst);
         on_done();
+    });
+
+    // 保活线程：解码停顿 >500ms 时重发最后一帧，避免扩展回落彩条
+    let cb_k = cb.clone();
+    let frame_k = last_frame.clone();
+    let sent_k = last_sent.clone();
+    let done_k = done.clone();
+    std::thread::spawn(move || {
+        while !done_k.load(std::sync::atomic::Ordering::SeqCst) {
+            let stale = sent_k
+                .lock()
+                .map(|s| s.elapsed() >= std::time::Duration::from_millis(500))
+                .unwrap_or(false);
+            if stale {
+                let frame = frame_k.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some((buf, w, h, stride)) = frame {
+                    let mut guard = cb_k.lock().unwrap_or_else(|e| e.into_inner());
+                    let c = guard.as_mut();
+                    c(buf, w, h, stride);
+                    drop(guard);
+                    *sent_k.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     });
     Ok(())
 }
@@ -253,6 +307,7 @@ fn run(
             }
             let pb = ffi::CMSampleBufferGetImageBuffer(sample);
             if pb.is_null() {
+                ffi::CFRelease(sample as *const std::ffi::c_void);
                 continue;
             }
             ffi::CVPixelBufferLockBaseAddress(pb, 1); // read-only
