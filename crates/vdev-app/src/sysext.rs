@@ -149,7 +149,7 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
     Ok(())
 }
 
-/// 服务主队列事件（自测用）：在指定秒数内转主 runloop，让 sysext 回调得到分发。
+// 服务主队列事件（自测用）：在指定秒数内转主 runloop，让 sysext 回调得到分发。
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFRunLoopDefaultMode: *const c_void;

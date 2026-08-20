@@ -28,7 +28,7 @@ mod ffi {
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
-        pub fn CFRelease(obj: *mut c_void);
+        pub fn CFRelease(obj: *const c_void);
     }
     #[link(name = "CoreVideo", kind = "framework")]
     extern "C" {
@@ -96,6 +96,7 @@ pub fn push_video(
     Ok(())
 }
 
+#[allow(deprecated)]
 fn run(
     path: &str,
     width: u32,
@@ -123,12 +124,10 @@ fn run(
         let dict: Retained<NSDictionary<NSString>> =
             msg_send![<NSDictionary<NSString>>::class(), dictionaryWithObject: &*val, forKey: &*key];
         let output = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-            unsafe {
-                AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
-                    &*track,
-                    Some(&*dict),
-                )
-            }
+            AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
+                &*track,
+                Some(&*dict),
+            )
         }))
         .map_err(|e| {
             let desc = e
@@ -186,7 +185,7 @@ fn run(
                 std::thread::sleep(std::time::Duration::from_nanos(target_ns - now));
             }
             on_frame(scaled.0, width, height, scaled.1 as u32);
-            ffi::CFRelease(sample);
+            ffi::CFRelease(sample as *const std::ffi::c_void);
         }
         Ok(())
     }

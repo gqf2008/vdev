@@ -7,7 +7,7 @@ mod video;
 mod vimage;
 mod vscreen;
 
-use slint::Weak;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ const QUICKTIME_PATH: &str = "/System/Applications/Quick Time Player.app";
 
 type Logs = Arc<Mutex<Vec<String>>>;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PushMode {
     ScreenMain,
     ScreenVd,
@@ -240,7 +240,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs: Logs = Arc::new(Mutex::new(Vec::new()));
     append_log(&ui, &logs, "VDCamera 就绪（Rust + Slint + slint-pixel）");
 
-    let ui_weak = ui.as_weak();
+    fn wire_ui(ui: &MainWindow, logs: &Logs) {
+        let ui_weak = ui.as_weak();
 
     // 安装
     {
@@ -252,11 +253,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             set_status(&ui, "⏳", "正在安装…", "正在请求系统激活摄像头扩展。");
             set_enabled(&ui, false, false, false, false);
 
-            let cb_ui = ui.as_weak();
             let cb_logs = logs.clone();
             let wk_outer = weak.clone();
             let cb = move |ev: sysext::SysextEvent| {
-                let ui = cb_ui.clone();
                 let logs = cb_logs.clone();
                 let wk = wk_outer.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -323,11 +322,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             append_log(&ui, &logs, format!("停用扩展: {}", BUNDLE_ID));
             set_status(&ui, "⏳", "正在卸载…", "正在从系统移除摄像头扩展。");
             set_enabled(&ui, false, false, false, false);
-            let cb_ui = ui.as_weak();
             let cb_logs = logs.clone();
             let wk_outer = weak.clone();
             let cb = move |ev: sysext::SysextEvent| {
-                let ui = cb_ui.clone();
                 let logs = cb_logs.clone();
                 let wk = wk_outer.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -368,13 +365,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = ui_weak.clone();
         ui.on_open_settings(move || {
-            if let Some(ui) = weak.upgrade() {
+            if weak.upgrade().is_some() {
                 open_url(SETTINGS_URL);
             }
         });
         let weak = ui_weak.clone();
         ui.on_open_quicktime(move || {
-            if let Some(ui) = weak.upgrade() {
+            if weak.upgrade().is_some() {
                 open_quicktime();
             }
         });
@@ -437,8 +434,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
             set_btn_texts(&ui);
             append_log(&ui, &logs, format!("视频推流开始: {}", path));
-            let ui_w = ui.as_weak();
-            let logs2 = logs.clone();
             if let Err(e) = video::push_video(&path, 1920, 1080, 60, move |buf, w, h, stride| {
                 let mut guard = VIDEO_CLIENT.lock().unwrap();
                 if guard.is_none() {
@@ -470,6 +465,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             start_screen_push(&ui, &logs, id, PushMode::ScreenVd);
         });
+    }
+
+    }
+
+    wire_ui(&ui, &logs);
+
+    if args.iter().any(|a| a == "--ui-selftest") {
+        // 程序化触发按钮回调，验证 UI 接线（Slint invoke_* == 点击按钮）
+        let ui2 = MainWindow::new()?;
+        slint_pixel::install_title_bar_controls(&ui2);
+        let logs2: Logs = Arc::new(Mutex::new(Vec::new()));
+        wire_ui(&ui2, &logs2);
+
+        ui2.invoke_vd_create();
+        std::thread::sleep(Duration::from_secs(2));
+        println!("ui-selftest: vd_create -> display_id={}", vscreen::display_id().is_some());
+
+        ui2.invoke_vd_push();
+        std::thread::sleep(Duration::from_secs(4));
+        println!("ui-selftest: vd_push -> mode={:?}", *PUSH_MODE.lock().unwrap());
+
+        ui2.invoke_vd_push();
+        std::thread::sleep(Duration::from_secs(2));
+        println!("ui-selftest: vd_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap());
+
+        ui2.invoke_screen_push();
+        std::thread::sleep(Duration::from_secs(3));
+        println!("ui-selftest: screen_push -> mode={:?}", *PUSH_MODE.lock().unwrap());
+
+        ui2.invoke_screen_push();
+        std::thread::sleep(Duration::from_secs(2));
+        println!("ui-selftest: screen_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap());
+
+        vscreen::destroy();
+        return Ok(());
     }
 
     refresh_status(&ui, &logs);
