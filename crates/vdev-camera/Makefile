@@ -3,7 +3,7 @@ REPO_ROOT := $(abspath ../..)
 BUILD := build/extension
 DERIVED := $(BUILD)/DerivedData
 PRODUCTS := $(DERIVED)/Build/Products/Release
-APP := $(PRODUCTS)/VDCameraHost.app
+APP := $(PRODUCTS)/vdev-camera.app
 EXT := $(PRODUCTS)/VDCameraExtension.systemextension
 SIGN_IDENTITY := "Developer ID Application: qingfeng gao (XFXU84HVK3)"
 TEAM_ID := XFXU84HVK3
@@ -19,7 +19,7 @@ project: rust
 	xcodegen generate
 
 build: project
-	xcodebuild -project VDCamera.xcodeproj -scheme VDCameraHost -configuration Release \
+	xcodebuild -project VDCamera.xcodeproj -scheme vdev-camera -configuration Release \
 		-derivedDataPath $(DERIVED) \
 		CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build
 
@@ -27,7 +27,7 @@ sign: build
 	mkdir -p $(BUILD)
 	sed 's/\$$(TeamIdentifierPrefix)/$(TEAM_ID)./g' extension/VDCameraExtension.entitlements > $(BUILD)/ext.entitlements
 	codesign --force --sign $(SIGN_IDENTITY) --entitlements $(BUILD)/ext.entitlements $(EXT)
-	codesign --force --sign $(SIGN_IDENTITY) --entitlements host/VDCameraHost.entitlements $(APP)
+	codesign --force --sign $(SIGN_IDENTITY) --entitlements host/vdev-camera.entitlements $(APP)
 
 verify: sign
 	codesign --verify --deep --strict $(APP)
@@ -36,7 +36,7 @@ verify: sign
 
 install: verify
 	cp -R $(APP) /Applications/
-	open /Applications/VDCameraHost.app
+	open /Applications/vdev-camera.app
 
 run: verify
 	open $(APP)
@@ -48,13 +48,14 @@ clean:
 # 用法：make build-autosign
 build-autosign: rust
 	xcodegen generate
-	xcodebuild -project VDCamera.xcodeproj -scheme VDCameraHost -configuration Release \
+	xcodebuild -project VDCamera.xcodeproj -scheme vdev-camera -configuration Release \
 		-derivedDataPath $(BUILD)/DerivedData \
 		ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
 		CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=$(TEAM_ID) CODE_SIGN_IDENTITY="Apple Development" \
 		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+	@if [ -d /Applications/vdev-camera.app ]; then mv /Applications/vdev-camera.app /tmp/vdev-camera.app.old.$$(date +%s); fi
 	@if [ -d /Applications/VDCameraHost.app ]; then mv /Applications/VDCameraHost.app /tmp/VDCameraHost.app.old.$$(date +%s); fi
 	cp -R $(APP) /Applications/
-	chmod -R a+rX /Applications/VDCameraHost.app
-	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCameraHost.app
+	chmod -R a+rX /Applications/vdev-camera.app
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/vdev-camera.app
 	@echo "autosigned & installed"

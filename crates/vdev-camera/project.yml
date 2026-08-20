@@ -35,7 +35,7 @@ targets:
         OTHER_LDFLAGS:
           - "$(SRCROOT)/../../target/release/libvdev_camera.a"
 
-  VDCameraHost:
+  vdev-camera:
     type: application
     platform: macOS
     sources:
@@ -47,16 +47,16 @@ targets:
         embed: true
     settings:
       base:
-        PRODUCT_NAME: VDCameraHost
+        PRODUCT_NAME: vdev-camera
         PRODUCT_BUNDLE_IDENTIFIER: com.vdev.camera.host
         INFOPLIST_FILE: host/Info.plist
-        CODE_SIGN_ENTITLEMENTS: host/VDCameraHost.entitlements
+        CODE_SIGN_ENTITLEMENTS: host/vdev-camera.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
 schemes:
-  VDCameraHost:
+  vdev-camera:
     build:
       targets:
-        VDCameraHost: all
+        vdev-camera: all
     run:
       config: Release
