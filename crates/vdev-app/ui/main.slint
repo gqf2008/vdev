@@ -11,6 +11,9 @@ export global AppState {
     in-out property <bool> can_push: false;
     in-out property <bool> can_vd_push: false;
     in-out property <string> vd_btn_text: "创建虚拟屏幕";
+    in-out property <string> screen_btn_text: "屏幕推流";
+    in-out property <string> video_btn_text: "视频推流";
+    in-out property <string> vd_push_btn_text: "推虚拟屏幕";
     in-out property <string> log_text: "";
 }
 
@@ -70,14 +73,14 @@ export component MainWindow inherits Window {
 
         HorizontalLayout { spacing: 8px;
             PixelButton { text: "在 QuickTime 中打开"; clicked => { open_quicktime(); } }
-            PixelButton { text: "屏幕推流"; enabled: AppState.can_push; clicked => { screen_push(); } }
+            PixelButton { text: AppState.screen_btn_text; enabled: AppState.can_push; clicked => { screen_push(); } }
             PixelButton { text: "刷新状态"; clicked => { refresh(); } }
         }
 
         HorizontalLayout { spacing: 8px;
-            PixelButton { text: "视频推流"; enabled: AppState.can_push; clicked => { video_push(); } }
+            PixelButton { text: AppState.video_btn_text; enabled: AppState.can_push; clicked => { video_push(); } }
             PixelButton { text: AppState.vd_btn_text; clicked => { vd_create(); } }
-            PixelButton { text: "推虚拟屏幕"; enabled: AppState.can_vd_push; clicked => { vd_push(); } }
+            PixelButton { text: AppState.vd_push_btn_text; enabled: AppState.can_vd_push; clicked => { vd_push(); } }
         }
 
         PixelScrollPanel {

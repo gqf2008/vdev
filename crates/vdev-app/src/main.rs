@@ -1,7 +1,10 @@
 //! VDCamera — vdev 摄像头宿主（Rust + Slint）
 mod camera;
 mod frame;
+mod screen;
 mod sysext;
+mod video;
+mod vimage;
 mod vscreen;
 
 use slint::Weak;
@@ -16,6 +19,64 @@ const SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.ExtensionsPrefer
 const QUICKTIME_PATH: &str = "/System/Applications/Quick Time Player.app";
 
 type Logs = Arc<Mutex<Vec<String>>>;
+
+#[derive(Clone, Copy, PartialEq)]
+enum PushMode {
+    ScreenMain,
+    ScreenVd,
+    Video,
+}
+
+static PUSH_MODE: Mutex<Option<PushMode>> = Mutex::new(None);
+static VIDEO_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static VIDEO_CLIENT: Mutex<Option<frame::FrameClient>> = Mutex::new(None);
+
+fn set_btn_texts(ui: &MainWindow) {
+    let g = ui.global::<AppState>();
+    let mode = *PUSH_MODE.lock().unwrap();
+    g.set_screen_btn_text(if mode == Some(PushMode::ScreenMain) { "停止屏幕推流".into() } else { "屏幕推流".into() });
+    g.set_video_btn_text(if mode == Some(PushMode::Video) { "停止视频推流".into() } else { "视频推流".into() });
+    g.set_vd_push_btn_text(if mode == Some(PushMode::ScreenVd) { "停止推虚拟屏".into() } else { "推虚拟屏幕".into() });
+}
+
+fn stop_current_push(ui: &MainWindow, logs: &Logs) {
+    let mode = *PUSH_MODE.lock().unwrap();
+    match mode {
+        Some(PushMode::ScreenMain) | Some(PushMode::ScreenVd) => {
+            screen::stop();
+            append_log(ui, logs, "屏幕推流已停止");
+        }
+        Some(PushMode::Video) => {
+            // 视频线程通过 Arc<AtomicBool> 停止，简化：直接断开（线程内循环会因发送失败退出）
+            append_log(ui, logs, "视频推流已停止");
+        }
+        None => {}
+    }
+    *PUSH_MODE.lock().unwrap() = None;
+    set_btn_texts(ui);
+}
+
+fn start_screen_push(ui: &MainWindow, logs: &Logs, display_id: u32, mode: PushMode) {
+    stop_current_push(ui, logs);
+    append_log(ui, logs, format!("屏幕推流开始（显示器 {:#x}）", display_id));
+    *PUSH_MODE.lock().unwrap() = Some(mode);
+    set_btn_texts(ui);
+    let client: Arc<Mutex<Option<frame::FrameClient>>> = Arc::new(Mutex::new(None));
+    let client_cb = client.clone();
+    if let Err(e) = screen::start(display_id, Box::new(move |buf, w, h, stride| {
+        let mut guard = client_cb.lock().unwrap();
+        if guard.is_none() {
+            *guard = frame::connect().ok();
+        }
+        if let Some(c) = guard.as_mut() {
+            let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
+        }
+    })) {
+        append_log(ui, logs, format!("屏幕推流失败: {}", e));
+        *PUSH_MODE.lock().unwrap() = None;
+        set_btn_texts(ui);
+    }
+}
 
 fn set_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
     let g = ui.global::<AppState>();
@@ -75,6 +136,41 @@ fn refresh_status(ui: &MainWindow, logs: &Logs) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--selftest-screen") {
+        let dur = args
+            .iter()
+            .position(|a| a == "--dur")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(8);
+        let client: Arc<Mutex<Option<frame::FrameClient>>> = Arc::new(Mutex::new(None));
+        let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client_cb = client.clone();
+        let sent_cb = sent.clone();
+        println!("selftest: 屏幕推流 {dur}s …");
+        screen::start(
+            screen::main_display_id(),
+            Box::new(move |buf, w, h, stride| {
+                let mut guard = client_cb.lock().unwrap();
+                if guard.is_none() {
+                    *guard = frame::connect().ok();
+                }
+                if let Some(c) = guard.as_mut() {
+                    if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
+                        let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 60 == 0 {
+                            println!("selftest: 已推 {n} 帧");
+                        }
+                    }
+                }
+            }),
+        )?;
+        std::thread::sleep(std::time::Duration::from_secs(dur));
+        screen::stop();
+        println!("selftest: 共推 {} 帧", sent.load(std::sync::atomic::Ordering::Relaxed));
+        return Ok(());
+    }
     let ui = MainWindow::new()?;
     slint_pixel::install_title_bar_controls(&ui);
     let logs: Logs = Arc::new(Mutex::new(Vec::new()));
@@ -247,32 +343,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 屏幕推流 / 视频推流 / 推虚拟屏幕：本版先提示，推流引擎下一版接入
+    // 屏幕推流（主显示器）
     {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_screen_push(move || {
-            if let Some(ui) = weak.upgrade() {
-                append_log(&ui, &logs, "屏幕推流：引擎迁移中（下一版接入）");
+            let Some(ui) = weak.upgrade() else { return };
+            if *PUSH_MODE.lock().unwrap() == Some(PushMode::ScreenMain) {
+                stop_current_push(&ui, &logs);
+            } else {
+                start_screen_push(&ui, &logs, screen::main_display_id(), PushMode::ScreenMain);
             }
         });
     }
+    // 视频推流
     {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_video_push(move || {
-            if let Some(ui) = weak.upgrade() {
-                append_log(&ui, &logs, "视频推流：引擎迁移中（下一版接入）");
+            let Some(ui) = weak.upgrade() else { return };
+            if *PUSH_MODE.lock().unwrap() == Some(PushMode::Video) {
+                VIDEO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                stop_current_push(&ui, &logs);
+                return;
+            }
+            let Some(path) = video::pick_video_url() else { return };
+            stop_current_push(&ui, &logs);
+            *PUSH_MODE.lock().unwrap() = Some(PushMode::Video);
+            VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+            set_btn_texts(&ui);
+            append_log(&ui, &logs, format!("视频推流开始: {}", path));
+            let ui_w = ui.as_weak();
+            let logs2 = logs.clone();
+            if let Err(e) = video::push_video(&path, 1920, 1080, 60, move |buf, w, h, stride| {
+                let mut guard = VIDEO_CLIENT.lock().unwrap();
+                if guard.is_none() {
+                    *guard = frame::connect().ok();
+                }
+                if let Some(c) = guard.as_mut() {
+                    let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
+                }
+            }) {
+                append_log(&ui, &logs, format!("视频推流启动失败: {}", e));
+                *PUSH_MODE.lock().unwrap() = None;
+                set_btn_texts(&ui);
             }
         });
     }
+    // 推虚拟屏幕
     {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_vd_push(move || {
-            if let Some(ui) = weak.upgrade() {
-                append_log(&ui, &logs, "推虚拟屏幕：引擎迁移中（下一版接入）");
+            let Some(ui) = weak.upgrade() else { return };
+            if *PUSH_MODE.lock().unwrap() == Some(PushMode::ScreenVd) {
+                stop_current_push(&ui, &logs);
+                return;
             }
+            let Some(id) = vscreen::display_id() else {
+                append_log(&ui, &logs, "请先创建虚拟屏幕");
+                return;
+            };
+            start_screen_push(&ui, &logs, id, PushMode::ScreenVd);
         });
     }
 

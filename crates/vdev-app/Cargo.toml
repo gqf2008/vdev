@@ -19,6 +19,7 @@ anyhow = "1.0.104"
 vdev-screen = { path = "../vdev-screen" }
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSURL", "NSArray", "NSDictionary", "NSValue"] }
-objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSApplication"] }
-objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSApplication", "NSOpenPanel", "NSSavePanel"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVAsset"] }
 objc2-core-foundation = "0.3.2"
+block2 = "0.6"
