@@ -30,13 +30,13 @@ final class ScreenPusher: NSObject, SCStreamOutput {
                 let display: SCDisplay
                 if let displayID {
                     guard let d = content.displays.first(where: { $0.displayID == displayID }) else {
-                        self.onStateChange?(false, "找不到显示器 ID \(displayID)")
+                        DispatchQueue.main.async { self.onStateChange?(false, "找不到显示器 ID \(displayID)") }
                         return
                     }
                     display = d
                 } else {
                     guard let d = content.displays.first else {
-                        self.onStateChange?(false, "没有可用显示器")
+                        DispatchQueue.main.async { self.onStateChange?(false, "没有可用显示器") }
                         return
                     }
                     display = d
@@ -53,9 +53,10 @@ final class ScreenPusher: NSObject, SCStreamOutput {
                 try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
                 try await s.startCapture()
                 self.stream = s
-                self.onStateChange?(true, nil)
+                DispatchQueue.main.async { self.onStateChange?(true, nil) }
             } catch {
-                self.onStateChange?(false, "屏幕推流失败：\(error.localizedDescription)\n需在 系统设置 → 隐私与安全性 → 屏幕录制 中允许 VDCamera。")
+                let msg = "屏幕推流失败：\(error.localizedDescription)\n需在 系统设置 → 隐私与安全性 → 屏幕录制 中允许 VDCamera。"
+                DispatchQueue.main.async { self.onStateChange?(false, msg) }
             }
         }
         _ = task

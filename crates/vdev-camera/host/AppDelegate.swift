@@ -220,6 +220,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func log(_ s: String) {
+        // AppKit 只能在主线程操作；后台线程回调统一切主线程
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.log(s) }
+            return
+        }
         let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         logs.append("[\(ts)] \(s)")
         if logs.count > 200 { logs.removeFirst(logs.count - 200) }
