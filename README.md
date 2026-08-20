@@ -80,11 +80,21 @@ make build-autosign   # 前提：Xcode → Settings → Accounts 已登录开发
 ```bash
 # 推送一张图片（循环，方便验证通道）
 cd crates/vdev-camera/tools
-swift push_frames.swift image /path/to/pic.png --fps 30
+swift push_frames.swift image /path/to/pic.png --fps 60
 
-# 推送真实屏幕画面（缩放到 1280x720；首次需授权 屏幕录制）
-swift push_frames.swift screen --fps 30
+# 推送真实屏幕画面（默认 1080p@30；首次需授权 屏幕录制）
+swift push_frames.swift screen [--display <id>] --fps 30
+
+# 推送视频文件（AVAssetReader 解码逐帧推）
+swift push_frames.swift video /path/to/video.mp4 --fps 60
 ```
+
+也可以直接用宿主 App：安装完成后点「**屏幕推流**」按钮，无需命令行。
+
+- 默认主格式 **1920×1080@60**；推流端任意尺寸都会被通道接受（工具默认按主格式缩放）
+- 屏幕采集默认 30fps（1080p60 会导致 WindowServer 过载卡顿）
+- 组合玩法：`vdev screen create` 建虚拟屏幕 → `swift push_frames.swift screen --display <虚拟屏ID>`，
+  摄像头即显示虚拟屏幕内容（可再接 SFU/WebRTC 做远程串流）
 
 帧协议：36 字节小端头（magic "VDFR" / version / width / height / stride / ptsNs / payloadLen）
 + `stride*height` 字节 BGRA32（见 `extension/FrameChannel.swift`）。
