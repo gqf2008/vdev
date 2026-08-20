@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vdev-hid",
+    "crates/vdev-screen",
+    "crates/vdev-camera",
+    "crates/vdev-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sqb/vdev"
