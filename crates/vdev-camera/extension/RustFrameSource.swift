@@ -36,7 +36,7 @@ final class RustFrameSource {
     }
     private let injectLock = NSLock()
     private var injected: InjectedFrame?
-    private let injectedFreshWindow: CFAbsoluteTime = 0.5 // 超过 0.5s 没有新帧就回落到 Rust 彩条
+    private let injectedFreshWindow: CFAbsoluteTime = 2.0 // 超过 2s 没有新帧才回落到 Rust 彩条（切换推流源不再闪）
 
     init(
         formatDescription: CMFormatDescription,

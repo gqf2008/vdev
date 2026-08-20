@@ -118,7 +118,7 @@ fn open_url(url: &str) {
 }
 
 fn open_quicktime() {
-    let url = format!("file://{}", QUICKTIME_PATH);
+    let url = format!("file://{}", QUICKTIME_PATH.replace(' ', "%20"));
     open_url(&url);
 }
 
@@ -538,6 +538,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui2.invoke_screen_push();
         std::thread::sleep(Duration::from_secs(2));
         println!("ui-selftest: screen_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()));
+
+        // 剩余安全回调：refresh（摄像头检测）+ install（同版本 no-op）
+        ui2.invoke_refresh();
+        ui2.invoke_install();
+        std::thread::sleep(Duration::from_secs(3));
+        println!("ui-selftest: refresh/install ok");
 
         vscreen::destroy();
         return Ok(());
