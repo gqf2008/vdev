@@ -2,8 +2,9 @@
 // vdev-camera 真实帧推流工具
 //
 // 用法：
-//   swift push_frames.swift image <png路径> [--fps 30]    # 推送一张图片（循环）
-//   swift push_frames.swift screen  [--fps 30]             # 推送真实屏幕画面（需屏幕录制权限）
+//   swift push_frames.swift image <png> [--width 1920] [--height 1080] [--fps 60]
+//   swift push_frames.swift screen [--display <id>] [--width 1920] [--height 1080] [--fps 60]
+//   swift push_frames.swift video  <mp4>  [--width 1920] [--height 1080] [--fps 60]
 //
 // 协议：连接 127.0.0.1:27890，发送 36 字节小端头 + BGRA32 payload（见扩展 FrameChannel.swift）。
 
@@ -12,13 +13,17 @@ import Network
 import CoreGraphics
 import ImageIO
 import CoreMedia
+import CoreVideo
+import AVFoundation
+import Accelerate
 import ScreenCaptureKit
 
 let kPort: UInt16 = 27890
 let kMagic: UInt32 = 0x56444652
 let kVersion: UInt32 = 1
-let kWidth = 1280
-let kHeight = 720
+let kDefaultWidth = 1920
+let kDefaultHeight = 1080
+let kDefaultFps = 60
 
 func eprint(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
@@ -48,7 +53,7 @@ final class FrameSender: NSObject, SCStreamOutput {
                     self.connected = true
                     sem.signal()
                 } else if case .failed(let e) = state {
-                    print("连接失败: \(e)")
+                    eprint("连接失败: \(e)")
                     sem.signal()
                 }
             }
@@ -116,12 +121,32 @@ func makeFrame(data: Data, width: Int, height: Int, stride: Int, ptsNs: UInt64) 
     return header
 }
 
+// MARK: - 缩放（vImage，BGRA 保序）
+
+func scaleBGRA(data: Data, srcW: Int, srcH: Int, srcStride: Int, dstW: Int, dstH: Int) -> (data: Data, stride: Int) {
+    guard srcW != dstW || srcH != dstH else { return (data, srcStride) }
+    var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: (data as NSData).bytes),
+                            height: vImagePixelCount(srcH), width: vImagePixelCount(srcW), rowBytes: srcStride)
+    var dstData = Data(count: dstW * dstH * 4)
+    let dstStride = dstW * 4
+    let rc = dstData.withUnsafeMutableBytes { raw -> vImage_Error in
+        var dst = vImage_Buffer(data: raw.baseAddress, height: vImagePixelCount(dstH),
+                                width: vImagePixelCount(dstW), rowBytes: dstStride)
+        return vImageScale_ARGB8888(&src, &dst, nil, vImage_Flags(kvImageNoFlags))
+    }
+    if rc != kvImageNoError {
+        eprint("vImage 缩放失败: \(rc)")
+        exit(1)
+    }
+    return (dstData, dstStride)
+}
+
 // MARK: - 图片模式
 
 func loadBGRA(path: String, targetW: Int, targetH: Int) -> (Data, Int)? {
     guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
           let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-        print("无法读取图片: \(path)")
+        eprint("无法读取图片: \(path)")
         return nil
     }
     var data = Data(count: targetW * targetH * 4)
@@ -135,22 +160,33 @@ func loadBGRA(path: String, targetW: Int, targetH: Int) -> (Data, Int)? {
         ctx.draw(img, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
         return true
     }
-    guard ok else { print("图片转换失败"); return nil }
+    guard ok else { eprint("图片转换失败"); return nil }
     return (data, targetW * 4)
 }
 
 // MARK: - 屏幕模式
 
-func startScreenStream(sender: FrameSender, fps: Int) async throws {
+func startScreenStream(sender: FrameSender, displayID: CGDirectDisplayID?, width: Int, height: Int, fps: Int) async throws {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    guard let display = content.displays.first else {
-        print("没有可用显示器")
-        exit(1)
+    let display: SCDisplay
+    if let displayID {
+        guard let d = content.displays.first(where: { $0.displayID == displayID }) else {
+            eprint("找不到显示器 ID \(displayID)，可用：")
+            for d in content.displays { eprint("  \(d.displayID) \(d.width)x\(d.height)") }
+            throw NSError(domain: "vdev.push", code: 1, userInfo: [NSLocalizedDescriptionKey: "display not found"])
+        }
+        display = d
+    } else {
+        guard let d = content.displays.first else {
+            eprint("没有可用显示器")
+            throw NSError(domain: "vdev.push", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display"])
+        }
+        display = d
     }
     let filter = SCContentFilter(display: display, excludingWindows: [])
     let config = SCStreamConfiguration()
-    config.width = kWidth
-    config.height = kHeight
+    config.width = width
+    config.height = height
     config.pixelFormat = kCVPixelFormatType_32BGRA
     config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(fps))
     config.queueDepth = 4
@@ -160,25 +196,90 @@ func startScreenStream(sender: FrameSender, fps: Int) async throws {
     try stream.addStreamOutput(sender, type: .screen, sampleHandlerQueue: DispatchQueue(label: "screen"))
     try await stream.startCapture()
     activeStream = stream
-    print("屏幕推流中（\(kWidth)x\(kHeight) @ \(fps)fps），Ctrl+C 停止")
+    eprint("屏幕推流中（显示器 \(display.displayID) → \(width)x\(height) @ \(fps)fps），Ctrl+C 停止")
+}
+
+// MARK: - 视频模式
+
+func pushVideo(path: String, sender: FrameSender, width: Int, height: Int, fps: Int) {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+    guard let reader = try? AVAssetReader(asset: asset) else {
+        eprint("无法打开视频: \(path)")
+        exit(1)
+    }
+    guard let track = asset.tracks(withMediaType: .video).first else {
+        eprint("没有视频轨: \(path)")
+        exit(1)
+    }
+    let settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+    output.alwaysCopiesSampleData = false
+    reader.add(output)
+    guard reader.startReading() else {
+        eprint("视频读取失败: \(String(describing: reader.error))")
+        exit(1)
+    }
+
+    let sourceFps = track.nominalFrameRate
+    let intervalNs = UInt64(1_000_000_000 / Double(fps))
+    let startHostNs = UInt64(CMClockGetTime(CMClockGetHostTimeClock()).seconds * Double(NSEC_PER_SEC))
+    var index: UInt64 = 0
+    eprint("视频推流中（\(path) → \(width)x\(height)，源 \(Int(sourceFps))fps，目标 \(fps)fps），Ctrl+C 停止")
+
+    while let sample = output.copyNextSampleBuffer() {
+        defer { index += 1 }
+        guard let pb = CMSampleBufferGetImageBuffer(sample) else { continue }
+        let srcW = CVPixelBufferGetWidth(pb)
+        let srcH = CVPixelBufferGetHeight(pb)
+        let srcStride = CVPixelBufferGetBytesPerRow(pb)
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        guard let base = CVPixelBufferGetBaseAddress(pb) else {
+            CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+            continue
+        }
+        let raw = Data(bytes: base, count: srcStride * srcH)
+        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+
+        let scaled = scaleBGRA(data: raw, srcW: srcW, srcH: srcH, srcStride: srcStride,
+                               dstW: width, dstH: height)
+        let targetNs = startHostNs + index * intervalNs
+        let nowNs = UInt64(CMClockGetTime(CMClockGetHostTimeClock()).seconds * Double(NSEC_PER_SEC))
+        if targetNs > nowNs {
+            usleep(useconds_t((targetNs - nowNs) / 1000))
+        }
+        sender.sendFrame(makeFrame(data: scaled.data, width: width, height: height,
+                                   stride: scaled.stride, ptsNs: targetNs))
+    }
+    eprint("视频推完（\(index) 帧）")
+    exit(0)
 }
 
 // MARK: - main
 
 func usage() -> Never {
-    print("用法:")
-    print("  swift push_frames.swift image <png> [--fps 30]")
-    print("  swift push_frames.swift screen [--fps 30]")
+    eprint("用法:")
+    eprint("  swift push_frames.swift image <png> [--width W] [--height H] [--fps N]")
+    eprint("  swift push_frames.swift screen [--display <id>] [--width W] [--height H] [--fps N]")
+    eprint("  swift push_frames.swift video  <mp4>  [--width W] [--height H] [--fps N]")
     exit(1)
 }
 
 let args = CommandLine.arguments
 guard args.count >= 2 else { usage() }
 let mode = args[1]
-var fps = 30
-if let i = args.firstIndex(of: "--fps"), i + 1 < args.count {
-    fps = Int(args[i + 1]) ?? 30
+
+func opt(_ name: String, default d: Int) -> Int {
+    if let i = args.firstIndex(of: name), i + 1 < args.count, let v = Int(args[i + 1]) { return v }
+    return d
 }
+func optDisplay() -> CGDirectDisplayID? {
+    if let i = args.firstIndex(of: "--display"), i + 1 < args.count, let v = UInt32(args[i + 1]) { return v }
+    return nil
+}
+
+let width = opt("--width", default: kDefaultWidth)
+let height = opt("--height", default: kDefaultHeight)
+let fps = opt("--fps", default: kDefaultFps)
 
 let sender = FrameSender()
 sender.connect()
@@ -186,22 +287,22 @@ sender.connect()
 switch mode {
 case "image":
     guard args.count >= 3 else { usage() }
-    guard let (data, stride) = loadBGRA(path: args[2], targetW: kWidth, targetH: kHeight) else { exit(1) }
-    print("图片推流中（\(kWidth)x\(kHeight) @ \(fps)fps），Ctrl+C 停止")
-    var pts: UInt64 = 0
+    guard let (data, stride) = loadBGRA(path: args[2], targetW: width, targetH: height) else { exit(1) }
+    eprint("图片推流中（\(width)x\(height) @ \(fps)fps），Ctrl+C 停止")
     let interval = 1_000_000_000 / UInt64(fps)
-    let now = CMClockGetTime(CMClockGetHostTimeClock())
-    pts = UInt64(now.seconds * Double(NSEC_PER_SEC))
+    var pts = UInt64(CMClockGetTime(CMClockGetHostTimeClock()).seconds * Double(NSEC_PER_SEC))
     Timer.scheduledTimer(withTimeInterval: 1.0 / Double(fps), repeats: true) { _ in
         pts += interval
-        sender.sendFrame(makeFrame(data: data, width: kWidth, height: kHeight, stride: stride, ptsNs: pts))
+        sender.sendFrame(makeFrame(data: data, width: width, height: height, stride: stride, ptsNs: pts))
     }
     RunLoop.main.run()
 
 case "screen":
+    let displayID = optDisplay()
     let task = Task {
         do {
-            try await startScreenStream(sender: sender, fps: fps)
+            try await startScreenStream(sender: sender, displayID: displayID,
+                                        width: width, height: height, fps: fps)
         } catch {
             eprint("屏幕推流失败: \(error)")
             eprint("提示：需先在 系统设置 → 隐私与安全性 → 屏幕录制 中允许本终端/脚本。")
@@ -210,6 +311,10 @@ case "screen":
     }
     RunLoop.main.run()
     _ = task
+
+case "video":
+    guard args.count >= 3 else { usage() }
+    pushVideo(path: args[2], sender: sender, width: width, height: height, fps: fps)
 
 default:
     usage()

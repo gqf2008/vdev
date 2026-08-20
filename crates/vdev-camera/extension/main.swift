@@ -5,9 +5,10 @@ import Foundation
 import CoreMediaIO
 
 // 固定参数；后续可改成 UserDefaults/环境变量配置
-let width: Int32 = 1280
-let height: Int32 = 720
-let frameRate: Int32 = 30
+// 主格式 1920x1080@60，推流通道支持任意尺寸（自动适配）
+let width: Int32 = 1920
+let height: Int32 = 1080
+let frameRate: Int32 = 60
 let pattern: Int32 = 0 // SMPTE 彩条
 
 let virtualCamera: VirtualCamera
