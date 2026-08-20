@@ -68,6 +68,11 @@ vdev hid listen --seconds 10
 - **文件选择器（视频推流）依赖沙盒文件权限**：宿主 App 是沙盒应用，entitlements 必须带
   `com.apple.security.files.user-selected.read-only`，否则 `NSOpenPanel` 返回 NULL、
   选择器弹不出来（历史上就是这原因）。改过 entitlements 后记得 `make install-rust` 重新签名安装。
+- **视频推流彩条/视频交替（已修复）**：扩展端超过 2s 没收到新注入帧就回落到彩条。
+  视频放在 ossfs/FUSE 网络挂载上时，AVAssetReader 读盘会随机停顿 1.5~2.8s+（本地文件仅
+  18~20ms），停顿超过 2s 摄像头就“彩条↔视频”反复交替。宿主端已加保活：最后发送超过 500ms
+  就重发最后一帧（带新时间戳），推流真正结束才允许回落彩条。
+  已知残余：网络挂载上 AVAssetReader 初始化（读 moov/索引）可能耗时 10~30s，期间显示彩条属正常。
 - **旧版本残留**：多次迭代留下的僵尸扩展 `[terminated waiting to uninstall on reboot]` 无害，
   重启一次自动清理。
 
