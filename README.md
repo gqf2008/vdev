@@ -66,10 +66,22 @@ vdev hid listen --seconds 10
 
 ### 开发构建
 
+宿主 App 是 **Rust + Slint + slint-pixel**（`crates/vdev-app`），扩展是 Swift 薄壳（Apple 强制）：
+
 ```bash
 cd crates/vdev-camera
-make build-autosign   # 前提：Xcode → Settings → Accounts 已登录开发者账号
-# 产物：/Applications/VDCamera.app（含系统扩展），打开后点「安装虚拟摄像头」
+make install-rust     # cargo 编宿主 App + xcodebuild 编扩展 + 组装签名 + 装 /Applications
+# 产物：/Applications/VDCamera.app，打开后点「安装虚拟摄像头」
+```
+
+### 自测（引擎级，无需点 UI）
+
+```bash
+cargo build -p vdev-app --release
+./target/release/vdev-app --ui-selftest         # UI 回调接线：建虚拟屏/推流 开始/停止
+./target/release/vdev-app --selftest-screen --dur 8    # 屏幕推流（CGDisplayStream → TCP）
+./target/release/vdev-app --selftest-video --file x.mp4 --dur 8  # 视频推流（AVAssetReader）
+/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-sysext  # 安装/卸载委托回调
 ```
 
 ### 真实画面推流通道（✅ 可用）
