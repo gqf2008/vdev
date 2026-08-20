@@ -171,6 +171,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("selftest: 共推 {} 帧", sent.load(std::sync::atomic::Ordering::Relaxed));
         return Ok(());
     }
+    if args.iter().any(|a| a == "--selftest-sysext") {
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_cb = events.clone();
+        sysext::submit(
+            BUNDLE_ID,
+            true,
+            Box::new(move |ev| {
+                let s = match ev {
+                    sysext::SysextEvent::NeedsApproval => "NeedsApproval".to_string(),
+                    sysext::SysextEvent::Finished(n) => format!("Finished({})", n),
+                    sysext::SysextEvent::Failed(e) => format!("Failed({})", e),
+                };
+                println!("selftest-sysext: {}", s);
+                ev_cb.lock().unwrap().push(s);
+            }),
+        )?;
+        sysext::service_main_queue(10.0);
+        println!("selftest-sysext: events={:?}", *events.lock().unwrap());
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--selftest-video") {
+        let path = args
+            .iter()
+            .position(|a| a == "--file")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+        if path.is_empty() {
+            println!("usage: vdev-app --selftest-video --file <mp4> [--dur N]");
+            return Ok(());
+        }
+        let dur = args
+            .iter()
+            .position(|a| a == "--dur")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10);
+        VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sent_cb = sent.clone();
+        println!("selftest-video: {} 推流 {dur}s …", path);
+        video::push_video(&path, 1920, 1080, 60, move |buf, w, h, stride| {
+            let mut guard = VIDEO_CLIENT.lock().unwrap();
+            if guard.is_none() {
+                *guard = frame::connect().ok();
+            }
+            if let Some(c) = guard.as_mut() {
+                if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
+                    let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 60 == 0 {
+                        println!("selftest-video: 已推 {n} 帧");
+                    }
+                }
+            }
+        })?;
+        std::thread::sleep(std::time::Duration::from_secs(dur));
+        VIDEO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!(
+            "selftest-video: 共推 {} 帧",
+            sent.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        return Ok(());
+    }
     let ui = MainWindow::new()?;
     slint_pixel::install_title_bar_controls(&ui);
     let logs: Logs = Arc::new(Mutex::new(Vec::new()));

@@ -1,6 +1,7 @@
 //! SystemExtensions FFI：激活/停用摄像头扩展。
 //! 使用 objc2 的 define_class! 实现 OSSystemExtensionRequestDelegate。
 use anyhow::{anyhow, Result};
+use dispatch2::{DispatchObject, DispatchQueue};
 use objc2::define_class;
 use objc2::msg_send;
 use objc2::ClassType;
@@ -21,6 +22,10 @@ static CALLBACK: OnceLock<Mutex<Option<Cb>>> = OnceLock::new();
 // 委托对象与请求对象：进程生命周期内持有（泄露即可），存裸指针避免 Send 约束
 static DELEGATE_PTR: Mutex<usize> = Mutex::new(0);
 static REQUEST_PTR: Mutex<usize> = Mutex::new(0);
+
+// 确保 SystemExtensions 框架被 dyld 加载（否则 ObjC 类未注册）
+#[link(name = "SystemExtensions", kind = "framework")]
+extern "C" {}
 
 fn class(name: &str) -> Result<&'static AnyClass> {
     let cname = CString::new(name).expect("class name has no NUL");
@@ -84,6 +89,19 @@ define_class!(
     }
 );
 
+static SYSEXT_QUEUE: OnceLock<usize> = OnceLock::new();
+
+/// 激活/停用请求的 delegate 回调队列（串行，进程生命周期内持有）。
+fn sysext_queue() -> *mut c_void {
+    let p = SYSEXT_QUEUE.get_or_init(|| {
+        let q = DispatchQueue::new("com.vdev.camera.sysext", None);
+        let raw = q.as_raw().as_ptr() as usize;
+        std::mem::forget(q); // 保持队列存活
+        raw
+    });
+    *p as *mut c_void
+}
+
 fn ensure_delegate() -> *mut AnyObject {
     let mut p = DELEGATE_PTR.lock().unwrap();
     if *p == 0 {
@@ -110,20 +128,12 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
 
     let req_cls = class("OSSystemExtensionRequest")?;
     let id = NSString::from_str(bundle_id);
-    let queue: *mut c_void = std::ptr::null_mut(); // nil = 主队列
+    let queue = sysext_queue();
     let req: *mut AnyObject = unsafe {
         if activation {
-            msg_send![
-                req_cls,
-                activationRequestForExtensionWithIdentifier: &*id,
-                queue: queue
-            ]
+            msg_send![req_cls, activationRequestForExtension: &*id, queue: queue]
         } else {
-            msg_send![
-                req_cls,
-                deactivationRequestForExtensionWithIdentifier: &*id,
-                queue: queue
-            ]
+            msg_send![req_cls, deactivationRequestForExtension: &*id, queue: queue]
         }
     };
     if req.is_null() {
@@ -137,4 +147,21 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
     }
     *REQUEST_PTR.lock().unwrap() = req as usize;
     Ok(())
+}
+
+/// 服务主队列事件（自测用）：在指定秒数内转主 runloop，让 sysext 回调得到分发。
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: bool) -> i32;
+}
+
+pub fn service_main_queue(seconds: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+    while std::time::Instant::now() < deadline {
+        unsafe {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.2, true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
