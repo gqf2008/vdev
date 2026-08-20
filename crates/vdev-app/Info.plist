@@ -28,5 +28,9 @@
 	<true/>
 	<key>NSSystemExtensionUsageDescription</key>
 	<string>vdev-camera 需要安装摄像头扩展，以向系统提供虚拟摄像头（Rust 生成测试画面）。</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 </dict>
 </plist>
