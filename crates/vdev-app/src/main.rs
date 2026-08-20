@@ -212,20 +212,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sent_cb = sent.clone();
         println!("selftest-video: {} 推流 {dur}s …", path);
-        video::push_video(&path, 1920, 1080, 60, move |buf, w, h, stride| {
-            let mut guard = VIDEO_CLIENT.lock().unwrap();
-            if guard.is_none() {
-                *guard = frame::connect().ok();
-            }
-            if let Some(c) = guard.as_mut() {
-                if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
-                    let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 60 == 0 {
-                        println!("selftest-video: 已推 {n} 帧");
+        video::push_video(
+            &path,
+            1920,
+            1080,
+            60,
+            move |buf, w, h, stride| {
+                let mut guard = VIDEO_CLIENT.lock().unwrap();
+                if guard.is_none() {
+                    *guard = frame::connect().ok();
+                }
+                if let Some(c) = guard.as_mut() {
+                    if c.send_frame(&buf, w, h, stride, video::host_time_ns()).is_ok() {
+                        let n = sent_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 60 == 0 {
+                            println!("selftest-video: 已推 {n} 帧");
+                        }
                     }
                 }
-            }
-        })?;
+            },
+            || {},
+        )?;
         std::thread::sleep(std::time::Duration::from_secs(dur));
         VIDEO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -434,15 +441,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
             set_btn_texts(&ui);
             append_log(&ui, &logs, format!("视频推流开始: {}", path));
-            if let Err(e) = video::push_video(&path, 1920, 1080, 60, move |buf, w, h, stride| {
-                let mut guard = VIDEO_CLIENT.lock().unwrap();
-                if guard.is_none() {
-                    *guard = frame::connect().ok();
-                }
-                if let Some(c) = guard.as_mut() {
-                    let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
-                }
-            }) {
+            let done_ui = ui.as_weak();
+            if let Err(e) = video::push_video(
+                &path,
+                1920,
+                1080,
+                60,
+                move |buf, w, h, stride| {
+                    let mut guard = VIDEO_CLIENT.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = frame::connect().ok();
+                    }
+                    if let Some(c) = guard.as_mut() {
+                        let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
+                    }
+                },
+                move || {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = done_ui.upgrade() {
+                            if *PUSH_MODE.lock().unwrap() == Some(PushMode::Video) {
+                                *PUSH_MODE.lock().unwrap() = None;
+                                set_btn_texts(&ui);
+                            }
+                        }
+                    });
+                },
+            ) {
                 append_log(&ui, &logs, format!("视频推流启动失败: {}", e));
                 *PUSH_MODE.lock().unwrap() = None;
                 set_btn_texts(&ui);

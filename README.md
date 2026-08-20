@@ -130,10 +130,39 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
   使用方（QuickTime/Zoom 等）各自需要摄像头权限。
 - **虚拟屏幕**：使用私有 API，仅供学习研究，不同 macOS 版本可能行为不同。
 
+## 组合玩法：虚拟屏幕 + SFU 串流（✅ 实测通过）
+
+配合 aerodesk（str0m WebRTC SFU）把虚拟屏幕远程分发，完整链路已验证：
+虚拟屏(0x12) → 发布端采集(HEVC 1080p) → SFU 收流 → 观看端解码 327 帧。
+
+```bash
+# 1. 起本地 SFU + signal（aerodesk 仓库）
+cd /Volumes/Workspace/GitHub/aerodesk
+TURN_SECRET=devsecret ./target/release/aerodesk-sfu      # 3002 + 媒体 3478
+./target/release/aerodesk-signal                          # WS 3003 / WSS 3001
+
+# 2. 建虚拟屏（保持进程；--hold 控制存活秒数）
+cd ~/Documents/GitHub/vdev
+target/release/vdev screen create --width 1920 --height 1080 --name vdev-sfu-demo --hold 3600
+
+# 3. 发布端：--display 是索引（0=主屏），虚拟屏是第 2 个 → 1
+cd /Volumes/Workspace/GitHub/aerodesk
+cargo run -p aerodesk-agent -- --role publisher --encoder screen --display 1 \
+  --room vdev-demo --signal ws://127.0.0.1:3003/ws
+
+# 4. 观看端（另一终端）
+cargo run -p aerodesk-agent -- --role viewer --room vdev-demo --layer f \
+  --signal ws://127.0.0.1:3003/ws
+# 日志出现 RECEIVED/DECODED 即成功；浏览器可访问 https://<host>:3000
+```
+
+要点：`vdev screen list` 给的是 CGDisplayID（十六进制），aerodesk `--display` 要的是
+**显示器索引**（枚举顺序）；虚拟屏通常是第 2 个 → 索引 1。
+
 ## 路线图
 
 - [x] 调研三条技术路线（见 docs/RESEARCH.md）
 - [x] vdev-hid：键码/文本/鼠标注入 CLI 可用
 - [x] vdev-screen：创建/列出/销毁虚拟显示器
 - [x] vdev-camera：Rust 帧核心 + CMIOExtension 全链路，QuickTime 可见
-- [ ] 组合玩法：虚拟屏幕 + 摄像头串流（配合 SFU 经验）
+- [x] 组合玩法：虚拟屏幕 + 摄像头串流（配合 aerodesk SFU，端到端实测）

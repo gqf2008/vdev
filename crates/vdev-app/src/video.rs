@@ -79,19 +79,23 @@ pub fn pick_video_url() -> Option<String> {
     }
 }
 
-/// 解码并推流视频（后台线程）。on_frame 回调已缩放 BGRA32。
+/// 解码并推流视频（后台线程）。on_frame 回调已缩放 BGRA32；
+/// 结束时（自然播完或被 stop）调用 on_done。
 pub fn push_video(
     path: &str,
     width: u32,
     height: u32,
     fps: u32,
     on_frame: impl FnMut(Vec<u8>, u32, u32, u32) + Send + 'static,
+    on_done: impl FnOnce() + Send + 'static,
 ) -> Result<()> {
     let path = path.to_string();
     std::thread::spawn(move || {
-        if let Err(e) = run(&path, width, height, fps, on_frame) {
+        let r = run(&path, width, height, fps, on_frame);
+        if let Err(e) = &r {
             eprintln!("视频推流失败: {}", e);
         }
+        on_done();
     });
     Ok(())
 }
