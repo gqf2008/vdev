@@ -44,6 +44,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
         refreshStatus()
+        // 摄像头设备增删时自动刷新状态（不用重启 App）
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(devicesDidChange),
+            name: .AVCaptureDeviceWasConnected, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(devicesDidChange),
+            name: .AVCaptureDeviceWasDisconnected, object: nil)
+    }
+
+    @objc private func devicesDidChange() {
+        // 操作进行中不打扰；空闲/已装/已卸/错误态下自动刷新
+        switch state {
+        case .idle, .enabled, .disabled, .error:
+            refreshStatus()
+        default:
+            break
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

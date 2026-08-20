@@ -150,14 +150,14 @@ func startScreenStream(sender: FrameSender, fps: Int) async throws {
     config.showsCursor = false
 
     let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-    stream.addStreamOutput(sender, type: .screen, sampleHandlerQueue: DispatchQueue(label: "screen"))
+    try stream.addStreamOutput(sender, type: .screen, sampleHandlerQueue: DispatchQueue(label: "screen"))
     try await stream.startCapture()
     print("屏幕推流中（\(kWidth)x\(kHeight) @ \(fps)fps），Ctrl+C 停止")
 }
 
 // MARK: - main
 
-func usage() {
+func usage() -> Never {
     print("用法:")
     print("  swift push_frames.swift image <png> [--fps 30]")
     print("  swift push_frames.swift screen [--fps 30]")
