@@ -33,14 +33,14 @@ static VIDEO_CLIENT: Mutex<Option<frame::FrameClient>> = Mutex::new(None);
 
 fn set_btn_texts(ui: &MainWindow) {
     let g = ui.global::<AppState>();
-    let mode = *PUSH_MODE.lock().unwrap();
+    let mode = *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner());
     g.set_screen_btn_text(if mode == Some(PushMode::ScreenMain) { "停止屏幕推流".into() } else { "屏幕推流".into() });
     g.set_video_btn_text(if mode == Some(PushMode::Video) { "停止视频推流".into() } else { "视频推流".into() });
     g.set_vd_push_btn_text(if mode == Some(PushMode::ScreenVd) { "停止推虚拟屏".into() } else { "推虚拟屏幕".into() });
 }
 
 fn stop_current_push(ui: &MainWindow, logs: &Logs) {
-    let mode = *PUSH_MODE.lock().unwrap();
+    let mode = *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner());
     match mode {
         Some(PushMode::ScreenMain) | Some(PushMode::ScreenVd) => {
             screen::stop();
@@ -52,14 +52,14 @@ fn stop_current_push(ui: &MainWindow, logs: &Logs) {
         }
         None => {}
     }
-    *PUSH_MODE.lock().unwrap() = None;
+    *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     set_btn_texts(ui);
 }
 
 fn start_screen_push(ui: &MainWindow, logs: &Logs, display_id: u32, mode: PushMode) {
     stop_current_push(ui, logs);
     append_log(ui, logs, format!("屏幕推流开始（显示器 {:#x}）", display_id));
-    *PUSH_MODE.lock().unwrap() = Some(mode);
+    *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(mode);
     set_btn_texts(ui);
     let client: Arc<Mutex<Option<frame::FrameClient>>> = Arc::new(Mutex::new(None));
     let client_cb = client.clone();
@@ -73,7 +73,7 @@ fn start_screen_push(ui: &MainWindow, logs: &Logs, display_id: u32, mode: PushMo
         }
     })) {
         append_log(ui, logs, format!("屏幕推流失败: {}", e));
-        *PUSH_MODE.lock().unwrap() = None;
+        *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         set_btn_texts(ui);
     }
 }
@@ -106,10 +106,11 @@ fn append_log(ui: &MainWindow, logs: &Logs, s: impl AsRef<str>) {
 
 fn open_url(url: &str) {
     unsafe {
-        let cls = objc2::runtime::AnyClass::get(c"NSWorkspace").unwrap();
+        let Some(cls) = objc2::runtime::AnyClass::get(c"NSWorkspace") else { return };
         let ws: *mut objc2::runtime::AnyObject = objc2::msg_send![cls, sharedWorkspace];
+        let Some(url_cls) = objc2::runtime::AnyClass::get(c"NSURL") else { return };
         let ns_url: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::runtime::AnyClass::get(c"NSURL").unwrap(), URLWithString: &*objc2_foundation::NSString::from_str(url)];
+            objc2::msg_send![url_cls, URLWithString: &*objc2_foundation::NSString::from_str(url)];
         if !ns_url.is_null() {
             let _: bool = objc2::msg_send![&*ws, openURL: &*ns_url];
         }
@@ -136,6 +137,13 @@ fn refresh_status(ui: &MainWindow, logs: &Logs) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // panic 落盘：GUI 无 stderr，崩溃后可读 /tmp/vdev-panic.log 定位
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("[unix={}] {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), info);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/vdev-panic.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+        eprintln!("{}", info);
+    }));
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--selftest-screen") {
         let dur = args
@@ -218,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1080,
             60,
             move |buf, w, h, stride| {
-                let mut guard = VIDEO_CLIENT.lock().unwrap();
+                let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
                 if guard.is_none() {
                     *guard = frame::connect().ok();
                 }
@@ -255,7 +263,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_install(move || {
-            let Some(ui) = weak.upgrade() else { return };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
             append_log(&ui, &logs, format!("激活扩展: {}", BUNDLE_ID));
             set_status(&ui, "⏳", "正在安装…", "正在请求系统激活摄像头扩展。");
             set_enabled(&ui, false, false, false, false);
@@ -317,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = sysext::submit(BUNDLE_ID, true, Box::new(cb)) {
                 append_log(&ui, &logs, format!("提交失败: {}", e));
             }
-        });
+        }));});
     }
 
     // 卸载
@@ -325,7 +334,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_uninstall(move || {
-            let Some(ui) = weak.upgrade() else { return };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
             append_log(&ui, &logs, format!("停用扩展: {}", BUNDLE_ID));
             set_status(&ui, "⏳", "正在卸载…", "正在从系统移除摄像头扩展。");
             set_enabled(&ui, false, false, false, false);
@@ -355,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = sysext::submit(BUNDLE_ID, false, Box::new(cb)) {
                 append_log(&ui, &logs, format!("提交失败: {}", e));
             }
-        });
+        }));});
     }
 
     // 刷新状态
@@ -363,25 +373,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_refresh(move || {
-            let Some(ui) = weak.upgrade() else { return };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
             refresh_status(&ui, &logs);
-        });
+        }));});
     }
 
     // 打开系统设置 / QuickTime
     {
         let weak = ui_weak.clone();
         ui.on_open_settings(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if weak.upgrade().is_some() {
                 open_url(SETTINGS_URL);
             }
-        });
+        }));});
         let weak = ui_weak.clone();
         ui.on_open_quicktime(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if weak.upgrade().is_some() {
                 open_quicktime();
             }
-        });
+        }));});
     }
 
     // 创建/销毁虚拟屏幕
@@ -389,7 +402,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_vd_create(move || {
-            let Some(ui) = weak.upgrade() else { return };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
             if vscreen::display_id().is_some() {
                 vscreen::destroy();
                 append_log(&ui, &logs, "虚拟屏幕已销毁");
@@ -408,7 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-        });
+        }));});
     }
 
     // 屏幕推流（主显示器）
@@ -416,28 +430,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_screen_push(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            if *PUSH_MODE.lock().unwrap() == Some(PushMode::ScreenMain) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
+            if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::ScreenMain) {
                 stop_current_push(&ui, &logs);
             } else {
                 start_screen_push(&ui, &logs, screen::main_display_id(), PushMode::ScreenMain);
             }
-        });
+        }));});
     }
     // 视频推流
     {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_video_push(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            if *PUSH_MODE.lock().unwrap() == Some(PushMode::Video) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
+            if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::Video) {
                 VIDEO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
                 stop_current_push(&ui, &logs);
                 return;
             }
             let Some(path) = video::pick_video_url() else { return };
             stop_current_push(&ui, &logs);
-            *PUSH_MODE.lock().unwrap() = Some(PushMode::Video);
+            *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PushMode::Video);
             VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
             set_btn_texts(&ui);
             append_log(&ui, &logs, format!("视频推流开始: {}", path));
@@ -448,7 +464,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 1080,
                 60,
                 move |buf, w, h, stride| {
-                    let mut guard = VIDEO_CLIENT.lock().unwrap();
+                    let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.is_none() {
                         *guard = frame::connect().ok();
                     }
@@ -459,8 +475,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 move || {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = done_ui.upgrade() {
-                            if *PUSH_MODE.lock().unwrap() == Some(PushMode::Video) {
-                                *PUSH_MODE.lock().unwrap() = None;
+                            if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::Video) {
+                                *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                 set_btn_texts(&ui);
                             }
                         }
@@ -468,18 +484,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ) {
                 append_log(&ui, &logs, format!("视频推流启动失败: {}", e));
-                *PUSH_MODE.lock().unwrap() = None;
+                *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 set_btn_texts(&ui);
             }
-        });
+        }));});
     }
     // 推虚拟屏幕
     {
         let weak = ui_weak.clone();
         let logs = logs.clone();
         ui.on_vd_push(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            if *PUSH_MODE.lock().unwrap() == Some(PushMode::ScreenVd) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
+            if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::ScreenVd) {
                 stop_current_push(&ui, &logs);
                 return;
             }
@@ -488,7 +505,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             start_screen_push(&ui, &logs, id, PushMode::ScreenVd);
-        });
+        }));});
     }
 
     }
@@ -508,19 +525,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         ui2.invoke_vd_push();
         std::thread::sleep(Duration::from_secs(4));
-        println!("ui-selftest: vd_push -> mode={:?}", *PUSH_MODE.lock().unwrap());
+        println!("ui-selftest: vd_push -> mode={:?}", *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()));
 
         ui2.invoke_vd_push();
         std::thread::sleep(Duration::from_secs(2));
-        println!("ui-selftest: vd_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap());
+        println!("ui-selftest: vd_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()));
 
         ui2.invoke_screen_push();
         std::thread::sleep(Duration::from_secs(3));
-        println!("ui-selftest: screen_push -> mode={:?}", *PUSH_MODE.lock().unwrap());
+        println!("ui-selftest: screen_push -> mode={:?}", *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()));
 
         ui2.invoke_screen_push();
         std::thread::sleep(Duration::from_secs(2));
-        println!("ui-selftest: screen_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap());
+        println!("ui-selftest: screen_push stop -> mode={:?}", *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()));
 
         vscreen::destroy();
         return Ok(());

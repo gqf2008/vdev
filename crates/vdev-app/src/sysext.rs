@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use dispatch2::{DispatchObject, DispatchQueue};
 use objc2::define_class;
 use objc2::msg_send;
+use objc2::rc::Retained;
 use objc2::ClassType;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2_foundation::{NSInteger, NSString};
@@ -45,13 +46,9 @@ fn fire(ev: SysextEvent) {
 
 fn error_description(err: &AnyObject) -> String {
     unsafe {
-        let s: *mut NSString = msg_send![err, localizedDescription];
-        if s.is_null() {
-            "未知错误".to_string()
-        } else {
-            let retained = objc2::rc::Retained::from_raw(s).unwrap();
-            retained.to_string()
-        }
+        // msg_send! 返回 Retained 会对 autoreleased 结果 retain（安全持有）
+        let s: Retained<NSString> = msg_send![err, localizedDescription];
+        s.to_string()
     }
 }
 
@@ -103,7 +100,7 @@ fn sysext_queue() -> *mut c_void {
 }
 
 fn ensure_delegate() -> *mut AnyObject {
-    let mut p = DELEGATE_PTR.lock().unwrap();
+    let mut p = DELEGATE_PTR.lock().unwrap_or_else(|e| e.into_inner());
     if *p == 0 {
         let obj: *mut AnyObject = unsafe { msg_send![SysextDelegate::class(), new] };
         *p = obj as usize;
@@ -145,7 +142,7 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
         let _: () = msg_send![&*req, setDelegate: &*delegate];
         let _: () = msg_send![&*shared, submitRequest: &*req];
     }
-    *REQUEST_PTR.lock().unwrap() = req as usize;
+    *REQUEST_PTR.lock().unwrap_or_else(|e| e.into_inner()) = req as usize;
     Ok(())
 }
 
