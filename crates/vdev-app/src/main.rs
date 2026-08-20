@@ -16,7 +16,7 @@ slint_pixel::impl_title_bar_ui!(MainWindow);
 
 const BUNDLE_ID: &str = "com.vdev.camera.host.extension";
 const SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.ExtensionsPreferences";
-const QUICKTIME_PATH: &str = "/System/Applications/Quick Time Player.app";
+const QUICKTIME_PATH: &str = "/System/Applications/QuickTime Player.app";
 
 type Logs = Arc<Mutex<Vec<String>>>;
 
