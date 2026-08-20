@@ -5,7 +5,7 @@
 | 设备 | 技术路线 | 状态 |
 |---|---|---|
 | 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
-| 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension**（Swift 薄壳 + Rust 帧核心） | 🚧 已构建可编译，待 Apple 描述文件激活 |
+| 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension**（Swift 薄壳 + Rust 帧核心） | ✅ 可用（QuickTime 可见 Rust 彩条） |
 | 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
 
 ## 为什么不用 kext / DriverKit
@@ -50,37 +50,51 @@ vdev camera frame --out /tmp/frame.ppm
 vdev hid listen --seconds 10
 ```
 
-## 虚拟摄像头：CMIOExtension（进行中）
+## 虚拟摄像头：CMIOExtension（✅ 已可用）
 
 **实测结论（macOS 26.5）**：DAL 插件已被系统停载（12.3 弃用），现代路线是 CMIOExtension。
 
-现状：
-- ✅ Rust 核心新增 BGRA32 C ABI（`vdev_camera_render_bgra32`）
-- ✅ `crates/vdev-camera/extension/`：CMIOExtension 系统扩展（Swift 薄壳 + Rust 帧源，1280x720@30fps SMPTE）
-- ✅ `crates/vdev-camera/host/`：宿主 App（安装/卸载按钮）
-- ✅ XcodeGen + xcodebuild 构建通过，Developer ID 手动签名验证通过
-- ⏳ **阻塞**：系统扩展激活需要宿主 App 带 `com.apple.developer.system-extension.install`
-  受限 entitlement，必须配套含 System Extension capability 的**描述文件**（AMFI 无 profile 直接杀进程）。
-  需在 Xcode 登录 Apple 开发者账号后 `make build-autosign`。
+### 使用步骤（普通用户）
+
+1. 打开 `/Applications/VDCamera.app`，点「**安装虚拟摄像头**」。
+2. 首次会在 系统设置 → 通用 → 登录项与扩展 → 扩展 → 按类别 → 相机扩展 里需要批准
+   （App 会自动打开设置页并引导）。
+3. 状态变为「✓ 已安装，摄像头可用」后，在任何 App 的摄像头列表里选择 **vdev-camera**：
+   - **QuickTime**：文件 → 新建影片录制 → 摄像头选 vdev-camera
+   - **Zoom / FaceTime / 腾讯会议**：设置 → 摄像头 → vdev-camera
+4. 卸载：打开 VDCamera.app 点「**卸载虚拟摄像头**」。
+
+### 开发构建
 
 ```bash
 cd crates/vdev-camera
 make build-autosign   # 前提：Xcode → Settings → Accounts 已登录开发者账号
+# 产物：/Applications/VDCamera.app（含系统扩展），打开后点「安装虚拟摄像头」
 ```
+
+### 踩坑记录（已沉淀）
+
+- 激活校验链：`.systemextension` 文件名=bundle ID → 宿主+扩展都要
+  `NSSystemExtensionUsageDescription` → 宿主+扩展要有同名 `application-groups` →
+  `CMIOExtensionMachServiceName` 必须以 App Group 为前缀 → 换二进制必须递增版本号。
+- 运行时：`CMIOExtensionProvider` 进程级单例只能建一个；`device.addStream` 必须先于
+  `provider.addDevice`（否则零流设备、能枚举但 0 帧）；`legacyDeviceID` 填 UUID 字符串。
+- 详见 `docs/RESEARCH.md` 与 `~/.agents/rules/LESSON_CMIOExtension虚拟摄像头激活与出帧的连环坑.md`。
+
 `crates/vdev-camera/dal/` 的旧 DAL 插件保留作学习样本。
 
 ## 权限说明
 
 - **注入按键**：`CGEventPost` 无需辅助功能权限（macOS 10.15+ 对合成事件放行）。
 - **拦截/监听**（后续功能）：需要「辅助功能」权限。
-- **虚拟摄像头**：宿主 App（QuickTime/Zoom）需要摄像头权限；插件装到 `/Library/CoreMediaIO/Plug-Ins/DAL/`。
+- **虚拟摄像头**：宿主 App 需要摄像头权限（仅用于检测安装状态）；扩展需在系统设置中批准；
+  使用方（QuickTime/Zoom 等）各自需要摄像头权限。
 - **虚拟屏幕**：使用私有 API，仅供学习研究，不同 macOS 版本可能行为不同。
 
 ## 路线图
 
 - [x] 调研三条技术路线（见 docs/RESEARCH.md）
-- [ ] vdev-hid：键码/文本/鼠标注入 CLI 可用
-- [ ] vdev-screen：创建/列出/销毁虚拟显示器
-- [ ] vdev-camera：Rust 帧核心（彩条/渐变）+ 帧服务
-- [ ] vdev-camera：DAL 插件薄壳接通 Rust 核心，QuickTime 可见
+- [x] vdev-hid：键码/文本/鼠标注入 CLI 可用
+- [x] vdev-screen：创建/列出/销毁虚拟显示器
+- [x] vdev-camera：Rust 帧核心 + CMIOExtension 全链路，QuickTime 可见
 - [ ] 组合玩法：虚拟屏幕 + 摄像头串流（配合 SFU 经验）
