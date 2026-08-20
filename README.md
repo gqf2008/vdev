@@ -72,6 +72,23 @@ make build-autosign   # 前提：Xcode → Settings → Accounts 已登录开发
 # 产物：/Applications/VDCamera.app（含系统扩展），打开后点「安装虚拟摄像头」
 ```
 
+### 真实画面推流通道（✅ 可用）
+
+扩展开启后监听 `127.0.0.1:27890`，外部工具把 BGRA32 帧推进来，摄像头就显示真实画面；
+超过 0.5s 没有新帧自动回落到 Rust 彩条。
+
+```bash
+# 推送一张图片（循环，方便验证通道）
+cd crates/vdev-camera/tools
+swift push_frames.swift image /path/to/pic.png --fps 30
+
+# 推送真实屏幕画面（缩放到 1280x720；首次需授权 屏幕录制）
+swift push_frames.swift screen --fps 30
+```
+
+帧协议：36 字节小端头（magic "VDFR" / version / width / height / stride / ptsNs / payloadLen）
++ `stride*height` 字节 BGRA32（见 `extension/FrameChannel.swift`）。
+
 ### 踩坑记录（已沉淀）
 
 - 激活校验链：`.systemextension` 文件名=bundle ID → 宿主+扩展都要
