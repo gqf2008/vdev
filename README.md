@@ -62,8 +62,12 @@ vdev hid listen --seconds 10
 - **已内置自动修复**：激活完成但 15s 内摄像头未出现时，App 自动「停用→重新启用→轮询」；
   需要批准会自动打开系统设置。也可 CLI 触发：`/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-recover`。
 - **同屏只能有一个虚拟屏**：CLI `vdev screen create` 与 App 互斥，占用时创建会失败（日志有提示）。
-- **崩溃排查**：App 回调全部 `catch_unwind`，panic 会落盘 `/tmp/vdev-panic.log`；崩溃报告在
-  `~/Library/Logs/DiagnosticReports/vdev-camera-*.ips`。
+- **崩溃排查**：App 回调全部 `catch_unwind`，panic 会落盘 `$HOME/vdev-panic.log`
+  （沙盒 App 写不了 /tmp，沙盒容器里即 `~/Library/Containers/com.vdev.camera.host/Data/vdev-panic.log`）；
+  崩溃报告在 `~/Library/Logs/DiagnosticReports/vdev-camera-*.ips`。
+- **文件选择器（视频推流）依赖沙盒文件权限**：宿主 App 是沙盒应用，entitlements 必须带
+  `com.apple.security.files.user-selected.read-only`，否则 `NSOpenPanel` 返回 NULL、
+  选择器弹不出来（历史上就是这原因）。改过 entitlements 后记得 `make install-rust` 重新签名安装。
 - **旧版本残留**：多次迭代留下的僵尸扩展 `[terminated waiting to uninstall on reboot]` 无害，
   重启一次自动清理。
 
@@ -94,6 +98,7 @@ cargo build -p vdev-app --release
 ./target/release/vdev-app --ui-selftest         # UI 回调接线：建虚拟屏/推流 开始/停止
 ./target/release/vdev-app --selftest-screen --dur 8    # 屏幕推流（CGDisplayStream → TCP）
 ./target/release/vdev-app --selftest-video --file x.mp4 --dur 8  # 视频推流（AVAssetReader）
+/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-openpanel  # 沙盒内验证 NSOpenPanel 可创建（不弹窗）
 /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-sysext  # 安装/卸载委托回调
 ```
 

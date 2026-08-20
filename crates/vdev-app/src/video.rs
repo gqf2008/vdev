@@ -8,7 +8,7 @@ use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
 use objc2_av_foundation::{
     AVAssetReader, AVAssetReaderTrackOutput, AVMediaTypeVideo, AVURLAsset,
 };
-use objc2_foundation::{NSDictionary, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
 
 mod ffi {
     use std::ffi::c_void;
@@ -55,30 +55,123 @@ pub fn host_time_ns() -> u64 {
     }
 }
 
-/// 主线程弹文件选择器，返回选中视频路径（取消返回 None）。
-pub fn pick_video_url() -> Option<String> {
+/// 确保 NSApplication 已初始化（否则 NSOpenPanel 返回 NULL）。
+pub fn ensure_nsapp() {
     unsafe {
-        let mtm = objc2::MainThreadMarker::new()?;
-        let panel = NSOpenPanel::openPanel(mtm);
-        let _: () = msg_send![&*panel, setCanChooseDirectories: false];
-        let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
-        let resp = panel.runModal();
-        if resp == NSModalResponseOK {
-            panel
-                .URLs()
-                .firstObject()
-                .and_then(|u| u.path().map(|p| p.to_string()))
-                .or_else(|| Some(String::new()))
-        } else {
-            None
+        let Some(cls) = objc2::runtime::AnyClass::get(c"NSApplication") else { return };
+        let app: *mut objc2::runtime::AnyObject = objc2::msg_send![cls, sharedApplication];
+        if !app.is_null() {
+            let _: () = objc2::msg_send![&*app, setActivationPolicy: 0]; // Regular
+            let _: bool = objc2::msg_send![&*app, activateIgnoringOtherApps: true];
         }
     }
+}
+
+/// 沙盒内读取用户所选文件的访问令牌：持有 NSOpenPanel 返回的 NSURL，
+/// 并保持 security-scoped 访问，直到推流结束（Drop 自动释放）。
+pub struct FileAccess {
+    url: Option<Retained<NSURL>>,
+    started: bool,
+}
+
+// NSURL 是不可变对象，跨线程只读使用是安全的。
+unsafe impl Send for FileAccess {}
+
+impl FileAccess {
+    /// 非沙盒场景（dev 自测二进制）不需要访问令牌。
+    pub fn none() -> Self {
+        Self { url: None, started: false }
+    }
+
+    fn start(url: Retained<NSURL>) -> Self {
+        let started = unsafe {
+            let ok: bool = msg_send![&*url, startAccessingSecurityScopedResource];
+            ok
+        };
+        Self { url: Some(url), started }
+    }
+}
+
+impl Drop for FileAccess {
+    fn drop(&mut self) {
+        if self.started {
+            if let Some(url) = &self.url {
+                unsafe {
+                    let _: () = msg_send![&**url, stopAccessingSecurityScopedResource];
+                }
+            }
+        }
+    }
+}
+
+/// 用户选择的视频：路径 + 沙盒访问令牌（必须存活到推流结束）。
+pub struct PickedVideo {
+    pub path: String,
+    pub access: FileAccess,
+}
+
+fn panic_detail(e: Box<dyn std::any::Any + Send>) -> String {
+    e.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| e.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知异常".to_string())
+}
+
+/// 主线程弹原生文件选择器（NSOpenPanel，非 rfd——需要保留 NSURL 供沙盒访问）。
+/// Ok(Some) 已选视频；Ok(None) 用户取消；Err 系统面板异常（如沙盒缺权限）。
+pub fn pick_video() -> Result<Option<PickedVideo>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Option<PickedVideo>, String> {
+        let mtm = objc2::MainThreadMarker::new()
+            .ok_or_else(|| "文件选择器必须在主线程打开".to_string())?;
+        #[allow(deprecated)]
+        let panel = NSOpenPanel::openPanel(mtm); // 沙盒缺 user-selected 权限时返回 NULL → panic
+        unsafe {
+            let _: () = msg_send![&*panel, setCanChooseFiles: true];
+            let _: () = msg_send![&*panel, setCanChooseDirectories: false];
+            let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
+            let _: () = msg_send![&*panel, setTitle: &*NSString::from_str("选择要推流的视频")];
+            let exts: Vec<Retained<NSString>> = ["mp4", "mov", "m4v", "mkv"]
+                .iter()
+                .map(|e| NSString::from_str(e))
+                .collect();
+            let array = NSArray::from_retained_slice(&exts);
+            #[allow(deprecated)]
+            let _: () = msg_send![&*panel, setAllowedFileTypes: Some(&*array)];
+        }
+        let resp = panel.runModal();
+        if resp == NSModalResponseOK {
+            let url = panel
+                .URL()
+                .ok_or_else(|| "未获取到所选文件的 URL".to_string())?;
+            let path = url
+                .path()
+                .map(|p| p.to_string())
+                .ok_or_else(|| "所选文件路径为空".to_string())?;
+            let access = FileAccess::start(url);
+            Ok(Some(PickedVideo { path, access }))
+        } else {
+            Ok(None)
+        }
+    }))
+    .map_err(|e| format!("系统文件选择器异常: {}", panic_detail(e)))?
+}
+
+/// 只验证 NSOpenPanel 能否创建（不弹窗、不阻塞），用于沙盒权限自测。
+pub fn openpanel_selftest() -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mtm = objc2::MainThreadMarker::new()
+            .ok_or_else(|| "文件选择器必须在主线程打开".to_string())?;
+        let _panel = NSOpenPanel::openPanel(mtm);
+        Ok::<(), String>(())
+    }))
+    .map_err(|e| format!("NSOpenPanel 创建失败: {}", panic_detail(e)))?
 }
 
 /// 解码并推流视频（后台线程）。on_frame 回调已缩放 BGRA32；
 /// 结束时（自然播完或被 stop）调用 on_done。
 pub fn push_video(
     path: &str,
+    access: FileAccess,
     width: u32,
     height: u32,
     fps: u32,
@@ -87,6 +180,8 @@ pub fn push_video(
 ) -> Result<()> {
     let path = path.to_string();
     std::thread::spawn(move || {
+        // access 随线程存活：沙盒内 security-scoped 权限保持到推流结束
+        let _access = access;
         let r = run(&path, width, height, fps, on_frame);
         if let Err(e) = &r {
             eprintln!("视频推流失败: {}", e);

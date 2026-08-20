@@ -198,11 +198,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // panic 落盘：GUI 无 stderr，崩溃后可读 /tmp/vdev-panic.log 定位
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("[unix={}] {}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), info);
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/vdev-panic.log")
+        // 沙盒 App 写不了 /tmp，优先写 $HOME（容器目录）
+        let path = std::env::var("HOME")
+            .map(|h| format!("{}/vdev-panic.log", h))
+            .unwrap_or_else(|_| "/tmp/vdev-panic.log".to_string());
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
         eprintln!("{}", info);
     }));
+    video::ensure_nsapp();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--selftest-openpanel") {
+        // 只验证 NSOpenPanel 可创建（不弹窗），沙盒权限自测用
+        match video::openpanel_selftest() {
+            Ok(()) => println!("selftest-openpanel: OK"),
+            Err(e) => println!("selftest-openpanel: FAIL {}", e),
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--selftest-screen") {
         let dur = args
             .iter()
@@ -280,6 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("selftest-video: {} 推流 {dur}s …", path);
         video::push_video(
             &path,
+            video::FileAccess::none(),
             1920,
             1080,
             60,
@@ -553,48 +567,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stop_current_push(&ui, &logs);
                 return;
             }
+            // NSOpenPanel 必须在主线程：经 invoke_from_event_loop 派发到 UI 线程
             append_log(&ui, &logs, "正在打开文件选择器…");
-            let Some(path) = video::pick_video_url() else {
-                append_log(&ui, &logs, "未选择视频（已取消）");
-                return;
-            };
-            append_log(&ui, &logs, format!("已选择: {}", path));
-            stop_current_push(&ui, &logs);
-            *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PushMode::Video);
-            VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
-            set_btn_texts(&ui);
-            append_log(&ui, &logs, format!("视频推流开始: {}", path));
-            let done_ui = ui.as_weak();
-            if let Err(e) = video::push_video(
-                &path,
-                1920,
-                1080,
-                60,
-                move |buf, w, h, stride| {
-                    let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.is_none() {
-                        *guard = frame::connect().ok();
-                    }
-                    if let Some(c) = guard.as_mut() {
-                        let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
-                    }
-                },
-                move || {
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = done_ui.upgrade() {
-                            if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::Video) {
-                                *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                                set_btn_texts(&ui);
-                            }
+            let ui2 = ui.as_weak();
+            let logs2 = logs.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let ui = match ui2.upgrade() { Some(ui) => ui, None => return };
+                    let picked = match video::pick_video() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            append_log(&ui, &logs2, "未选择视频（已取消）");
+                            return;
                         }
-                    });
-                },
-            ) {
-                append_log(&ui, &logs, format!("视频推流启动失败: {}", e));
-                *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                set_btn_texts(&ui);
-            }
-        }));});
+                        Err(e) => {
+                            append_log(&ui, &logs2, format!("打开文件选择器失败: {}", e));
+                            return;
+                        }
+                    };
+                    let path = picked.path;
+                    append_log(&ui, &logs2, format!("已选择: {}", path));
+                    stop_current_push(&ui, &logs2);
+                    *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PushMode::Video);
+                    VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+                    set_btn_texts(&ui);
+                    append_log(&ui, &logs2, format!("视频推流开始: {}", path));
+                    let done_ui = ui.as_weak();
+                    let logs3 = logs2.clone();
+                    if let Err(e) = video::push_video(
+                        &path,
+                        picked.access,
+                        1920,
+                        1080,
+                        60,
+                        move |buf, w, h, stride| {
+                            let mut guard = VIDEO_CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.is_none() {
+                                *guard = frame::connect().ok();
+                            }
+                            if let Some(c) = guard.as_mut() {
+                                let _ = c.send_frame(&buf, w, h, stride, video::host_time_ns());
+                            }
+                        },
+                        move || {
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = done_ui.upgrade() {
+                                    if *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) == Some(PushMode::Video) {
+                                        *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                        set_btn_texts(&ui);
+                                    }
+                                }
+                            });
+                        },
+                    ) {
+                        append_log(&ui, &logs3, format!("视频推流启动失败: {}", e));
+                        *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        set_btn_texts(&ui);
+                    }
+                }));
+            });
+        }));
+    });
     }
     // 推虚拟屏幕
     {
@@ -619,6 +652,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     wire_ui(&ui, &logs);
 
+    if args.iter().any(|a| a == "--selftest-pick") {
+        println!("selftest-pick: 打开文件选择器…");
+        match video::pick_video() {
+            Ok(Some(p)) => println!("selftest-pick: result={:?}", p.path),
+            Ok(None) => println!("selftest-pick: cancelled"),
+            Err(e) => println!("selftest-pick: ERROR {}", e),
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--selftest-recover") {
         let log = Arc::new(|line: String| println!("recover: {}", line));
         recover_extension(log);
@@ -664,6 +706,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     refresh_status(&ui, &logs);
+
+    if args.iter().any(|a| a == "--auto-pick-test") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let log_path = format!("{}/pick-gui.log", home);
+        let _ = std::fs::write(&log_path, "scheduled\n");
+        let _ = slint::invoke_from_event_loop(move || {
+            let _ = std::fs::write(&log_path, "calling pick\n");
+            let r = video::pick_video();
+            let _ = std::fs::write(&log_path, format!("result={:?}\n", r.map(|o| o.map(|p| p.path))));
+        });
+    }
+
     ui.run()?;
     Ok(())
 }
