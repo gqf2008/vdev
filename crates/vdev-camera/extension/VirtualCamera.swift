@@ -10,6 +10,7 @@ final class VirtualCamera {
     private let providerSource: ProviderSource
     private let deviceSource: DeviceSource
     private let streamSource: StreamSource
+    private let frameChannel = FrameChannel()
 
     init(localizedName: String, dimensions: CMVideoDimensions, frameRate: Int32, pattern: Int32) throws {
         var fmt: CMFormatDescription?
@@ -77,9 +78,12 @@ final class VirtualCamera {
 
         streamSource.delegate = self
         frameSource.delegate = self
+        frameChannel.delegate = self
     }
 
     func start() {
+        // 开启真实帧推流通道（127.0.0.1:27890），外部工具可推 BGRA32 帧
+        frameChannel.start()
         CMIOExtensionProvider.startService(provider: provider)
     }
 }
@@ -88,6 +92,15 @@ extension VirtualCamera: StreamSourceDelegate {
     func streamSourceShouldAuthorizeStartOfStream(_ source: StreamSource) -> Bool { true }
     func streamSourceDidStartStream(_ source: StreamSource) { frameSource.startStreaming() }
     func streamSourceDidStopStream(_ source: StreamSource) { frameSource.stopStreaming() }
+}
+
+extension VirtualCamera: FrameChannelDelegate {
+    func frameChannel(_ channel: FrameChannel,
+                      didReceiveFrame data: Data,
+                      width: Int32, height: Int32, stride: Int32, ptsNs: UInt64) {
+        frameSource.injectFrame(data: data, width: width, height: height,
+                                stride: Int(stride), ptsNs: ptsNs)
+    }
 }
 
 extension VirtualCamera: RustFrameSourceDelegate {

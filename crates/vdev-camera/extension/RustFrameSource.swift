@@ -25,6 +25,19 @@ final class RustFrameSource {
     private let queue = DispatchQueue(label: "com.vdev.camera.frames")
     private var timer: DispatchSourceTimer?
 
+    // 真实帧注入（来自 FrameChannel 推流）
+    private struct InjectedFrame {
+        let data: Data
+        let width: Int32
+        let height: Int32
+        let stride: Int
+        let ptsNs: UInt64
+        let receivedAt: CFAbsoluteTime
+    }
+    private let injectLock = NSLock()
+    private var injected: InjectedFrame?
+    private let injectedFreshWindow: CFAbsoluteTime = 0.5 // 超过 0.5s 没有新帧就回落到 Rust 彩条
+
     init(
         formatDescription: CMFormatDescription,
         width: Int32,
@@ -70,17 +83,107 @@ final class RustFrameSource {
         timer = nil
     }
 
+    /// 外部推流线程调用：写入一帧真实画面（线程安全）。
+    func injectFrame(data: Data, width: Int32, height: Int32, stride: Int, ptsNs: UInt64) {
+        injectLock.lock()
+        injected = InjectedFrame(data: data, width: width, height: height,
+                                 stride: stride, ptsNs: ptsNs,
+                                 receivedAt: CFAbsoluteTimeGetCurrent())
+        injectLock.unlock()
+    }
+
+    private func takeFreshInjectedFrame() -> InjectedFrame? {
+        injectLock.lock()
+        defer { injectLock.unlock() }
+        guard let inj = injected,
+              CFAbsoluteTimeGetCurrent() - inj.receivedAt < injectedFreshWindow else {
+            return nil
+        }
+        return inj
+    }
+
     private func emitFrame() {
         guard let delegate else { return }
         do {
-            let sample = try nextSampleBuffer()
-            let now = CMClockGetTime(CMClockGetHostTimeClock())
-            let ns = UInt64(now.seconds * Double(NSEC_PER_SEC))
+            let sample: CMSampleBuffer
+            let ns: UInt64
+            if let inj = takeFreshInjectedFrame() {
+                sample = try nextSampleBufferFromInjected(inj)
+                ns = inj.ptsNs
+            } else {
+                sample = try nextSampleBuffer()
+                let now = CMClockGetTime(CMClockGetHostTimeClock())
+                ns = UInt64(now.seconds * Double(NSEC_PER_SEC))
+            }
             delegate.frameSource(self, didReceiveSampleBuffer: sample,
                                  discontinuity: [], hostTimeInNanoseconds: ns)
         } catch {
             NSLog("vdev-camera: frame error: \(error)")
         }
+    }
+
+    /// 从推流通道收到的 BGRA32 裸数据构造 CMSampleBuffer。
+    private func nextSampleBufferFromInjected(_ inj: InjectedFrame) throws -> CMSampleBuffer {
+        let attrs: NSDictionary = [
+            kCVPixelBufferWidthKey: inj.width,
+            kCVPixelBufferHeightKey: inj.height,
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        ]
+        var pb: CVPixelBuffer?
+        let cstatus = CVPixelBufferCreate(
+            kCFAllocatorDefault, Int(inj.width), Int(inj.height),
+            kCVPixelFormatType_32BGRA, attrs, &pb)
+        guard cstatus == kCVReturnSuccess, let pb else {
+            throw NSError(domain: "vdev.camera", code: Int(cstatus),
+                          userInfo: [NSLocalizedDescriptionKey: "pixel buffer create failed: \(cstatus)"])
+        }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let dst = CVPixelBufferGetBaseAddress(pb) else {
+            throw NSError(domain: "vdev.camera", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "no base address"])
+        }
+        let dstStride = CVPixelBufferGetBytesPerRow(pb)
+        guard inj.data.count >= inj.stride * Int(inj.height) else {
+            throw NSError(domain: "vdev.camera", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "payload too short"])
+        }
+        inj.data.withUnsafeBytes { srcRaw in
+            guard let src = srcRaw.baseAddress else { return }
+            let srcPtr = src.assumingMemoryBound(to: UInt8.self)
+            let dstPtr = dst.assumingMemoryBound(to: UInt8.self)
+            if inj.stride == dstStride {
+                memcpy(dstPtr, srcPtr, inj.stride * Int(inj.height))
+            } else {
+                for row in 0..<Int(inj.height) {
+                    memcpy(dstPtr + row * dstStride, srcPtr + row * inj.stride, Int(inj.stride))
+                }
+            }
+        }
+
+        var fmt: CMVideoFormatDescription?
+        let fstatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: nil, imageBuffer: pb, formatDescriptionOut: &fmt)
+        guard fstatus == noErr, let fmt else {
+            throw NSError(domain: "vdev.camera", code: Int(fstatus),
+                          userInfo: [NSLocalizedDescriptionKey: "format description failed: \(fstatus)"])
+        }
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: frameRate),
+            presentationTimeStamp: CMTime(value: Int64(inj.ptsNs), timescale: 1_000_000_000),
+            decodeTimeStamp: .invalid
+        )
+        var sample: CMSampleBuffer?
+        let sstatus = CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: pb, dataReady: true,
+            makeDataReadyCallback: nil, refcon: nil, formatDescription: fmt,
+            sampleTiming: &timing, sampleBufferOut: &sample)
+        guard sstatus == noErr, let sample else {
+            throw NSError(domain: "vdev.camera", code: Int(sstatus),
+                          userInfo: [NSLocalizedDescriptionKey: "sample buffer failed: \(sstatus)"])
+        }
+        return sample
     }
 
     private func nextSampleBuffer() throws -> CMSampleBuffer {
