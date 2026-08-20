@@ -78,6 +78,64 @@ fn start_screen_push(ui: &MainWindow, logs: &Logs, display_id: u32, mode: PushMo
     }
 }
 
+
+/// 自动修复 launchd 竞态：停用 → 等待清理 → 重新启用 → 确认摄像头。
+/// log 在后台线程回调。
+fn recover_extension(log: Arc<dyn Fn(String) + Send + Sync>) {
+    log("自动修复：先停用再重新启用扩展…".to_string());
+    let l2 = log.clone();
+    let cb = move |ev: sysext::SysextEvent| {
+        let lg = l2.clone();
+        match ev {
+            sysext::SysextEvent::Finished(_) => {
+                lg("已停用，等待 6s 后重新启用…".to_string());
+                let lg2 = lg.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(6));
+                    lg2("重新启用…".to_string());
+                    let lg3 = lg2.clone();
+                    let cb3 = move |ev3: sysext::SysextEvent| {
+                        let lg4 = lg3.clone();
+                        match ev3 {
+                            sysext::SysextEvent::Finished(0) => {
+                                lg4("启用完成，确认摄像头…".to_string());
+                                let lg5 = lg4.clone();
+                                std::thread::spawn(move || {
+                                    let mut ok = false;
+                                    for _ in 0..30 {
+                                        if camera::find_vdev() {
+                                            ok = true;
+                                            break;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(500));
+                                    }
+                                    lg5(if ok {
+                                        "✅ 摄像头已恢复".to_string()
+                                    } else {
+                                        "❌ 仍未出现：请到 系统设置 → … → 相机扩展 关闭再打开，或重启电脑".to_string()
+                                    });
+                                });
+                            }
+                            sysext::SysextEvent::NeedsApproval => {
+                                lg4("重新启用需要批准：系统设置 → … → 相机扩展".to_string())
+                            }
+                            sysext::SysextEvent::Failed(e) => {
+                                lg4(format!("重新启用失败: {}", e))
+                            }
+                            _ => {}
+                        }
+                    };
+                    let _ = sysext::submit(BUNDLE_ID, true, Box::new(cb3));
+                });
+            }
+            sysext::SysextEvent::NeedsApproval => lg("停用需要系统确认".to_string()),
+            sysext::SysextEvent::Failed(e) => lg(format!("停用失败: {}", e)),
+            _ => {}
+        }
+    };
+    let _ = sysext::submit(BUNDLE_ID, false, Box::new(cb));
+}
+
 fn set_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
     let g = ui.global::<AppState>();
     g.set_status_glyph(glyph.into());
@@ -305,10 +363,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "打开 QuickTime → 新建影片录制 → 选择 vdev-camera。");
                                         set_enabled(&ui, false, true, true, vscreen::display_id().is_some());
                                     } else {
-                                        append_log(&ui, &logs2, "15 秒内未检测到摄像头");
-                                        set_status(&ui, "✕", "操作失败",
-                                            "安装请求已完成，但暂未检测到摄像头。\n请点「刷新状态」重试；或重启电脑后自动恢复。");
-                                        set_enabled(&ui, true, false, false, false);
+                                        append_log(&ui, &logs2, "15 秒内未检测到摄像头，触发自动修复");
+                                        set_status(&ui, "⏳", "正在自动修复…",
+                                            "停用→重新启用扩展，最长约 30 秒。");
+                                        let log = {
+                                            let wk = ui.as_weak();
+                                            let lg = logs.clone();
+                                            Arc::new(move |line: String| {
+                                                if line.contains("批准") {
+                                                    open_url(SETTINGS_URL);
+                                                }
+                                                let w = wk.clone();
+                                                let l = lg.clone();
+                                                let _ = slint::invoke_from_event_loop(move || {
+                                                    if let Some(ui) = w.upgrade() {
+                                                        append_log(&ui, &l, line);
+                                                    }
+                                                });
+                                            })
+                                        };
+                                        recover_extension(log);
                                     }
                                 });
                             });
@@ -512,6 +586,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     wire_ui(&ui, &logs);
 
+    if args.iter().any(|a| a == "--selftest-recover") {
+        let log = Arc::new(|line: String| println!("recover: {}", line));
+        recover_extension(log);
+        std::thread::sleep(Duration::from_secs(40));
+        println!("recover: done, camera={}", camera::find_vdev());
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--ui-selftest") {
         // 程序化触发按钮回调，验证 UI 接线（Slint invoke_* == 点击按钮）
         let ui2 = MainWindow::new()?;
