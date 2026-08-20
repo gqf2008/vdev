@@ -442,6 +442,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));});
     }
 
+    // 自动修复（停用→重新启用，解决 launchd 竞态）
+    {
+        let weak = ui_weak.clone();
+        let logs = logs.clone();
+        ui.on_recover(move || {
+            let ui = match weak.upgrade() { Some(ui) => ui, None => return };
+            append_log(&ui, &logs, "手动触发自动修复…");
+            set_status(&ui, "⏳", "正在自动修复…", "停用→重新启用扩展，最长约 30 秒。");
+            let log = {
+                let wk = ui.as_weak();
+                let lg = logs.clone();
+                Arc::new(move |line: String| {
+                    if line.contains("批准") {
+                        open_url(SETTINGS_URL);
+                    }
+                    let w = wk.clone();
+                    let l = lg.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = w.upgrade() {
+                            append_log(&ui, &l, line);
+                        }
+                    });
+                })
+            };
+            recover_extension(log);
+        });
+    }
+
     // 刷新状态
     {
         let weak = ui_weak.clone();

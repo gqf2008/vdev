@@ -32,6 +32,7 @@ export component MainWindow inherits Window {
     callback refresh();
     callback open_quicktime();
     callback screen_push();
+    callback recover();
     callback video_push();
     callback vd_create();
     callback vd_push();
@@ -74,6 +75,7 @@ export component MainWindow inherits Window {
         HorizontalLayout { spacing: 8px;
             PixelButton { text: "在 QuickTime 中打开"; clicked => { open_quicktime(); } }
             PixelButton { text: AppState.screen_btn_text; enabled: AppState.can_push; clicked => { screen_push(); } }
+            PixelButton { text: "自动修复"; clicked => { recover(); } }
             PixelButton { text: "刷新状态"; clicked => { refresh(); } }
         }
 
