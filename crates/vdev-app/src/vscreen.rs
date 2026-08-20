@@ -17,22 +17,22 @@ pub fn create_display() -> Result<u32> {
     };
     let vd = create(opts)?;
     let id = vd.display_id;
-    *slot().lock().unwrap() = Box::into_raw(Box::new(vd)) as usize;
+    *slot().lock().unwrap_or_else(|e| e.into_inner()) = Box::into_raw(Box::new(vd)) as usize;
     Ok(id)
 }
 
 pub fn destroy() {
-    let p = *slot().lock().unwrap();
+    let p = *slot().lock().unwrap_or_else(|e| e.into_inner());
     if p != 0 {
         unsafe {
             drop(Box::from_raw(p as *mut VirtualDisplay));
         }
-        *slot().lock().unwrap() = 0;
+        *slot().lock().unwrap_or_else(|e| e.into_inner()) = 0;
     }
 }
 
 pub fn display_id() -> Option<u32> {
-    let p = *slot().lock().unwrap();
+    let p = *slot().lock().unwrap_or_else(|e| e.into_inner());
     if p == 0 {
         None
     } else {

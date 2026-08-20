@@ -43,12 +43,8 @@ mod ffi {
 
 fn error_description(e: &AnyObject) -> String {
     unsafe {
-        let reason: *mut NSString = msg_send![e, reason];
-        if reason.is_null() {
-            "未知异常".to_string()
-        } else {
-            objc2::rc::Retained::from_raw(reason).unwrap().to_string()
-        }
+        let reason: Retained<NSString> = msg_send![e, reason];
+        reason.to_string()
     }
 }
 
@@ -114,7 +110,10 @@ fn run(
         let reader = AVAssetReader::assetReaderWithAsset_error(&asset)
             .ok()
             .ok_or_else(|| anyhow!("AVAssetReader 创建失败"))?;
-        let tracks = asset.tracksWithMediaType(AVMediaTypeVideo.unwrap());
+        let Some(video_type) = AVMediaTypeVideo else {
+            return Err(anyhow!("AVMediaTypeVideo 不可用"));
+        };
+        let tracks = asset.tracksWithMediaType(video_type);
         let track = tracks
             .firstObject()
             .ok_or_else(|| anyhow!("没有视频轨"))?;

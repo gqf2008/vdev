@@ -100,3 +100,14 @@ install-rust: build-rust
 	chmod -R a+rX /Applications/VDCamera.app
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCamera.app
 	@echo "installed /Applications/VDCamera.app (Rust + Slint)"
+
+# ============ 一键验证（make test）============
+# 视频自测需未沙盒 dev 二进制读任意文件；其余用安装版（含沙盒）
+.PHONY: test
+test: build-rust
+	@echo "== UI 接线（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --ui-selftest 2>&1 | grep ui-selftest
+	@echo "== 屏幕推流（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-screen --dur 3 2>&1 | tail -1
+	@echo "== 视频推流（dev 二进制；VDEV_TEST_VIDEO 指定视频）=="; \
+		$(REPO_ROOT)/target/release/vdev-app --selftest-video --file "$${VDEV_TEST_VIDEO:-/tmp/nonexistent.mp4}" --dur 3 2>&1 | tail -1
+	@echo "== sysext（安装版，须在 /Applications）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-sysext 2>&1 | tail -1
+	@echo "测试完成（视频 0 帧 = 没设 VDEV_TEST_VIDEO 或路径不在沙盒可读范围，UI 走 NSOpenPanel 不受限）"
