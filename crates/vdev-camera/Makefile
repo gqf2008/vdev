@@ -81,6 +81,7 @@ build-rust:
 		-allowProvisioningUpdates -allowProvisioningDeviceRegistration build
 	@if [ -d $(ASSEMBLE) ]; then mv $(ASSEMBLE) /tmp/VDCamera.assemble.old.$$(date +%s); fi
 	mkdir -p $(ASSEMBLE)/Contents/MacOS $(ASSEMBLE)/Contents/Resources $(ASSEMBLE)/Contents/Library/SystemExtensions
+	export COPYFILE_DISABLE=1
 	cp $(RUST_APP_BIN) $(ASSEMBLE)/Contents/MacOS/vdev-camera
 	cp ../vdev-app/Info.plist $(ASSEMBLE)/Contents/Info.plist
 	cp host/Resources/AppIcon.icns $(ASSEMBLE)/Contents/Resources/ 2>/dev/null || true
@@ -89,6 +90,7 @@ build-rust:
 		cp /Applications/VDCamera.app/Contents/embedded.provisionprofile $(ASSEMBLE)/Contents/; \
 	fi
 	sed 's/\$$(TeamIdentifierPrefix)/$(TEAM_ID)./g' host/vdev-camera.entitlements > $(BUILD)/app.entitlements
+	find $(ASSEMBLE) -name '._*' -exec mv {} /tmp/ \;
 	codesign --force --sign $(SIGN_APP_IDENTITY) --entitlements $(BUILD)/app.entitlements --options runtime --timestamp=none $(ASSEMBLE)
 	codesign --verify --deep --strict $(ASSEMBLE)
 	@echo "Rust app assembled & signed: $(ASSEMBLE)"
