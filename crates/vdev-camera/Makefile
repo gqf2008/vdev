@@ -4,7 +4,7 @@ BUILD := build/extension
 DERIVED := $(BUILD)/DerivedData
 TEAM_ID := XFXU84HVK3
 
-.PHONY: all build-rust install-rust test clean
+.PHONY: all build-rust install-rust test clean spike spike-clean
 
 all: install-rust
 
@@ -60,3 +60,41 @@ test: build-rust
 
 clean:
 	rm -rf $(BUILD) VDCamera.xcodeproj
+
+# ============ 全 Rust 扩展 spike（独立，不影响正式版 VDCamera.app）============
+# 手写 CMIOExtension ObjC 绑定 + 纯 Rust 扩展，验证后决定是否迁移正式版。
+# 宿主复用正式版 bundle id(com.vdev.camera.host) 与其 provisioning profile
+# （xcodebuild CLI 无法新建 profile，只有 GUI Xcode 能建），扩展用独立 id。
+SPIKE_ROOT := ../vdev-camera-ext
+SPIKE_BIN := $(REPO_ROOT)/target/release/vdev-camera-ext
+SPIKE_HOST_BIN := $(REPO_ROOT)/target/release/vdev-spike-host
+SPIKE_APP := $(BUILD)/VDCameraSpike.app
+SPIKE_EXT := $(SPIKE_APP)/Contents/Library/SystemExtensions/com.vdev.camera.ext.spike.systemextension
+SIGN_DEV_IDENTITY := "Apple Development: qingfeng gao (7L8FV63FAP)"
+
+spike:
+	cd $(REPO_ROOT) && cargo build -p vdev-camera-ext --release
+	@if [ ! -d /Applications/VDCamera.app ]; then echo "需要先 make install-rust 安装正式版（取 provisioning profile）"; exit 1; fi
+	@if [ -d $(SPIKE_APP) ]; then mv $(SPIKE_APP) /tmp/VDCameraSpike.old.$$(date +%s); fi
+	cp -R /Applications/VDCamera.app $(SPIKE_APP)
+	export COPYFILE_DISABLE=1
+	cp $(SPIKE_HOST_BIN) $(SPIKE_APP)/Contents/MacOS/vdev-camera
+	@if [ -d "$(SPIKE_APP)/Contents/Library/SystemExtensions/com.vdev.camera.host.extension.systemextension" ]; then mv "$(SPIKE_APP)/Contents/Library/SystemExtensions/com.vdev.camera.host.extension.systemextension" /tmp/vdev-real-ext.old.$$(date +%s); fi
+	mkdir -p $(SPIKE_EXT)/Contents/MacOS
+	cp $(SPIKE_BIN) $(SPIKE_EXT)/Contents/MacOS/vdev-camera-ext
+	cp $(SPIKE_ROOT)/spike/ext-Info.plist $(SPIKE_EXT)/Contents/Info.plist
+	find $(SPIKE_APP) -name '._*' -exec mv {} /tmp/ \;
+	codesign --force --sign $(SIGN_DEV_IDENTITY) --entitlements $(SPIKE_ROOT)/spike/ext.entitlements --options runtime --timestamp=none $(SPIKE_EXT)
+	codesign --verify --strict $(SPIKE_EXT)
+	codesign --force --sign $(SIGN_DEV_IDENTITY) --entitlements host/vdev-camera.entitlements --options runtime --timestamp=none $(SPIKE_APP)
+	codesign --verify --deep --strict $(SPIKE_APP)
+	@if [ -d /Applications/VDCameraSpike.app ]; then mv /Applications/VDCameraSpike.app /tmp/VDCameraSpike.app.old.$$(date +%s); fi
+	cp -R $(SPIKE_APP) /Applications/
+	chmod -R a+rX /Applications/VDCameraSpike.app
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/VDCameraSpike.app
+	@echo "spike app installed: /Applications/VDCameraSpike.app"
+	@echo "运行：/Applications/VDCameraSpike.app/Contents/MacOS/vdev-camera（提交激活请求）"
+
+spike-clean:
+	@if [ -d /Applications/VDCameraSpike.app ]; then mv /Applications/VDCameraSpike.app /tmp/VDCameraSpike.app.old.$$(date +%s); fi
+	@if [ -d $(BUILD)/VDCameraSpike.app ]; then mv $(BUILD)/VDCameraSpike.app /tmp/VDCameraSpike.old.$$(date +%s); fi
