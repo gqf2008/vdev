@@ -3,6 +3,9 @@
 //! 经过可插拔滤镜链，再推给 FrameChannel → 虚拟摄像头。
 //! 设计目标：无堆分配、纯整数/浮点逐像素，实时帧处理友好。
 
+#[cfg(feature = "vision")]
+pub mod vision;
+
 /// 一个 8-bit 像素（BGRA 字节序：b,g,r,a）
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pixel {

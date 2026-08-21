@@ -4,4 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+vision = ["objc2", "objc2-foundation", "dep:block2"]
+
 [dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSArray", "NSString", "NSDictionary"] }
+block2 = { version = "0.6", optional = true }
