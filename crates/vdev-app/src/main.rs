@@ -144,6 +144,13 @@ fn set_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
     g.set_status_detail(detail.into());
 }
 
+fn set_audio_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
+    let g = ui.global::<AppState>();
+    g.set_audio_glyph(glyph.into());
+    g.set_audio_title(title.into());
+    g.set_audio_detail(detail.into());
+}
+
 fn set_enabled(ui: &MainWindow, install: bool, uninstall: bool, push: bool, vd_push: bool) {
     let g = ui.global::<AppState>();
     g.set_can_install(install);
@@ -193,6 +200,17 @@ fn refresh_status(ui: &MainWindow, logs: &Logs) {
             "点击「安装虚拟摄像头」，然后在系统提示中允许扩展。");
         set_enabled(ui, true, false, false, false);
     }
+    // 虚拟声卡检测：vdev-audio（输出环回输入，音频推流目标）
+    let audio_ok = audio::find_vdev_audio();
+    if audio_ok {
+        set_audio_status(ui, "✓", "虚拟声卡可用",
+            "系统已能看到 vdev-audio。会议/录制软件把麦克风选成 vdev-audio 即可收到视频音轨。");
+        append_log(ui, logs, "检测到虚拟声卡：vdev-audio");
+    } else {
+        set_audio_status(ui, "○", "虚拟声卡未安装",
+            "未检测到 vdev-audio。在 crates/vdev-audio 下执行 make install 安装。");
+        append_log(ui, logs, "未检测到虚拟声卡：vdev-audio（cd crates/vdev-audio && make install）");
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -209,6 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     video::ensure_nsapp();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--selftest-audio") {
+        // 虚拟声卡检测自测：枚举 CoreAudio 设备，找 vdev-audio
+        println!("selftest-audio: vdev-audio={}", audio::find_vdev_audio());
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--selftest-openpanel") {
         // 只验证 NSOpenPanel 可创建（不弹窗），沙盒权限自测用
         match video::openpanel_selftest() {

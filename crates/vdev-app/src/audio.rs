@@ -393,6 +393,11 @@ fn find_device_id(keyword: &str) -> Option<u32> {
     }
 }
 
+/// 检测 vdev-audio 虚拟声卡是否已安装（系统音频设备里名字包含 vdev-audio）。
+pub fn find_vdev_audio() -> bool {
+    find_device_id("vdev-audio").is_some()
+}
+
 fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
     let desc = AudioStreamBasicDescription {
         m_sample_rate: SAMPLE_RATE,
