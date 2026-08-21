@@ -43,6 +43,8 @@ static mut RING_BUF: [f32; RING_FRAMES * CHANNELS] = [0.0; RING_FRAMES * CHANNEL
 // 上次输出写入的“结束 sample time”（f64 位模式）+ 缓冲是否干净
 static RING_LAST_OUTPUT_BITS: AtomicU64 = AtomicU64::new(0);
 static RING_IS_CLEAR: AtomicBool = AtomicBool::new(true);
+// 输入/输出时间戳不同步（切换设备后 input 落后 output）→ 清空缓冲并静音直到追平
+static RING_RESYNC: AtomicBool = AtomicBool::new(false);
 
 #[allow(static_mut_refs)]
 fn ring_clear() {
@@ -72,6 +74,19 @@ fn ring_write_out(data: &[f32], out_sample_time: f64, frames: u32) {
 // 输入（ReadInput）：从 input sample time 对应的 ring 位置读；输出未跟上则静音+清空
 fn ring_read_in(out: &mut [f32], in_sample_time: f64, frames: u32) {
     let last_output = f64::from_bits(RING_LAST_OUTPUT_BITS.load(Ordering::SeqCst));
+    let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f64;
+    // 切换设备后 input 时间戳会落后 output（读到的是切走前/切走期间的旧音频）。
+    // 检测到落后 > 1s：清空缓冲一次，并在追平前输出静音，丢弃残留旧数据。
+    if last_output - in_sample_time > rate {
+        if !RING_RESYNC.swap(true, Ordering::SeqCst) {
+            ring_clear();
+        }
+        out.fill(0.0);
+        return;
+    }
+    if RING_RESYNC.load(Ordering::SeqCst) && (last_output - in_sample_time) <= rate {
+        RING_RESYNC.store(false, Ordering::SeqCst);
+    }
     // BlackHole 静音条件：输出最后写入的结束时间还不到当前输入帧（输出没跟上）
     if last_output - (frames as f64) < in_sample_time {
         out.fill(0.0);
