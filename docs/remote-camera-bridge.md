@@ -35,11 +35,25 @@
 1. 基础：亮度/对比度/饱和度、色调、锐化/模糊、裁剪/缩放、水印
 2. 进阶：绿幕抠像、背景模糊（人脸分割）、美颜（磨皮+美白）
 
-## 最小闭环（MVP）
+## 实现进度（全部完成，代码编译通过）
 
-阶段 1：视频收流 → 解码 → BGRA → FrameChannel → 摄像头（能看到远端画面）
-阶段 2：滤镜管线（先做亮度/对比度/饱和度 + 绿幕抠像）
-阶段 3：音频收流 → Opus 解码 → PCM → 声卡（能听到远端声音）
+- ✅ vdev-filter：滤镜管线（亮度/对比度/饱和度/绿幕/锐化 + 4 单测）
+- ✅ 滤镜接入 vdev-app 视频推流（VDEV_FILTER）
+- ✅ vdev-bridge 视频桥：str0m 收流 → NAL 组装 → FfmpegDecoder → RGBA→BGRA 缩放 → 滤镜 → FrameChannel
+- ✅ vdev-bridge 音频桥：Opus 解码 → SPSC ring → AudioUnit → vdev-audio 声卡
+- ⏳ 端到端运行验证（需 aerodesk SFU + signal + 发布端 + 摄像头扩展运行）
+
+## 用法
+
+```bash
+# 1. 起 aerodesk SFU + signal（aerodesk 仓库）
+# 2. 发布端推流
+# 3. 本机运行桥
+vdev-bridge <signal_server> <room> [auth]
+# 环境变量：
+#   VDEV_FILTER="brightness,contrast,saturation,green,sharpen"
+#   VDEV_WIDTH / VDEV_HEIGHT（默认 1920x1080）
+```
 
 ## 技术选型
 
