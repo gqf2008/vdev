@@ -15,7 +15,7 @@ const SEL_LMOD: u32 = 0x6c6d6f64; // kAudioObjectPropertyModelName 'lmod'
 const SEL_LMAK: u32 = 0x6c6d616b; // kAudioObjectPropertyManufacturer 'lmak'
 const SEL_CLAS: u32 = 0x636c6173; // kAudioObjectPropertyClass 'clas'
 const SEL_BCLS: u32 = 0x62636c73; // kAudioObjectPropertyBaseClass 'bcls'
-const SEL_OWNE: u32 = 0x6f776e65; // kAudioObjectPropertyOwner 'owne'
+const SEL_OWNE: u32 = 0x73746476; // kAudioObjectPropertyOwner 'stdv' (macOS 26)
 const SEL_OWND: u32 = 0x6f776e64; // kAudioObjectPropertyOwnedObjects 'ownd'
 const SEL_RING: u32 = 0x72696e67; // kAudioDevicePropertyZeroTimeStampPeriod 'ring'
 const SEL_CSCP: u32 = 0x63736370; // kAudioControlPropertyScope 'cscp'
@@ -92,6 +92,7 @@ const SEL_MUTE: u32 = 0x6d757465; // kAudioMuteControlPropertyValue 'mute'
 const SEL_LCDV: u32 = 0x6c636476; // kAudioLevelControlPropertyDecibelValue 'lcdv'
 const SEL_LCDR: u32 = 0x6c636472; // kAudioLevelControlPropertyDecibelRange 'lcdr'
 const SEL_VDSP: u32 = 0x76647370; // 自定义 DSP 参数 'vdsp'：4×f32（gain/low/mid/high dB）
+const SEL_VRUT: u32 = 0x76727574; // 自定义路由矩阵 'vrut'：4×f32（r00,r01,r10,r11）
 const SEL_CUST: u32 = 0x63757374; // kAudioObjectPropertyCustomPropertyInfoList 'cust'
 
 const SCOPE_GLOBAL: u32 = 0x676c6f62; // 'glob'
@@ -240,7 +241,7 @@ unsafe extern "C" fn plugin_has_property(
     let ok = match obj {
         OBJ_PLUGIN => matches!(sel, SEL_PMFR | SEL_PNAM | SEL_PVER | SEL_PBOX | SEL_PDEV | SEL_UIDB | SEL_UIDD | SEL_RSRC | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
         OBJ_BOX => matches!(sel, SEL_BUID | SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF | SEL_BDV | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_IDEN | SEL_SNUM | SEL_FWVN),
-        DEV_A | DEV_B => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND | SEL_VDSP | SEL_CUST),
+        DEV_A | DEV_B => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND | SEL_VDSP | SEL_VRUT | SEL_CUST),
         A_OUT | A_IN | B_OUT | B_IN => matches!(sel, SEL_SACT | SEL_SDIR | SEL_TERM | SEL_SCHN | SEL_LTNC | SEL_SFMT | SEL_PFT | SEL_SFMA | SEL_PFTA | SEL_LNAM | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
         A_VOL | B_VOL => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM | SEL_LCDV | SEL_LCDR),
         A_MUTE | B_MUTE => matches!(sel, SEL_STBL | SEL_MUTE | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
@@ -263,7 +264,7 @@ unsafe extern "C" fn plugin_is_property_settable(
     if addr.is_null() || out.is_null() { return BAD_SEL; }
     let sel = unsafe { (*addr).m_selector };
     let settable = match obj {
-        DEV_A | DEV_B => matches!(sel, SEL_NSRT | SEL_FSIZ | SEL_VDSP),
+        DEV_A | DEV_B => matches!(sel, SEL_NSRT | SEL_FSIZ | SEL_VDSP | SEL_VRUT),
         A_VOL | B_VOL => sel == SEL_VLSC,
         A_MUTE | B_MUTE => sel == SEL_MUTE,
         _ => false,
@@ -307,7 +308,8 @@ unsafe extern "C" fn plugin_get_property_data_size(
         DEV_A | DEV_B => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_RING | SEL_CSTB | SEL_CLOK => 4,
             SEL_VDSP => std::mem::size_of::<*mut c_void>() as u32,
-            SEL_CUST => std::mem::size_of::<CustomPropertyInfo>() as u32,
+            SEL_VRUT => std::mem::size_of::<*mut c_void>() as u32,
+            SEL_CUST => 2 * std::mem::size_of::<CustomPropertyInfo>() as u32,
             SEL_SRND => 12, // AudioChannelLayout（tag+bitmap+count，无描述）
             SEL_ICON => std::mem::size_of::<*mut c_void>() as u32,
             SEL_OWND => 4 * std::mem::size_of::<AudioObjectID>() as u32,
@@ -423,10 +425,18 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
             SEL_OWNE => write_out(out, data_size, out_size, OBJ_PLUGIN),
             SEL_CUST => {
-                let info = [CustomPropertyInfo { m_selector: SEL_VDSP, m_data_type: 0x63667374 /* 'cfst' */, m_qualifier_data_type: 0 }];
+                let info = [
+                    CustomPropertyInfo { m_selector: SEL_VDSP, m_data_type: 0x63667374 /* 'cfst' */, m_qualifier_data_type: 0 },
+                    CustomPropertyInfo { m_selector: SEL_VRUT, m_data_type: 0x63667374 /* 'cfst' */, m_qualifier_data_type: 0 },
+                ];
                 write_bytes_partial(out, data_size, out_size, unsafe {
-                    std::slice::from_raw_parts(info.as_ptr() as *const u8, std::mem::size_of::<CustomPropertyInfo>())
+                    std::slice::from_raw_parts(info.as_ptr() as *const u8, 2 * std::mem::size_of::<CustomPropertyInfo>())
                 })
+            }
+            SEL_VRUT => {
+                let r = route().lock().unwrap_or_else(|e| e.into_inner());
+                let s = format!("{:.1},{:.1},{:.1},{:.1}", r[0][0], r[0][1], r[1][0], r[1][1]);
+                write_cfstring(out, data_size, out_size, &s)
             }
             SEL_VDSP => {
                 let p = dsp().lock().unwrap_or_else(|e| e.into_inner()).params();
@@ -599,6 +609,22 @@ unsafe extern "C" fn plugin_set_property_data(
             }
             let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f32;
             dsp().lock().unwrap_or_else(|e| e.into_inner()).set_params(parts[0], parts[1], parts[2], parts[3], rate);
+            NO_ERR
+        }
+        DEV_A | DEV_B if sel == SEL_VRUT => {
+            let cf = unsafe { *(data as *const *mut c_void) };
+            let mut buf = [0 as std::ffi::c_char; 128];
+            if cf.is_null() || !unsafe { CFStringGetCString(cf, buf.as_mut_ptr(), 128, UTF8) } {
+                return BAD_PROP;
+            }
+            let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+            let parts: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if parts.len() != 4 {
+                return BAD_PROP;
+            }
+            let mut r = route().lock().unwrap_or_else(|e| e.into_inner());
+            r[0][0] = parts[0]; r[0][1] = parts[1];
+            r[1][0] = parts[2]; r[1][1] = parts[3];
             NO_ERR
         }
         A_VOL | B_VOL if sel == SEL_VLSC => NO_ERR,

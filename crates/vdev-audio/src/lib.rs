@@ -97,6 +97,12 @@ static DSP: std::sync::OnceLock<Mutex<dsp::Dsp>> = std::sync::OnceLock::new();
 pub(crate) fn dsp() -> &'static Mutex<dsp::Dsp> {
     DSP.get_or_init(|| Mutex::new(dsp::Dsp::default()))
 }
+// 路由矩阵：ROUTE[src][dst] = src 设备输出 → dst 设备输入的增益（0=不路由）
+// 默认 [[1,0],[0,1]]：各自独立环回。可由自定义属性 'vrut' 修改。
+static ROUTE: Mutex<[[f32; N_DEVICES]; N_DEVICES]> = Mutex::new([[1.0, 0.0], [0.0, 1.0]]);
+pub(crate) fn route() -> &'static Mutex<[[f32; N_DEVICES]; N_DEVICES]> { &ROUTE }
+#[allow(static_mut_refs)]
+static mut MIX_BUF: [f32; RING_FRAMES * CHANNELS] = [0.0; RING_FRAMES * CHANNELS];
 // 上次输出写入的“结束 sample time”（f64 位模式）+ 缓冲是否干净
 static RING_LAST_OUTPUT_BITS: [AtomicU64; N_DEVICES] = [AtomicU64::new(0), AtomicU64::new(0)];
 static RING_IS_CLEAR: [AtomicBool; N_DEVICES] = [AtomicBool::new(true), AtomicBool::new(true)];
@@ -169,6 +175,28 @@ struct MachTimebaseInfo {
     numer: u32,
     denom: u32,
 }
+#[allow(static_mut_refs)]
+fn ring_peek(idx: usize, out: &mut [f32], in_sample_time: f64) {
+    let frames = (out.len() / CHANNELS) as f64;
+    let last_output = f64::from_bits(RING_LAST_OUTPUT_BITS[idx].load(Ordering::SeqCst));
+    if last_output - frames < in_sample_time {
+        out.fill(0.0);
+        return;
+    }
+    let start = ((in_sample_time as i64).rem_euclid(RING_FRAMES as i64)) as usize * CHANNELS;
+    let n = out.len();
+    unsafe {
+        let ring = &RING_BUFS[idx];
+        if start + n <= RING_FRAMES * CHANNELS {
+            out.copy_from_slice(&ring[start..start + n]);
+        } else {
+            let first = RING_FRAMES * CHANNELS - start;
+            out[..first].copy_from_slice(&ring[start..]);
+            out[first..].copy_from_slice(&ring[..n - first]);
+        }
+    }
+}
+
 fn mach_now_ticks() -> u64 {
     unsafe extern "C" { fn mach_absolute_time() -> u64; }
     unsafe { mach_absolute_time() }
@@ -419,6 +447,19 @@ unsafe extern "C" fn plugin_do_io_operation(
         K_OP_READ_INPUT => {
             if sample_time >= 0.0 {
                 ring_read_in(idx, data, sample_time, frames);
+                let route = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+                for src in 0..N_DEVICES {
+                    if src != idx && route[src][idx] != 0.0 {
+                        let g = route[src][idx];
+                        unsafe {
+                            MIX_BUF[..n].fill(0.0);
+                            ring_peek(src, &mut MIX_BUF[..n], sample_time);
+                            for i in 0..n {
+                                data[i] += g * MIX_BUF[i];
+                            }
+                        }
+                    }
+                }
             } else {
                 data.fill(0.0);
             }
