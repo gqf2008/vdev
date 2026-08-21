@@ -24,51 +24,71 @@ static HOST: Mutex<Option<usize>> = Mutex::new(None);
 static SAMPLE_RATE: AtomicU64 = AtomicU64::new(48_000);
 static IO_RUNNING: AtomicBool = AtomicBool::new(false);
 static ZERO_SEED: AtomicU64 = AtomicU64::new(1);
-// GetZeroTimeStamp 增量推进：只在被调用时按真实流逝推进 sample，
-// 设备 IO 停止期间不累计，恢复后从断点继续（避免墙钟跳变导致 coreaudiod 判定时钟异常）
-static ZTS_LAST_TICKS: AtomicU64 = AtomicU64::new(0);
-static ZTS_SAMPLE_BITS: AtomicU64 = AtomicU64::new(0); // f64 位模式
-static RING: Mutex<Ring> = Mutex::new(Ring::new());
+// GetZeroTimeStamp —— BlackHole 同款：锚定 + 环缓冲量化 + 追赶推进。
+// sample = N * ZTS_PERIOD；host = anchor + N * ticks_per_period。
+// 只在“计划下一拍已到”时推进一拍（Float64 累计 ticks），IO 停止期间不推进，
+// 恢复后从断点继续，coreaudiod 看到的时钟永远连续（切换输入设备不再失声）。
+const ZTS_PERIOD_FRAMES: u64 = 16384; // kAudioDevicePropertyZeroTimeStampPeriod（≥10923）
+static ZTS_ANCHOR_TICKS: AtomicU64 = AtomicU64::new(0);
+static ZTS_COUNT: AtomicU64 = AtomicU64::new(0);
+static ZTS_PREV_TICKS_BITS: AtomicU64 = AtomicU64::new(0); // f64 位模式（Float64 累计 ticks）
+static IO_CLIENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// ---- BlackHole 式环形缓冲：按 sample time 定位（不是 FIFO head/tail）----
+// ring 容量 65536 帧 × 2ch；输出（WriteMix）写入 mOutputTime 对应位置，
+// 输入（ReadInput）读取 mInputTime 对应位置；输出未跟上时输出静音并清空。
+const RING_FRAMES: usize = 65536;
+const CHANNELS: usize = 2;
+#[allow(static_mut_refs)]
+static mut RING_BUF: [f32; RING_FRAMES * CHANNELS] = [0.0; RING_FRAMES * CHANNELS];
+// 上次输出写入的“结束 sample time”（f64 位模式）+ 缓冲是否干净
+static RING_LAST_OUTPUT_BITS: AtomicU64 = AtomicU64::new(0);
+static RING_IS_CLEAR: AtomicBool = AtomicBool::new(true);
 
-// 环回缓冲：Float32 交错立体声
-const RING_LEN: usize = 65536 * 2; // 帧数（立体声 sample 数 = 帧*2）
-struct Ring {
-    buf: Vec<f32>,
-    head: usize, // 写（输出流入）
-    tail: usize, // 读（输入流出）
-    count: usize,
+#[allow(static_mut_refs)]
+fn ring_clear() {
+    unsafe { RING_BUF.fill(0.0); }
+    RING_IS_CLEAR.store(true, Ordering::SeqCst);
 }
-impl Ring {
-    const fn new() -> Self {
-        Self { buf: Vec::new(), head: 0, tail: 0, count: 0 }
-    }
-    fn ensure(&mut self) {
-        if self.buf.is_empty() {
-            self.buf = vec![0.0; RING_LEN];
+
+// 输出（WriteMix）：把混合数据写入 output sample time 对应的 ring 位置
+fn ring_write_out(data: &[f32], out_sample_time: f64, frames: u32) {
+    let start = ((out_sample_time as i64).rem_euclid(RING_FRAMES as i64)) as usize * CHANNELS;
+    let n = data.len();
+    unsafe {
+        if start + n <= RING_FRAMES * CHANNELS {
+            RING_BUF[start..start + n].copy_from_slice(data);
+        } else {
+            let first = RING_FRAMES * CHANNELS - start;
+            RING_BUF[start..].copy_from_slice(&data[..first]);
+            RING_BUF[..n - first].copy_from_slice(&data[first..]);
         }
     }
-    fn write(&mut self, data: &[f32]) {
-        self.ensure();
-        for &v in data {
-            self.buf[self.head] = v;
-            self.head = (self.head + 1) % RING_LEN;
-            if self.count < RING_LEN {
-                self.count += 1;
-            } else {
-                self.tail = (self.tail + 1) % RING_LEN; // 满则丢最旧
-            }
+    // 记录输出写入的结束 sample time
+    let end = out_sample_time + frames as f64;
+    RING_LAST_OUTPUT_BITS.store(end.to_bits(), Ordering::SeqCst);
+    RING_IS_CLEAR.store(false, Ordering::SeqCst);
+}
+
+// 输入（ReadInput）：从 input sample time 对应的 ring 位置读；输出未跟上则静音+清空
+fn ring_read_in(out: &mut [f32], in_sample_time: f64, frames: u32) {
+    let last_output = f64::from_bits(RING_LAST_OUTPUT_BITS.load(Ordering::SeqCst));
+    // BlackHole 静音条件：输出最后写入的结束时间还不到当前输入帧（输出没跟上）
+    if last_output - (frames as f64) < in_sample_time {
+        out.fill(0.0);
+        if !RING_IS_CLEAR.load(Ordering::SeqCst) {
+            ring_clear();
         }
+        return;
     }
-    fn read(&mut self, out: &mut [f32]) {
-        self.ensure();
-        for o in out.iter_mut() {
-            if self.count > 0 {
-                *o = self.buf[self.tail];
-                self.tail = (self.tail + 1) % RING_LEN;
-                self.count -= 1;
-            } else {
-                *o = 0.0; // 静音
-            }
+    let start = ((in_sample_time as i64).rem_euclid(RING_FRAMES as i64)) as usize * CHANNELS;
+    let n = out.len();
+    unsafe {
+        if start + n <= RING_FRAMES * CHANNELS {
+            out.copy_from_slice(&RING_BUF[start..start + n]);
+        } else {
+            let first = RING_FRAMES * CHANNELS - start;
+            out[..first].copy_from_slice(&RING_BUF[start..]);
+            out[first..].copy_from_slice(&RING_BUF[..n - first]);
         }
     }
 }
@@ -82,14 +102,11 @@ fn mach_now_ticks() -> u64 {
     unsafe extern "C" { fn mach_absolute_time() -> u64; }
     unsafe { mach_absolute_time() }
 }
-fn mach_ticks_to_ns(ticks: u64) -> f64 {
+fn mach_ns_per_tick() -> f64 {
     unsafe extern "C" { fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32; }
     let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
     unsafe { mach_timebase_info(&mut info) };
-    ticks as f64 * info.numer as f64 / info.denom as f64
-}
-fn mach_now_ns() -> u64 {
-    mach_ticks_to_ns(mach_now_ticks()) as u64
+    info.numer as f64 / info.denom as f64
 }
 
 // ---------------- 工厂函数（Info.plist CFPlugInFactories 指向） ----------------
@@ -152,8 +169,9 @@ unsafe extern "C" fn plugin_initialize(
     in_host: AudioServerPlugInHostRef,
 ) -> OSStatus {
     *HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_host as usize);
-    ZTS_LAST_TICKS.store(mach_now_ticks(), Ordering::SeqCst);
-    ZTS_SAMPLE_BITS.store(0.0f64.to_bits(), Ordering::SeqCst);
+    ZTS_ANCHOR_TICKS.store(mach_now_ticks(), Ordering::SeqCst);
+    ZTS_COUNT.store(0, Ordering::SeqCst);
+    ZTS_PREV_TICKS_BITS.store(0.0f64.to_bits(), Ordering::SeqCst);
     0
 }
 
@@ -200,6 +218,13 @@ unsafe extern "C" fn plugin_start_io(
     _id: AudioObjectID,
     _client: u32,
 ) -> OSStatus {
+    if IO_CLIENTS.fetch_add(1, Ordering::SeqCst) == 0 {
+        // 设备从空闲→活跃：重置时间锚点 + 清空 ring（BlackHole 同款）
+        ZTS_ANCHOR_TICKS.store(mach_now_ticks(), Ordering::SeqCst);
+        ZTS_COUNT.store(0, Ordering::SeqCst);
+        ZTS_PREV_TICKS_BITS.store(0.0f64.to_bits(), Ordering::SeqCst);
+        ring_clear();
+    }
     IO_RUNNING.store(true, Ordering::SeqCst);
     0
 }
@@ -208,7 +233,9 @@ unsafe extern "C" fn plugin_stop_io(
     _id: AudioObjectID,
     _client: u32,
 ) -> OSStatus {
-    IO_RUNNING.store(false, Ordering::SeqCst);
+    if IO_CLIENTS.fetch_sub(1, Ordering::SeqCst) <= 1 {
+        IO_RUNNING.store(false, Ordering::SeqCst);
+    }
     0
 }
 unsafe extern "C" fn plugin_get_zero_time_stamp(
@@ -219,20 +246,28 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
     out_host: *mut u64,
     out_seed: *mut u64,
 ) -> OSStatus {
-    // host time 必须用 mach_absolute_time() 的 ticks（CoreAudio 的标准）；
-    // sample 时间按“上次调用以来的真实流逝”增量推进：IO 停止期间不调用就不累计，
-    // 恢复后从断点继续，coreaudiod 看到的时钟永远连续。
+    // BlackHole 同款：host 用 mach ticks；sample 按 ZTS_PERIOD 量化；
+    // 只在计划下一拍已到（anchor + prevTicks + periodTicks <= now）时推进一拍。
     let now_ticks = mach_now_ticks();
-    let last_ticks = ZTS_LAST_TICKS.swap(now_ticks, Ordering::SeqCst);
-    let mut sample = f64::from_bits(ZTS_SAMPLE_BITS.load(Ordering::SeqCst));
-    if last_ticks != 0 && now_ticks >= last_ticks {
-        let delta_ns = mach_ticks_to_ns(now_ticks - last_ticks);
+    let anchor = ZTS_ANCHOR_TICKS.load(Ordering::SeqCst);
+    if anchor != 0 {
         let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f64;
-        sample += delta_ns / 1e9 * rate;
-        ZTS_SAMPLE_BITS.store(sample.to_bits(), Ordering::SeqCst);
+        let ns_per_tick = mach_ns_per_tick();
+        let ticks_per_frame = 1e9 / ns_per_tick / rate; // Float64
+        let period_ticks = ticks_per_frame * ZTS_PERIOD_FRAMES as f64;
+        let mut prev_ticks = f64::from_bits(ZTS_PREV_TICKS_BITS.load(Ordering::SeqCst));
+        if anchor + prev_ticks as u64 + period_ticks as u64 <= now_ticks {
+            ZTS_COUNT.fetch_add(1, Ordering::SeqCst);
+            prev_ticks += period_ticks;
+            ZTS_PREV_TICKS_BITS.store(prev_ticks.to_bits(), Ordering::SeqCst);
+        }
+        let count = ZTS_COUNT.load(Ordering::SeqCst);
+        if !out_sample.is_null() { *out_sample = (count * ZTS_PERIOD_FRAMES) as f64; }
+        if !out_host.is_null() { *out_host = anchor + prev_ticks as u64; }
+    } else {
+        if !out_sample.is_null() { *out_sample = 0.0; }
+        if !out_host.is_null() { *out_host = now_ticks; }
     }
-    if !out_sample.is_null() { *out_sample = sample; }
-    if !out_host.is_null() { *out_host = now_ticks; }
     // sample 时间不回转，seed 保持恒定（HAL 用 seed 变化检测跳变）
     if !out_seed.is_null() { *out_seed = ZERO_SEED.load(Ordering::SeqCst); }
     0
@@ -274,23 +309,35 @@ unsafe extern "C" fn plugin_do_io_operation(
     _sec_buf: *mut c_void,
 ) -> OSStatus {
     if main_buf.is_null() { return 0; }
-    let n = frames as usize * 2; // 立体声交错
+    let n = frames as usize * CHANNELS; // 立体声交错
     let data = std::slice::from_raw_parts_mut(main_buf as *mut f32, n);
+    // BlackHole 同款：用 IO cycle 的 sample time 定位 ring（不是 FIFO）
+    let sample_time = if _cycle.is_null() {
+        -1.0 // 防御：cycle 缺失时退化为覆盖写/静音
+    } else {
+        let cycle = unsafe { &*_cycle };
+        match op {
+            K_OP_READ_INPUT => cycle.m_input_time.m_sample_time,
+            K_OP_WRITE_OUTPUT => cycle.m_output_time.m_sample_time,
+            _ => -1.0,
+        }
+    };
     match op {
         K_OP_WRITE_OUTPUT => {
-            // App 写音频到我们的输出流 → 写入环
-            if let Ok(mut r) = RING.lock() {
-                r.write(data);
+            if sample_time >= 0.0 {
+                ring_write_out(data, sample_time, frames);
+            } else {
+                // 无 sample time：写入 ring 开头（极少发生）
+                ring_write_out(data, 0.0, frames);
             }
-                }
+        }
         K_OP_READ_INPUT => {
-            // 其它 App 读我们的输入流（麦克风）→ 从环读
-            if let Ok(mut r) = RING.lock() {
-                r.read(data);
+            if sample_time >= 0.0 {
+                ring_read_in(data, sample_time, frames);
             } else {
                 data.fill(0.0);
             }
-                }
+        }
         _ => { data.fill(0.0); }
     }
     0
