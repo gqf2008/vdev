@@ -219,6 +219,8 @@ fn filter_params_from_env() -> vdev_filter::FilterParams {
         if parts.len() >= 3 { p.saturation = parts[2]; }
         if parts.len() >= 4 { p.green_screen_threshold = parts[3].clamp(0.0, 255.0) as u8; }
         if parts.len() >= 5 { p.sharpen = parts[4]; }
+        if parts.len() >= 6 { p.beauty_strength = parts[5].clamp(0.0, 1.0); }
+        if parts.len() >= 7 { p.whiten_strength = parts[6].clamp(0.0, 1.0); }
     }
     p
 }
