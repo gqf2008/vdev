@@ -5,7 +5,7 @@
 | 设备 | 技术路线 | 状态 |
 |---|---|---|
 | 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
-| 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension**（Swift 薄壳 + Rust 帧核心） | ✅ 可用（QuickTime 可见 Rust 彩条） |
+| 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension 100% Rust**（手写 objc2 绑定，零 Swift） | ✅ 可用（QuickTime 可见 Rust 彩条 / 真实推流） |
 | 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
 
 ## 为什么不用 kext / DriverKit
@@ -22,7 +22,7 @@
 ```
 crates/
   vdev-hid/     虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动
-  vdev-camera/  虚拟摄像头：Rust 帧生成核心 + CMIOExtension Swift 薄壳（extension/）
+  vdev-camera/  虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
   vdev-screen/  虚拟屏幕：CGVirtualDisplay 私有 API 封装
   vdev-host/    宿主进程 / 统一命令行入口（二进制名 vdev）
 docs/RESEARCH.md  三条技术路线的调研笔记与参考项目
@@ -94,11 +94,12 @@ vdev hid listen --seconds 10
 
 ### 开发构建
 
-宿主 App 是 **Rust + Slint + slint-pixel**（`crates/vdev-app`），扩展是 Swift 薄壳（Apple 强制）：
+宿主 App 是 **Rust + Slint + slint-pixel**（`crates/vdev-app`），扩展是 **100% Rust**
+（`crates/vdev-camera-ext`，手写 CMIOExtension objc2 绑定 + FrameChannel + 帧管线，零 Swift）：
 
 ```bash
 cd crates/vdev-camera
-make install-rust     # cargo 编宿主 App + xcodebuild 编扩展 + 组装签名 + 装 /Applications
+make install-rust     # cargo 编宿主 App + 编 Rust 扩展 + 组装签名 + 装 /Applications（无 xcodebuild）
 # 产物：/Applications/VDCamera.app，打开后点「安装虚拟摄像头」
 ```
 
@@ -138,7 +139,7 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
   摄像头即显示虚拟屏幕内容（可再接 SFU/WebRTC 做远程串流）
 
 帧协议：36 字节小端头（magic "VDFR" / version / width / height / stride / ptsNs / payloadLen）
-+ `stride*height` 字节 BGRA32（见 `extension/FrameChannel.swift`）。
++ `stride*height` 字节 BGRA32（见 `crates/vdev-camera-ext/src/frame_channel.rs`）。
 
 ### 踩坑记录（已沉淀）
 
@@ -149,8 +150,9 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
   `provider.addDevice`（否则零流设备、能枚举但 0 帧）；`legacyDeviceID` 填 UUID 字符串。
 - 详见 `docs/RESEARCH.md` 与 `~/.agents/rules/LESSON_CMIOExtension虚拟摄像头激活与出帧的连环坑.md`。
 
-历史遗留已清理：旧 DAL 插件（`dal/`，macOS 12.3 弃用）与旧 Swift 宿主（`host/`）已删除；
-构建只走 `crates/vdev-camera/extension/`（Swift 薄壳）+ Rust 宿主。
+历史遗留已清理：旧 DAL 插件（`dal/`）、旧 Swift 宿主（`host/`）、旧 Swift 扩展壳
+（`crates/vdev-camera/extension/`）均已删除/替换；现在宿主与扩展 **100% Rust**，
+构建只走 `cargo build` + 手工组装签名（无 xcodebuild）。
 
 ## 权限说明
 

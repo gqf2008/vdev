@@ -5,29 +5,29 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>vdev-camera-spike</string>
+	<string>vdev-camera</string>
 	<key>CFBundleExecutable</key>
 	<string>vdev-camera-ext</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.vdev.camera.ext.spike</string>
+	<string>com.vdev.camera.host.extension</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>vdev-camera-spike</string>
+	<string>vdev-camera</string>
 	<key>CFBundlePackageType</key>
 	<string>SYSX</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>19</string>
 	<key>CMIOExtension</key>
 	<dict>
 		<key>CMIOExtensionMachServiceName</key>
-		<string>XFXU84HVK3.com.vdev.camera.ext.spike</string>
+		<string>XFXU84HVK3.com.vdev.camera.host.extension</string>
 	</dict>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSSystemExtensionUsageDescription</key>
-	<string>需要安装全 Rust spike 摄像头扩展，以验证 CMIOExtension 的 Rust 实现。</string>
+	<string>vdev-camera 需要安装摄像头扩展，以向系统提供虚拟摄像头（Rust 生成测试画面）。</string>
 </dict>
 </plist>
