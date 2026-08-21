@@ -29,7 +29,8 @@ build:
 
 # ============ 安装：/Library/Audio/Plug-Ins/HAL + 重启 coreaudiod ============
 install: build
-	osascript -e 'do shell script "rm -rf /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && cp -R $(DRIVER) /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && chown -R root:wheel /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && chmod -R 755 /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && killall coreaudiod" with administrator privileges'
+	@rm -rf /tmp/vdev-audio.driver && cp -R $(DRIVER) /tmp/vdev-audio.driver
+	osascript -e 'do shell script "rm -rf /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && cp -R /tmp/vdev-audio.driver /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && chown -R root:wheel /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && chmod -R 755 /Library/Audio/Plug-Ins/HAL/vdev-audio.driver && killall coreaudiod" with administrator privileges'
 	@echo "installed vdev-audio.driver, coreaudiod restarted"
 
 uninstall:

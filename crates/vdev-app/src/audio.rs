@@ -227,6 +227,13 @@ fn ring_push(data: &[f32]) -> usize {
     n
 }
 
+/// 清空环缓冲（重启 AudioUnit 前调用，丢弃旧数据避免延迟回放）。
+fn ring_reset() {
+    let r = ring();
+    r.head.store(0, std::sync::atomic::Ordering::Relaxed);
+    r.tail.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 消费（渲染回调）：读最多 dst.len() 个样本到 dst，返回实际读到的数量。
 fn ring_pop(dst: &mut [f32]) -> usize {
     let r = ring();
@@ -596,6 +603,8 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
     alog("音频推流: 开始");
     let mut pushed = 0usize;
     let mut unit_started = false;
+    let mut stall_start: Option<std::time::Instant> = None;
+    let mut restarts = 0u32;
     loop {
         if crate::VIDEO_STOP.load(Ordering::SeqCst) {
             break;
@@ -648,9 +657,29 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             let src = unsafe {
                 std::slice::from_raw_parts((*abl).m_buffers[0].m_data as *const f32, n)
             };
-            // 先等有足够空间再整块推入（不丢样本，避免爆音）
+            // 先等有足够空间再整块推入（不丢样本，避免爆音）。
+            // 自愈：如果 ring 持续满（渲染端不消费，通常是被设备切换打断的 AudioUnit），
+            // 超过 2s 就重启 AudioUnit 并清空环，避免永久静音。
             while ring_free() < src.len() {
+                if stall_start.is_none() {
+                    stall_start = Some(std::time::Instant::now());
+                }
+                if stall_start.unwrap().elapsed() >= std::time::Duration::from_secs(2) {
+                    restarts += 1;
+                    alog(format!("音频推流: 输出端疑似卡死（{restarts} 次），重启 AudioUnit…"));
+                    if unit_started {
+                        unsafe { AudioOutputUnitStop(unit); }
+                    }
+                    ring_reset();
+                    if unit_started {
+                        unsafe { AudioOutputUnitStart(unit); }
+                    }
+                    stall_start = None;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if stall_start.is_some() {
+                stall_start = None;
             }
             let written = ring_push(src);
             pushed += written;

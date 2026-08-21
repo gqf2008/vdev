@@ -24,8 +24,10 @@ static HOST: Mutex<Option<usize>> = Mutex::new(None);
 static SAMPLE_RATE: AtomicU64 = AtomicU64::new(48_000);
 static IO_RUNNING: AtomicBool = AtomicBool::new(false);
 static ZERO_SEED: AtomicU64 = AtomicU64::new(1);
-static ANCHOR_SAMPLE: AtomicU64 = AtomicU64::new(0);
-static ANCHOR_HOST: AtomicU64 = AtomicU64::new(0);
+// GetZeroTimeStamp 增量推进：只在被调用时按真实流逝推进 sample，
+// 设备 IO 停止期间不累计，恢复后从断点继续（避免墙钟跳变导致 coreaudiod 判定时钟异常）
+static ZTS_LAST_TICKS: AtomicU64 = AtomicU64::new(0);
+static ZTS_SAMPLE_BITS: AtomicU64 = AtomicU64::new(0); // f64 位模式
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
 
 // 环回缓冲：Float32 交错立体声
@@ -150,8 +152,8 @@ unsafe extern "C" fn plugin_initialize(
     in_host: AudioServerPlugInHostRef,
 ) -> OSStatus {
     *HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_host as usize);
-    ANCHOR_HOST.store(mach_now_ns(), Ordering::SeqCst);
-    ANCHOR_SAMPLE.store(0, Ordering::SeqCst);
+    ZTS_LAST_TICKS.store(mach_now_ticks(), Ordering::SeqCst);
+    ZTS_SAMPLE_BITS.store(0.0f64.to_bits(), Ordering::SeqCst);
     0
 }
 
@@ -217,12 +219,18 @@ unsafe extern "C" fn plugin_get_zero_time_stamp(
     out_host: *mut u64,
     out_seed: *mut u64,
 ) -> OSStatus {
-    // host time 必须用 mach_absolute_time() 的 ticks（CoreAudio 的标准），sample time 用 timebase 换算
+    // host time 必须用 mach_absolute_time() 的 ticks（CoreAudio 的标准）；
+    // sample 时间按“上次调用以来的真实流逝”增量推进：IO 停止期间不调用就不累计，
+    // 恢复后从断点继续，coreaudiod 看到的时钟永远连续。
     let now_ticks = mach_now_ticks();
-    let anchor_ticks = ANCHOR_HOST.load(Ordering::SeqCst);
-    let elapsed_ns = mach_ticks_to_ns(now_ticks.saturating_sub(anchor_ticks));
-    let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f64;
-    let sample = ANCHOR_SAMPLE.load(Ordering::SeqCst) as f64 + elapsed_ns / 1e9 * rate;
+    let last_ticks = ZTS_LAST_TICKS.swap(now_ticks, Ordering::SeqCst);
+    let mut sample = f64::from_bits(ZTS_SAMPLE_BITS.load(Ordering::SeqCst));
+    if last_ticks != 0 && now_ticks >= last_ticks {
+        let delta_ns = mach_ticks_to_ns(now_ticks - last_ticks);
+        let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f64;
+        sample += delta_ns / 1e9 * rate;
+        ZTS_SAMPLE_BITS.store(sample.to_bits(), Ordering::SeqCst);
+    }
     if !out_sample.is_null() { *out_sample = sample; }
     if !out_host.is_null() { *out_host = now_ticks; }
     // sample 时间不回转，seed 保持恒定（HAL 用 seed 变化检测跳变）
