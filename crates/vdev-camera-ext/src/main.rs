@@ -439,12 +439,18 @@ fn send_bgra(
             &mut sb,
         );
         if ss == 0 && !sb.0.is_null() {
-            let _: () = msg_send![
-                &*stream,
-                sendSampleBuffer: sb.0,
-                discontinuity: 0u64,
-                hostTimeInNanoseconds: pts_ns
-            ];
+            // ObjC 异常包住：sendSampleBuffer 抛异常时记录而不是 abort
+            let send_res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                let _: () = msg_send![
+                    &*stream,
+                    sendSampleBuffer: sb.0,
+                    discontinuity: 0u64,
+                    hostTimeInNanoseconds: pts_ns
+                ];
+            }));
+            if let Err(ex) = send_res {
+                elog(format!("sendSampleBuffer 异常: {:?}", ex));
+            }
             SENT.fetch_add(1, Ordering::SeqCst);
             let n = SENT.load(Ordering::SeqCst);
             if n % 300 == 0 || n == 1 {
@@ -461,31 +467,41 @@ fn send_bgra(
 fn frame_loop() {
     let fmt = FORMAT_DESC.lock().unwrap_or_else(|e| e.into_inner()).unwrap();
     let mut last_sent: std::time::Instant = std::time::Instant::now();
+    // 彩条缓冲复用，避免每帧 8.3MB 分配
+    let mut bars_buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
     loop {
-        if RUNNING.load(Ordering::SeqCst) {
-            let stream = STREAM.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
-            // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
-            let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
-            if let Some((data, w, h, stride, pts)) = injected {
-                send_bgra(stream, fmt, &data, w, h, stride, pts);
-            } else {
-                // 彩条：1920x1080 BGRA
-                let mut buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
-                let rc = vdev_camera::cabi::vdev_camera_render_bgra32(
-                    0,
-                    WIDTH as u32,
-                    HEIGHT as u32,
-                    unsafe { CFAbsoluteTimeGetCurrent() },
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                );
-                if rc == 0 {
-                    let pts = host_now_ns();
-                    send_bgra(stream, fmt, &buf, WIDTH as u32, HEIGHT as u32, WIDTH as u32 * 4, pts);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if RUNNING.load(Ordering::SeqCst) {
+                let stream = STREAM.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
+                // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
+                let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
+                if let Some((data, w, h, stride, pts)) = injected {
+                    send_bgra(stream, fmt, &data, w, h, stride, pts);
+                } else {
+                    let rc = vdev_camera::cabi::vdev_camera_render_bgra32(
+                        0,
+                        WIDTH as u32,
+                        HEIGHT as u32,
+                        unsafe { CFAbsoluteTimeGetCurrent() },
+                        bars_buf.as_mut_ptr(),
+                        bars_buf.len(),
+                    );
+                    if rc == 0 {
+                        let pts = host_now_ns();
+                        send_bgra(
+                            stream,
+                            fmt,
+                            &bars_buf,
+                            WIDTH as u32,
+                            HEIGHT as u32,
+                            WIDTH as u32 * 4,
+                            pts,
+                        );
+                    }
                 }
             }
-            last_sent = std::time::Instant::now();
-        }
+        }));
+        last_sent = std::time::Instant::now();
         // 60fps 节拍
         let elapsed = last_sent.elapsed();
         let target = std::time::Duration::from_micros(16_666);
