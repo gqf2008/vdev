@@ -107,8 +107,7 @@ pub struct Dsp {
     low_coeff: BiquadCoeffs,
     mid_coeff: BiquadCoeffs,
     high_coeff: BiquadCoeffs,
-    left: Channel,
-    right: Channel,
+    channels: [Channel; crate::CHANNELS],
 }
 
 impl Default for Dsp {
@@ -121,8 +120,7 @@ impl Default for Dsp {
             low_coeff: BiquadCoeffs::IDENTITY,
             mid_coeff: BiquadCoeffs::IDENTITY,
             high_coeff: BiquadCoeffs::IDENTITY,
-            left: Channel::default(),
-            right: Channel::default(),
+            channels: [Channel::default(); crate::CHANNELS],
         };
         d.recalc(48_000.0);
         d
@@ -159,22 +157,18 @@ impl Dsp {
         [self.gain_db, self.low_db, self.mid_db, self.high_db]
     }
 
-    // 处理交错立体声帧（实时路径：无分配、纯乘加）
+    // 处理交错多声道帧（实时路径：无分配、纯乘加）
     pub fn process(&mut self, data: &mut [f32]) {
         let gain = 10f32.powf(self.gain_db / 20.0);
-        for frame in data.chunks_exact_mut(2) {
-            // 左声道
-            let l0 = frame[0] * gain;
-            let l1 = self.low_coeff.process(&mut self.left.low, l0);
-            let l2 = self.mid_coeff.process(&mut self.left.mid, l1);
-            let l3 = self.high_coeff.process(&mut self.left.high, l2);
-            frame[0] = soft_limit(l3);
-            // 右声道
-            let r0 = frame[1] * gain;
-            let r1 = self.low_coeff.process(&mut self.right.low, r0);
-            let r2 = self.mid_coeff.process(&mut self.right.mid, r1);
-            let r3 = self.high_coeff.process(&mut self.right.high, r2);
-            frame[1] = soft_limit(r3);
+        let nch = crate::CHANNELS;
+        for frame in data.chunks_exact_mut(nch) {
+            for (ch, sample) in frame.iter_mut().enumerate() {
+                let s0 = *sample * gain;
+                let s1 = self.low_coeff.process(&mut self.channels[ch].low, s0);
+                let s2 = self.mid_coeff.process(&mut self.channels[ch].mid, s1);
+                let s3 = self.high_coeff.process(&mut self.channels[ch].high, s2);
+                *sample = soft_limit(s3);
+            }
         }
     }
 }
@@ -187,13 +181,15 @@ mod tests {
         data.iter().fold(0.0f32, |m, &v| m.max(v.abs()))
     }
 
-    // 生成正弦帧（交错立体声），返回峰值约等于 amp
+    // 生成正弦帧（交错多声道），返回峰值约等于 amp
     fn sine(amp: f32, freq: f32, frames: usize) -> Vec<f32> {
-        let mut v = Vec::with_capacity(frames * 2);
+        let nch = crate::CHANNELS;
+        let mut v = Vec::with_capacity(frames * nch);
         for i in 0..frames {
             let x = amp * (2.0 * PI * freq * i as f32 / 48000.0).sin();
-            v.push(x);
-            v.push(x);
+            for _ in 0..nch {
+                v.push(x);
+            }
         }
         v
     }
