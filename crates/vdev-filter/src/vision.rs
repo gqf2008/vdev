@@ -204,6 +204,49 @@ pub fn create_bgra_buffer(width: usize, height: usize) -> CVPixelBufferRef {
     pb
 }
 
+/// 把 BGRA 帧写入 CVPixelBuffer（供 Vision 输入）
+pub fn bgra_to_cvpixelbuffer(bgra: &[u8], width: usize, height: usize) -> Option<CVPixelBufferRef> {
+    let pb = create_bgra_buffer(width, height);
+    if pb.is_null() { return None; }
+    unsafe {
+        if CVPixelBufferLockBaseAddress(pb, 0) != 0 {
+            CFRelease(pb as *const std::ffi::c_void);
+            return None;
+        }
+        let base = CVPixelBufferGetBaseAddress(pb) as *mut u8;
+        let stride = CVPixelBufferGetBytesPerRow(pb);
+        for y in 0..height {
+            let dst = base.add(y * stride);
+            let src = bgra.as_ptr().add(y * width * 4);
+            std::ptr::copy_nonoverlapping(src, dst, width * 4);
+        }
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+    }
+    Some(pb)
+}
+
+/// 一步封装：BGRA 帧 → 人像分割 → 背景替换/模糊。
+/// `background` 为 None 时用盒式模糊作为"背景模糊"。
+/// 需要 feature "vision"。返回处理后的 BGRA（原地修改 bgra）。
+pub fn segment_and_replace(
+    bgra: &mut [u8],
+    width: u32,
+    height: u32,
+    background: Option<&[u8]>,
+    blur_radius: u32,
+) -> bool {
+    let Some(pb) = bgra_to_cvpixelbuffer(bgra, width as usize, height as usize) else {
+        return false;
+    };
+    let Some((mask, _mw, _mh)) = segment_person(pb) else {
+        unsafe { CFRelease(pb as *const std::ffi::c_void); }
+        return false;
+    };
+    unsafe { CFRelease(pb as *const std::ffi::c_void); }
+    apply_background(bgra, width, height, &mask, background, blur_radius);
+    true
+}
+
 #[cfg(all(test, feature = "vision"))]
 mod tests {
     use super::*;
@@ -216,6 +259,18 @@ mod tests {
         unsafe { CFRelease(pb as *const std::ffi::c_void); }
         let (mask, mw, mh) = r.expect("人像分割失败");
         println!("mask 尺寸 {}x{}，非零占比: {:.1}%", mw, mh, mask.iter().filter(|&&m| m > 128).count() as f32 * 100.0 / mask.len() as f32);
+    }
+
+    #[test]
+    fn test_segment_and_replace_runs() {
+        let w = 128; let h = 128;
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w*h) as usize {
+            let o = i * 4;
+            bgra[o] = 60; bgra[o+1] = 120; bgra[o+2] = 180; bgra[o+3] = 255;
+        }
+        // 纯色无人像：segment 返回 mask（全背景），replace 后应仍有效（不崩溃）
+        assert!(segment_and_replace(&mut bgra, w, h, None, 3));
     }
 
     #[test]

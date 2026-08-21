@@ -14,5 +14,5 @@ aerodesk-core = { path = "../../../aerodesk/crates/aerodesk-core" }
 aerodesk-codec = { path = "../../../aerodesk/crates/aerodesk-codec" }
 str0m = { git = "https://github.com/aerodesk-labs/str0m.git", rev = "f5b4fd6e79d23f8bc368873603f453c05314b4e2", default-features = false, features = ["rust-crypto"] }
 ffmpeg-next = "8"
-vdev-filter = { path = "../vdev-filter" }
+vdev-filter = { path = "../vdev-filter", features = ["vision"] }
 anyhow = "1.0.104"

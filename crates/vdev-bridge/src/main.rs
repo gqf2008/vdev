@@ -53,6 +53,9 @@ fn main() -> Result<(), String> {
 
     // 3. 滤镜参数
     let filter = filter_params_from_env();
+    // 背景替换：VDEV_BG=blur 开启背景模糊（Vision 人像分割）
+    let bg_mode = std::env::var("VDEV_BG").unwrap_or_default();
+    let bg_enabled = bg_mode == "blur" || bg_mode == "1";
     let out_w: u32 = std::env::var("VDEV_WIDTH").ok().and_then(|s| s.parse().ok()).unwrap_or(1920);
     let out_h: u32 = std::env::var("VDEV_HEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(1080);
 
@@ -156,6 +159,10 @@ fn main() -> Result<(), String> {
 
                 // 滤镜
                 vdev_filter::process_frame(&mut bgra, out_w, out_h, &filter);
+                // 背景模糊/替换（Vision 人像分割）
+                if bg_enabled {
+                    vdev_filter::vision::segment_and_replace(&mut bgra, out_w, out_h, None, 8);
+                }
 
                 // 推摄像头
                 if let Some(fc) = &mut frame_client {
