@@ -38,12 +38,18 @@ const SEL_BMFR: u32 = 0x626d6672; // kAudioBoxPropertyManufacturer 'bmfr'
 const SEL_BMOD: u32 = 0x626d6f64; // kAudioBoxPropertyModel 'bmod'
 const SEL_BSNO: u32 = 0x62736e6f; // kAudioBoxPropertySerialNumber 'bsno'
 const SEL_BFMW: u32 = 0x62666d77; // kAudioBoxPropertyFirmwareVersion 'bfmw'
+const SEL_IDEN: u32 = 0x6964656e; // kAudioObjectPropertyIdentify 'iden'
+const SEL_SNUM: u32 = 0x736e756d; // kAudioObjectPropertySerialNumber 'snum'
+const SEL_FWVN: u32 = 0x6677766e; // kAudioObjectPropertyFirmwareVersion 'fwvn'
 // ---- device ----
 const SEL_UID: u32 = 0x75696420; // kAudioDevicePropertyDeviceUID 'uid '
 const SEL_MUID: u32 = 0x6d756964; // kAudioDevicePropertyModelUID 'muid'
+const SEL_ICON: u32 = 0x69636f6e; // kAudioDevicePropertyIcon 'icon'
+const SEL_SRND: u32 = 0x73726e64; // kAudioDevicePropertyPreferredChannelLayout 'srnd'
 const SEL_TRAN: u32 = 0x7472616e; // kAudioDevicePropertyTransportType 'tran'
 const SEL_GROU: u32 = 0x67726f75; // kAudioDevicePropertyRelatedDevices 'grou'
-const SEL_CLOK: u32 = 0x636c6b64; // kAudioDevicePropertyClockDomain 'clkd'
+const SEL_CLKD: u32 = 0x636c6b64; // kAudioDevicePropertyClockDomain 'clkd'
+const SEL_CLOK: u32 = 0x636c6f6b; // kAudioDevicePropertyClockAlgorithm 'clok' (macOS 26)
 const SEL_LIVN: u32 = 0x6c69766e; // kAudioDevicePropertyDeviceIsAlive 'livn'
 const SEL_GOIN: u32 = 0x676f696e; // kAudioDevicePropertyDeviceIsRunning 'goin'
 const SEL_GONE: u32 = 0x676f6e65; // kAudioDevicePropertyDeviceIsRunningSomewhere 'gone'
@@ -75,6 +81,8 @@ const SEL_VLSC: u32 = 0x766c7363; // kAudioVolumeControlPropertyScalarValue 'vls
 const SEL_VMIN: u32 = 0x766d696e; // kAudioVolumeControlPropertyMinimumScalarValue 'vmin'
 const SEL_VMAX: u32 = 0x766d6178; // kAudioVolumeControlPropertyMaximumScalarValue 'vmax'
 const SEL_MUTE: u32 = 0x6d757465; // kAudioMuteControlPropertyValue 'mute'
+const SEL_LCDV: u32 = 0x6c636476; // kAudioLevelControlPropertyDecibelValue 'lcdv'
+const SEL_LCDR: u32 = 0x6c636472; // kAudioLevelControlPropertyDecibelRange 'lcdr'
 
 const SCOPE_GLOBAL: u32 = 0x676c6f62; // 'glob'
 const SCOPE_INPUT: u32 = 0x696e7074; // 'inpt'
@@ -87,6 +95,9 @@ const CLASS_DEVICE: u32 = 0x61646576; // kAudioDeviceClassID 'adev'
 const CLASS_STREAM: u32 = 0x61737472; // kAudioStreamClassID 'astr'
 const CLASS_VOLUME: u32 = 0x766c6d65; // kAudioVolumeControlClassID 'vlme'
 const CLASS_MUTE: u32 = 0x6d757465;   // kAudioMuteControlClassID 'mute'
+
+const CLOCK_ALGO_RAW: u32 = 0x72617777; // kAudioDeviceClockAlgorithmRaw 'raww'
+const LAYOUT_STEREO: u32 = 0x65000002;   // kAudioChannelLayoutTag_Stereo
 
 const TERM_SPEAKER: u32 = 0x73706b72; // 'spkr'
 const TERM_MIC: u32 = 0x6d696372; // 'micr'
@@ -178,10 +189,10 @@ unsafe extern "C" fn plugin_has_property(
     let scope = unsafe { (*addr).m_scope };
     let ok = match obj {
         OBJ_PLUGIN => matches!(sel, SEL_PMFR | SEL_PNAM | SEL_PVER | SEL_PBOX | SEL_PDEV | SEL_UIDB | SEL_UIDD | SEL_RSRC | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
-        OBJ_BOX => matches!(sel, SEL_BUID | SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF | SEL_BDV | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
-        OBJ_DEVICE => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLOK | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB),
+        OBJ_BOX => matches!(sel, SEL_BUID | SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF | SEL_BDV | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_IDEN | SEL_SNUM | SEL_FWVN),
+        OBJ_DEVICE => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND),
         OBJ_STREAM_OUTPUT | OBJ_STREAM_INPUT => matches!(sel, SEL_SACT | SEL_SDIR | SEL_TERM | SEL_SCHN | SEL_LTNC | SEL_SFMT | SEL_PFT | SEL_SFMA | SEL_PFTA | SEL_LNAM | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
-        OBJ_VOLUME => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
+        OBJ_VOLUME => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM | SEL_LCDV | SEL_LCDR),
         OBJ_MUTE => matches!(sel, SEL_STBL | SEL_MUTE | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
         _ => false,
     };
@@ -235,16 +246,20 @@ unsafe extern "C" fn plugin_get_property_data_size(
         OBJ_BOX => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE => 4,
             SEL_OWND => 0,
+            SEL_SNUM | SEL_FWVN => std::mem::size_of::<*mut c_void>() as u32,
+            SEL_IDEN => 4,
             SEL_BUID | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK => std::mem::size_of::<*mut c_void>() as u32,
             SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF => 4,
             SEL_BDV => std::mem::size_of::<AudioObjectID>() as u32,
             _ => return BAD_PROP,
         },
         OBJ_DEVICE => match sel {
-            SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_RING | SEL_CSTB => 4,
+            SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_RING | SEL_CSTB | SEL_CLOK => 4,
+            SEL_SRND => 12, // AudioChannelLayout（tag+bitmap+count，无描述）
+            SEL_ICON => std::mem::size_of::<*mut c_void>() as u32,
             SEL_OWND => 4 * std::mem::size_of::<AudioObjectID>() as u32,
             SEL_UID | SEL_MUID | SEL_LNAM | SEL_LMOD | SEL_LMAK => std::mem::size_of::<*mut c_void>() as u32,
-            SEL_TRAN | SEL_CLOK | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_SAFT | SEL_HIDN | SEL_FSIZ | SEL_VFSZ | SEL_GOIN | SEL_GONE | SEL_LIVN => 4,
+            SEL_TRAN | SEL_CLKD | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_SAFT | SEL_HIDN | SEL_FSIZ | SEL_VFSZ | SEL_GOIN | SEL_GONE | SEL_LIVN => 4,
             SEL_GROU => std::mem::size_of::<AudioObjectID>() as u32,
             SEL_STM => {
                 if scope == SCOPE_INPUT { 1 * std::mem::size_of::<AudioObjectID>() as u32 }
@@ -267,7 +282,8 @@ unsafe extern "C" fn plugin_get_property_data_size(
             _ => return BAD_PROP,
         },
         OBJ_VOLUME => match sel {
-            SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_CSCP | SEL_CELM => 4,
+            SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_CSCP | SEL_CELM | SEL_LCDV => 4,
+            SEL_LCDR => 2 * std::mem::size_of::<AudioValueRange>() as u32,
             SEL_OWND => 0,
             SEL_STBL => 1,
             SEL_VLSC | SEL_VMIN | SEL_VMAX => 4,
@@ -321,6 +337,9 @@ unsafe extern "C" fn plugin_get_property_data(
         },
         OBJ_BOX => match sel {
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_BOX),
+            SEL_IDEN => write_out(out, data_size, out_size, 0u32),
+            SEL_SNUM => write_cfstring(out, data_size, out_size, "1"),
+            SEL_FWVN => write_cfstring(out, data_size, out_size, "1.0.0"),
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
             SEL_OWNE => write_out(out, data_size, out_size, OBJ_PLUGIN),
             SEL_OWND => { unsafe { if !out_size.is_null() { *out_size = 0; } } NO_ERR }
@@ -344,6 +363,15 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_OWNE => write_out(out, data_size, out_size, OBJ_PLUGIN),
             SEL_RING => write_out(out, data_size, out_size, 16384u32),
             SEL_CSTB => write_out(out, data_size, out_size, 1u32),
+            SEL_CLOK => write_out(out, data_size, out_size, CLOCK_ALGO_RAW),
+            SEL_SRND => {
+                // AudioChannelLayout：stereo tag，无 channel descriptions
+                let layout: [u32; 3] = [LAYOUT_STEREO, 0, 0];
+                write_bytes_partial(out, data_size, out_size, unsafe {
+                    std::slice::from_raw_parts(layout.as_ptr() as *const u8, 12)
+                })
+            }
+            SEL_ICON => write_cfstring(out, data_size, out_size, ""),
             SEL_OWND => {
                 let mut owned: Vec<u32> = Vec::new();
                 if scope == SCOPE_GLOBAL || scope == SCOPE_OUTPUT {
@@ -364,7 +392,7 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_LMAK => write_cfstring(out, data_size, out_size, "vdev"),
             SEL_TRAN => write_out(out, data_size, out_size, TRANSPORT_VIRTUAL),
             SEL_GROU => write_out(out, data_size, out_size, OBJ_DEVICE),
-            SEL_CLOK => write_out(out, data_size, out_size, 0u32),
+            SEL_CLKD => write_out(out, data_size, out_size, 0u32),
             SEL_LIVN => write_out(out, data_size, out_size, 1u32),
             SEL_GOIN | SEL_GONE => write_out(out, data_size, out_size, IO_RUNNING.load(Ordering::SeqCst) as u32),
             SEL_DFLT | SEL_SFLT => write_out(out, data_size, out_size, 1u32),
@@ -430,6 +458,13 @@ unsafe extern "C" fn plugin_get_property_data(
         }
         OBJ_VOLUME => match sel {
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_VOLUME),
+            SEL_LCDV => write_out(out, data_size, out_size, 0.0f32),
+            SEL_LCDR => {
+                let r = [AudioValueRange { m_minimum: -96.0, m_maximum: 0.0 }];
+                write_bytes_partial(out, data_size, out_size, unsafe {
+                    std::slice::from_raw_parts(r.as_ptr() as *const u8, std::mem::size_of::<AudioValueRange>())
+                })
+            }
             SEL_CSCP => write_out(out, data_size, out_size, SCOPE_OUTPUT),
             SEL_CELM => write_out(out, data_size, out_size, 1u32),
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
