@@ -194,6 +194,40 @@ fn write_cfstring(out: *mut c_void, data_size: u32, out_size: *mut u32, s: &str)
     NO_ERR
 }
 
+// ---- 多设备辅助：对象类型判断 + 按设备取值 ----
+fn is_dev(obj: AudioObjectID) -> bool { matches!(obj, DEV_A | DEV_B) }
+fn is_stream_out(obj: AudioObjectID) -> bool { matches!(obj, A_OUT | B_OUT) }
+fn is_stream_in(obj: AudioObjectID) -> bool { matches!(obj, A_IN | B_IN) }
+fn is_stream(obj: AudioObjectID) -> bool { is_stream_out(obj) || is_stream_in(obj) }
+fn is_vol(obj: AudioObjectID) -> bool { matches!(obj, A_VOL | B_VOL) }
+fn is_mute(obj: AudioObjectID) -> bool { matches!(obj, A_MUTE | B_MUTE) }
+fn dev_name(obj: AudioObjectID) -> &'static str {
+    DEVS[dev_index(obj).unwrap_or(0)].name
+}
+fn dev_uid(obj: AudioObjectID) -> &'static str {
+    DEVS[dev_index(obj).unwrap_or(0)].uid
+}
+fn dev_out(obj: AudioObjectID) -> AudioObjectID { if dev_index(obj) == Some(0) { A_OUT } else { B_OUT } }
+fn dev_in(obj: AudioObjectID) -> AudioObjectID { if dev_index(obj) == Some(0) { A_IN } else { B_IN } }
+fn dev_vol(obj: AudioObjectID) -> AudioObjectID { if dev_index(obj) == Some(0) { A_VOL } else { B_VOL } }
+fn dev_mute(obj: AudioObjectID) -> AudioObjectID { if dev_index(obj) == Some(0) { A_MUTE } else { B_MUTE } }
+fn dev_id(obj: AudioObjectID) -> AudioObjectID { if dev_index(obj) == Some(0) { DEV_A } else { DEV_B } }
+// TranslateUIDToDevice：按 UID qualifier（CFString）映射到设备
+fn translate_uid(qdata: *const c_void) -> AudioObjectID {
+    if qdata.is_null() { return DEV_A; }
+    unsafe {
+        let cf = *(qdata as *const *mut c_void);
+        let mut buf = [0 as std::ffi::c_char; 128];
+        if !cf.is_null() && CFStringGetCString(cf, buf.as_mut_ptr(), 128, UTF8) {
+            let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
+            for (i, meta) in DEVS.iter().enumerate() {
+                if s.contains(meta.uid) { return if i == 0 { DEV_A } else { DEV_B }; }
+            }
+        }
+    }
+    DEV_A
+}
+
 unsafe extern "C" fn plugin_has_property(
     _driver: AudioServerPlugInDriverRef,
     obj: AudioObjectID,
@@ -206,14 +240,14 @@ unsafe extern "C" fn plugin_has_property(
     let ok = match obj {
         OBJ_PLUGIN => matches!(sel, SEL_PMFR | SEL_PNAM | SEL_PVER | SEL_PBOX | SEL_PDEV | SEL_UIDB | SEL_UIDD | SEL_RSRC | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
         OBJ_BOX => matches!(sel, SEL_BUID | SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF | SEL_BDV | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_IDEN | SEL_SNUM | SEL_FWVN),
-        OBJ_DEVICE => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND | SEL_VDSP | SEL_CUST),
-        OBJ_STREAM_OUTPUT | OBJ_STREAM_INPUT => matches!(sel, SEL_SACT | SEL_SDIR | SEL_TERM | SEL_SCHN | SEL_LTNC | SEL_SFMT | SEL_PFT | SEL_SFMA | SEL_PFTA | SEL_LNAM | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
-        OBJ_VOLUME => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM | SEL_LCDV | SEL_LCDR),
-        OBJ_MUTE => matches!(sel, SEL_STBL | SEL_MUTE | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
+        DEV_A | DEV_B => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND | SEL_VDSP | SEL_CUST),
+        A_OUT | A_IN | B_OUT | B_IN => matches!(sel, SEL_SACT | SEL_SDIR | SEL_TERM | SEL_SCHN | SEL_LTNC | SEL_SFMT | SEL_PFT | SEL_SFMA | SEL_PFTA | SEL_LNAM | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
+        A_VOL | B_VOL => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM | SEL_LCDV | SEL_LCDR),
+        A_MUTE | B_MUTE => matches!(sel, SEL_STBL | SEL_MUTE | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
         _ => false,
     };
     // 'stm#' 有 scope 限定（output 返回输出流，input 返回输入流）
-    if obj == OBJ_DEVICE && sel == SEL_STM && scope != SCOPE_OUTPUT && scope != SCOPE_INPUT {
+    if is_dev(obj) && sel == SEL_STM && scope != SCOPE_OUTPUT && scope != SCOPE_INPUT {
         return 0;
     }
     ok as u8
@@ -229,9 +263,9 @@ unsafe extern "C" fn plugin_is_property_settable(
     if addr.is_null() || out.is_null() { return BAD_SEL; }
     let sel = unsafe { (*addr).m_selector };
     let settable = match obj {
-        OBJ_DEVICE => matches!(sel, SEL_NSRT | SEL_FSIZ | SEL_VDSP),
-        OBJ_VOLUME => sel == SEL_VLSC,
-        OBJ_MUTE => sel == SEL_MUTE,
+        DEV_A | DEV_B => matches!(sel, SEL_NSRT | SEL_FSIZ | SEL_VDSP),
+        A_VOL | B_VOL => sel == SEL_VLSC,
+        A_MUTE | B_MUTE => sel == SEL_MUTE,
         _ => false,
     };
     unsafe { *out = settable as u8; }
@@ -255,7 +289,8 @@ unsafe extern "C" fn plugin_get_property_data_size(
             SEL_CLAS | SEL_BCLS | SEL_OWNE => 4,
             SEL_OWND => 4,
             SEL_PMFR | SEL_PNAM | SEL_PVER | SEL_RSRC | SEL_LNAM | SEL_LMOD | SEL_LMAK => std::mem::size_of::<*mut c_void>() as u32,
-            SEL_PBOX | SEL_PDEV => std::mem::size_of::<AudioObjectID>() as u32,
+            SEL_PBOX => std::mem::size_of::<AudioObjectID>() as u32,
+            SEL_PDEV => 2 * std::mem::size_of::<AudioObjectID>() as u32,
             SEL_UIDB | SEL_UIDD => std::mem::size_of::<AudioObjectID>() as u32,
             _ => return BAD_PROP,
         },
@@ -266,10 +301,10 @@ unsafe extern "C" fn plugin_get_property_data_size(
             SEL_IDEN => 4,
             SEL_BUID | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK => std::mem::size_of::<*mut c_void>() as u32,
             SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF => 4,
-            SEL_BDV => std::mem::size_of::<AudioObjectID>() as u32,
+            SEL_BDV => 2 * std::mem::size_of::<AudioObjectID>() as u32,
             _ => return BAD_PROP,
         },
-        OBJ_DEVICE => match sel {
+        DEV_A | DEV_B => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_RING | SEL_CSTB | SEL_CLOK => 4,
             SEL_VDSP => std::mem::size_of::<*mut c_void>() as u32,
             SEL_CUST => std::mem::size_of::<CustomPropertyInfo>() as u32,
@@ -290,7 +325,7 @@ unsafe extern "C" fn plugin_get_property_data_size(
             SEL_DCH2 => 2 * 4,
             _ => return BAD_PROP,
         },
-        OBJ_STREAM_OUTPUT | OBJ_STREAM_INPUT => match sel {
+        A_OUT | A_IN | B_OUT | B_IN => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE => 4,
             SEL_OWND => 0,
             SEL_LNAM | SEL_LMAK => std::mem::size_of::<*mut c_void>() as u32,
@@ -299,7 +334,7 @@ unsafe extern "C" fn plugin_get_property_data_size(
             SEL_SFMA | SEL_PFTA => 2 * std::mem::size_of::<AudioStreamBasicDescription>() as u32,
             _ => return BAD_PROP,
         },
-        OBJ_VOLUME => match sel {
+        A_VOL | B_VOL => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_CSCP | SEL_CELM | SEL_LCDV => 4,
             SEL_LCDR => 2 * std::mem::size_of::<AudioValueRange>() as u32,
             SEL_OWND => 0,
@@ -307,7 +342,7 @@ unsafe extern "C" fn plugin_get_property_data_size(
             SEL_VLSC | SEL_VMIN | SEL_VMAX => 4,
             _ => return BAD_PROP,
         },
-        OBJ_MUTE => match sel {
+        A_MUTE | B_MUTE => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_CSCP | SEL_CELM => 4,
             SEL_OWND => 0,
             SEL_STBL => 1,
@@ -346,11 +381,14 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_PVER => write_cfstring(out, data_size, out_size, "1.0.0"),
             SEL_RSRC => write_cfstring(out, data_size, out_size, "com.vdev.audio.driver"),
             SEL_PBOX => write_out(out, data_size, out_size, OBJ_BOX),
-            SEL_PDEV => write_out(out, data_size, out_size, OBJ_DEVICE),
-            SEL_UIDB | SEL_UIDD => {
-                // 任意 UID 都映射到唯一对象
-                write_out(out, data_size, out_size, if sel == SEL_UIDB { OBJ_BOX } else { OBJ_DEVICE })
+            SEL_PDEV => {
+                let devs = [DEV_A, DEV_B];
+                write_bytes_partial(out, data_size, out_size, unsafe {
+                    std::slice::from_raw_parts(devs.as_ptr() as *const u8, 2 * std::mem::size_of::<AudioObjectID>())
+                })
             }
+            SEL_UIDB => write_out(out, data_size, out_size, OBJ_BOX),
+            SEL_UIDD => write_out(out, data_size, out_size, translate_uid(_qdata)),
             _ => BAD_PROP,
         },
         OBJ_BOX => match sel {
@@ -372,10 +410,15 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_BHAU => write_out(out, data_size, out_size, 1u32),
             SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXOF => write_out(out, data_size, out_size, 0u32),
             SEL_BXON => write_out(out, data_size, out_size, 1u32),
-            SEL_BDV => write_out(out, data_size, out_size, OBJ_DEVICE),
+            SEL_BDV => {
+                let devs = [DEV_A, DEV_B];
+                write_bytes_partial(out, data_size, out_size, unsafe {
+                    std::slice::from_raw_parts(devs.as_ptr() as *const u8, 2 * std::mem::size_of::<AudioObjectID>())
+                })
+            }
             _ => BAD_PROP,
         },
-        OBJ_DEVICE => match sel {
+        DEV_A | DEV_B => match sel {
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_DEVICE),
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
             SEL_OWNE => write_out(out, data_size, out_size, OBJ_PLUGIN),
@@ -404,26 +447,26 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_OWND => {
                 let mut owned: Vec<u32> = Vec::new();
                 if scope == SCOPE_GLOBAL || scope == SCOPE_OUTPUT {
-                    owned.push(OBJ_STREAM_OUTPUT);
-                    owned.push(OBJ_VOLUME);
-                    owned.push(OBJ_MUTE);
+                    owned.push(dev_out(obj));
+                    owned.push(dev_vol(obj));
+                    owned.push(dev_mute(obj));
                 }
                 if scope == SCOPE_GLOBAL || scope == SCOPE_INPUT {
-                    owned.push(OBJ_STREAM_INPUT);
+                    owned.push(dev_in(obj));
                 }
                 let bytes = unsafe { std::slice::from_raw_parts(owned.as_ptr() as *const u8, owned.len() * 4) };
                 write_bytes_partial(out, data_size, out_size, bytes)
             }
-            SEL_UID => write_cfstring(out, data_size, out_size, "vdev-audio-device"),
-            SEL_MUID => write_cfstring(out, data_size, out_size, "vdev-audio-device"),
-            SEL_LNAM => write_cfstring(out, data_size, out_size, "vdev-audio"),
-            SEL_LMOD => write_cfstring(out, data_size, out_size, "vdev-audio 2ch"),
+            SEL_UID => write_cfstring(out, data_size, out_size, dev_uid(obj)),
+            SEL_MUID => write_cfstring(out, data_size, out_size, dev_uid(obj)),
+            SEL_LNAM => write_cfstring(out, data_size, out_size, dev_name(obj)),
+            SEL_LMOD => write_cfstring(out, data_size, out_size, "vdev-audio 8ch"),
             SEL_LMAK => write_cfstring(out, data_size, out_size, "vdev"),
             SEL_TRAN => write_out(out, data_size, out_size, TRANSPORT_VIRTUAL),
-            SEL_GROU => write_out(out, data_size, out_size, OBJ_DEVICE),
+            SEL_GROU => write_out(out, data_size, out_size, dev_id(obj)),
             SEL_CLKD => write_out(out, data_size, out_size, 0u32),
             SEL_LIVN => write_out(out, data_size, out_size, 1u32),
-            SEL_GOIN | SEL_GONE => write_out(out, data_size, out_size, IO_RUNNING.load(Ordering::SeqCst) as u32),
+            SEL_GOIN | SEL_GONE => write_out(out, data_size, out_size, device_running(obj)),
             SEL_DFLT | SEL_SFLT => write_out(out, data_size, out_size, 1u32),
             SEL_LTNC | SEL_SAFT => write_out(out, data_size, out_size, 0u32),
             SEL_HIDN => write_out(out, data_size, out_size, 0u32),
@@ -441,11 +484,11 @@ unsafe extern "C" fn plugin_get_property_data(
                 })
             }
             SEL_STM => {
-                let stream = if scope == SCOPE_INPUT { OBJ_STREAM_INPUT } else { OBJ_STREAM_OUTPUT };
+                let stream = if scope == SCOPE_INPUT { dev_in(obj) } else { dev_out(obj) };
                 write_out(out, data_size, out_size, stream)
             }
             SEL_CTRL => {
-                let ctrls = [OBJ_VOLUME, OBJ_MUTE];
+                let ctrls = [dev_vol(obj), dev_mute(obj)];
                 write_bytes_partial(out, data_size, out_size, unsafe {
                     std::slice::from_raw_parts(ctrls.as_ptr() as *const u8, std::mem::size_of::<[AudioObjectID; 2]>())
                 })
@@ -458,12 +501,12 @@ unsafe extern "C" fn plugin_get_property_data(
             }
             _ => BAD_PROP,
         },
-        OBJ_STREAM_OUTPUT | OBJ_STREAM_INPUT => {
-            let input = obj == OBJ_STREAM_INPUT;
+        A_OUT | A_IN | B_OUT | B_IN => {
+            let input = is_stream_in(obj);
             match sel {
                 SEL_CLAS => write_out(out, data_size, out_size, CLASS_STREAM),
                 SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
-                SEL_OWNE => write_out(out, data_size, out_size, OBJ_DEVICE),
+                SEL_OWNE => write_out(out, data_size, out_size, dev_id(obj)),
                 SEL_OWND => { unsafe { if !out_size.is_null() { *out_size = 0; } } NO_ERR }
                 SEL_LNAM => write_cfstring(out, data_size, out_size, if input { "vdev-audio Input" } else { "vdev-audio Output" }),
                 SEL_LMAK => write_cfstring(out, data_size, out_size, "vdev"),
@@ -485,8 +528,11 @@ unsafe extern "C" fn plugin_get_property_data(
                 _ => BAD_PROP,
             }
         }
-        OBJ_VOLUME => match sel {
+        A_VOL | B_VOL => match sel {
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_VOLUME),
+            SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
+            SEL_OWNE => write_out(out, data_size, out_size, dev_id(obj)),
+            SEL_OWND => { unsafe { if !out_size.is_null() { *out_size = 0; } } NO_ERR },
             SEL_LCDV => write_out(out, data_size, out_size, 0.0f32),
             SEL_LCDR => {
                 let r = [AudioValueRange { m_minimum: -96.0, m_maximum: 0.0 }];
@@ -496,21 +542,18 @@ unsafe extern "C" fn plugin_get_property_data(
             }
             SEL_CSCP => write_out(out, data_size, out_size, SCOPE_OUTPUT),
             SEL_CELM => write_out(out, data_size, out_size, 1u32),
-            SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
-            SEL_OWNE => write_out(out, data_size, out_size, OBJ_DEVICE),
-            SEL_OWND => { unsafe { if !out_size.is_null() { *out_size = 0; } } NO_ERR }
             SEL_STBL => write_out(out, data_size, out_size, 1u8),
             SEL_VLSC => write_out(out, data_size, out_size, 1.0f32),
             SEL_VMIN => write_out(out, data_size, out_size, 0.0f32),
             SEL_VMAX => write_out(out, data_size, out_size, 1.0f32),
             _ => BAD_PROP,
         },
-        OBJ_MUTE => match sel {
+        A_MUTE | B_MUTE => match sel {
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_MUTE),
             SEL_CSCP => write_out(out, data_size, out_size, SCOPE_OUTPUT),
             SEL_CELM => write_out(out, data_size, out_size, 1u32),
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
-            SEL_OWNE => write_out(out, data_size, out_size, OBJ_DEVICE),
+            SEL_OWNE => write_out(out, data_size, out_size, dev_id(obj)),
             SEL_OWND => { unsafe { if !out_size.is_null() { *out_size = 0; } } NO_ERR }
             SEL_STBL => write_out(out, data_size, out_size, 1u8),
             SEL_MUTE => write_out(out, data_size, out_size, 0.0f32),
@@ -533,7 +576,7 @@ unsafe extern "C" fn plugin_set_property_data(
     if addr.is_null() || data.is_null() { return BAD_SEL; }
     let sel = unsafe { (*addr).m_selector };
     match obj {
-        OBJ_DEVICE if sel == SEL_NSRT => {
+        DEV_A | DEV_B if sel == SEL_NSRT => {
             let rate = unsafe { *(data as *const f64) };
             if rate != 44100.0 && rate != 48000.0 {
                 return BAD_PROP;
@@ -541,8 +584,8 @@ unsafe extern "C" fn plugin_set_property_data(
             SAMPLE_RATE.store(rate as u64, Ordering::SeqCst);
             NO_ERR
         }
-        OBJ_DEVICE if sel == SEL_FSIZ => NO_ERR, // 接受任意 buffer size
-        OBJ_DEVICE if sel == SEL_VDSP => {
+        DEV_A | DEV_B if sel == SEL_FSIZ => NO_ERR, // 接受任意 buffer size
+        DEV_A | DEV_B if sel == SEL_VDSP => {
             // data 是 CFStringRef："gain,low,mid,high"
             let cf = unsafe { *(data as *const *mut c_void) };
             let mut buf = [0 as std::ffi::c_char; 128];
@@ -558,8 +601,8 @@ unsafe extern "C" fn plugin_set_property_data(
             dsp().lock().unwrap_or_else(|e| e.into_inner()).set_params(parts[0], parts[1], parts[2], parts[3], rate);
             NO_ERR
         }
-        OBJ_VOLUME if sel == SEL_VLSC => NO_ERR,
-        OBJ_MUTE if sel == SEL_MUTE => NO_ERR,
+        A_VOL | B_VOL if sel == SEL_VLSC => NO_ERR,
+        A_MUTE | B_MUTE if sel == SEL_MUTE => NO_ERR,
         _ => BAD_PROP,
     }
 }
