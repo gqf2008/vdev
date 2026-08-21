@@ -1,4 +1,5 @@
 //! VDCamera — vdev 摄像头宿主（Rust + Slint）
+mod audio;
 mod camera;
 mod frame;
 mod screen;

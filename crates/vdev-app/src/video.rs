@@ -245,6 +245,11 @@ pub fn push_video(
                 path.clone()
             }
         };
+        // 音频推流（视频音轨 → VB-Cable 虚拟声卡，用本地副本避免网络卷卡顿）
+        let audio_path = local.clone();
+        let _ = std::thread::spawn(move || {
+            let _ = crate::audio::start_audio_push(&audio_path);
+        });
         let r = run(&local, width, height, fps, move |buf, w, h, stride| {
             let mut guard = cb_d.lock().unwrap_or_else(|e| e.into_inner());
             let c = guard.as_mut();
