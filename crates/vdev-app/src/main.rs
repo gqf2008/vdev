@@ -645,6 +645,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let path = picked.path;
                     append_log(&ui, &logs2, format!("已选择: {}", path));
+                    if path.starts_with("/Volumes/") {
+                        append_log(&ui, &logs2, "正在准备视频（外置/网络卷，首次会复制到本地缓存，请稍候）…");
+                    }
                     stop_current_push(&ui, &logs2);
                     *PUSH_MODE.lock().unwrap_or_else(|e| e.into_inner()) = Some(PushMode::Video);
                     VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
