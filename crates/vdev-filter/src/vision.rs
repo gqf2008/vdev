@@ -35,15 +35,29 @@ extern "C" {
 
 /// 对输入 BGRA CVPixelBuffer 生成人像分割 mask（8bit 灰度，255=人像）。
 /// 内部完成 mask 的取用与释放；返回与输入同宽高的 mask Vec<u8>。
+// 复用 VNGeneratePersonSegmentationRequest（stateful，避免每帧 alloc + 提升时序稳定）
+static REQ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+// 上次分割 mask 缓存 + 帧计数（每 3 帧分割一次，中间复用，人像 mask 慢变化）
+static LAST_MASK: std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>> = std::sync::Mutex::new(None); // (mask, blur_bg)
+static FRAME_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn get_req() -> *mut objc2::runtime::AnyObject {
+    let addr = *REQ.get_or_init(|| {
+        let req_cls = AnyClass::get(c"VNGeneratePersonSegmentationRequest").unwrap();
+        let req: *mut objc2::runtime::AnyObject = unsafe {
+            objc2::msg_send![req_cls, new]
+        };
+        unsafe {
+            let _: () = objc2::msg_send![&*req, setQualityLevel: 2u64];
+        }
+        req as usize
+    });
+    addr as *mut objc2::runtime::AnyObject
+}
+
 pub fn segment_person(pixel_buffer: CVPixelBufferRef) -> Option<(Vec<u8>, usize, usize)> {
     unsafe {
-        let req_cls = AnyClass::get(c"VNGeneratePersonSegmentationRequest")?;
-        let req: *mut objc2::runtime::AnyObject = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-            objc2::msg_send![req_cls, new]
-        })).unwrap_or_else(|_| std::ptr::null_mut());
+        let req = get_req();
         if req.is_null() { return None; }
-        // fast（流式，Neural Engine）
-        let _: () = objc2::msg_send![&*req, setQualityLevel: 2u64];
 
         let handler_cls = AnyClass::get(c"VNImageRequestHandler")?;
         let h: *mut objc2::runtime::AnyObject = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
@@ -135,41 +149,40 @@ pub fn apply_background(
     }
 }
 
-/// 盒式模糊（对整帧；用于"背景模糊"模式）
+/// 盒式模糊（分离 + 前缀和 O(1)/像素；用于"背景模糊"模式）
 fn box_blur(bgra: &[u8], width: u32, height: u32, radius: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let r = radius as usize;
-    let mut out = bgra.to_vec();
-    // 水平 + 垂直分离盒式模糊（O(n) 滑动窗口）
     let mut tmp = vec![0u8; bgra.len()];
+    // 水平前缀和
     for y in 0..h {
         for ch in 0..4 {
-            let row = y * w;
+            let mut prefix = vec![0u32; w + 1];
+            for x in 0..w {
+                prefix[x + 1] = prefix[x] + bgra[(y * w + x) * 4 + ch] as u32;
+            }
             for x in 0..w {
                 let l = x.saturating_sub(r);
                 let rr = (x + r).min(w - 1);
-                let mut acc = 0u32;
-                for xx in l..=rr {
-                    acc += bgra[(row + xx) * 4 + ch] as u32;
-                }
-                let cnt = (rr - l + 1) as u32;
-                tmp[(row + x) * 4 + ch] = (acc / cnt) as u8;
+                let sum = prefix[rr + 1] - prefix[l];
+                tmp[(y * w + x) * 4 + ch] = (sum / (rr - l + 1) as u32) as u8;
             }
         }
     }
-    // 垂直
+    // 垂直前缀和
+    let mut out = vec![0u8; bgra.len()];
     for x in 0..w {
         for ch in 0..4 {
+            let mut prefix = vec![0u32; h + 1];
+            for y in 0..h {
+                prefix[y + 1] = prefix[y] + tmp[(y * w + x) * 4 + ch] as u32;
+            }
             for y in 0..h {
                 let t = y.saturating_sub(r);
                 let b = (y + r).min(h - 1);
-                let mut acc = 0u32;
-                for yy in t..=b {
-                    acc += tmp[(yy * w + x) * 4 + ch] as u32;
-                }
-                let cnt = (b - t + 1) as u32;
-                out[(y * w + x) * 4 + ch] = (acc / cnt) as u8;
+                let sum = prefix[b + 1] - prefix[t];
+                out[(y * w + x) * 4 + ch] = (sum / (b - t + 1) as u32) as u8;
             }
         }
     }
@@ -225,6 +238,54 @@ pub fn bgra_to_cvpixelbuffer(bgra: &[u8], width: usize, height: usize) -> Option
     Some(pb)
 }
 
+/// BGRA 双线性缩放（供降分辨率分割用）
+pub fn resize_bgra(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let mut out = vec![0u8; dw * dh * 4];
+    if sw == dw && sh == dh {
+        out.copy_from_slice(&src[..dw * dh * 4]);
+        return out;
+    }
+    for y in 0..dh {
+        // 源坐标（中心对齐）
+        let sy = ((y as f64 + 0.5) * sh as f64 / dh as f64 - 0.5).clamp(0.0, sh as f64 - 1.0);
+        let sy0 = sy.floor() as usize;
+        let sy1 = (sy0 + 1).min(sh - 1);
+        let fy = sy - sy0 as f64;
+        for x in 0..dw {
+            let sx = ((x as f64 + 0.5) * sw as f64 / dw as f64 - 0.5).clamp(0.0, sw as f64 - 1.0);
+            let sx0 = sx.floor() as usize;
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let fx = sx - sx0 as f64;
+            let di = (y * dw + x) * 4;
+            for c in 0..4 {
+                let p00 = src[(sy0 * sw + sx0) * 4 + c] as f64;
+                let p10 = src[(sy0 * sw + sx1) * 4 + c] as f64;
+                let p01 = src[(sy1 * sw + sx0) * 4 + c] as f64;
+                let p11 = src[(sy1 * sw + sx1) * 4 + c] as f64;
+                let top = p00 * (1.0 - fx) + p10 * fx;
+                let bot = p01 * (1.0 - fx) + p11 * fx;
+                out[di + c] = (top * (1.0 - fy) + bot * fy).round() as u8;
+            }
+        }
+    }
+    out
+}
+
+/// mask 最近邻放大（灰度 mask，最近邻足够）
+pub fn resize_mask(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let mut out = vec![0u8; dw * dh];
+    for y in 0..dh {
+        let sy = (y * sh / dh).min(sh - 1);
+        for x in 0..dw {
+            let sx = (x * sw / dw).min(sw - 1);
+            out[y * dw + x] = src[sy * sw + sx];
+        }
+    }
+    out
+}
+
 /// 一步封装：BGRA 帧 → 人像分割 → 背景替换/模糊。
 /// `background` 为 None 时用盒式模糊作为"背景模糊"。
 /// 需要 feature "vision"。返回处理后的 BGRA（原地修改 bgra）。
@@ -235,16 +296,41 @@ pub fn segment_and_replace(
     background: Option<&[u8]>,
     blur_radius: u32,
 ) -> bool {
-    let Some(pb) = bgra_to_cvpixelbuffer(bgra, width as usize, height as usize) else {
-        return false;
+    // 降分辨率分割：最长边压到 512，mask 再放大回原尺寸（帧率从 ~10 提到 30+）
+    let max_dim = width.max(height);
+    let (sw, sh) = if max_dim > 512 {
+        let scale = 512.0 / max_dim as f64;
+        ((width as f64 * scale) as u32, (height as f64 * scale) as u32)
+    } else {
+        (width, height)
     };
-    let Some((mask, _mw, _mh)) = segment_person(pb) else {
+    // 节流：每 5 帧真正跑一次 Vision 分割，中间复用上一帧 mask
+    let n = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 5 == 0 {
+        let small = resize_bgra(bgra, width, height, sw, sh);
+        let Some(pb) = bgra_to_cvpixelbuffer(&small, sw as usize, sh as usize) else {
+            return false;
+        };
+        let Some((mask, mw, mh)) = segment_person(pb) else {
+            unsafe { CFRelease(pb as *const std::ffi::c_void); }
+            return false;
+        };
         unsafe { CFRelease(pb as *const std::ffi::c_void); }
-        return false;
-    };
-    unsafe { CFRelease(pb as *const std::ffi::c_void); }
-    apply_background(bgra, width, height, &mask, background, blur_radius);
-    true
+        let full_mask = resize_mask(&mask, mw as u32, mh as u32, width, height);
+        // 同时缓存模糊背景（每 5 帧算一次，中间复用）
+        let blur_bg = match background {
+            Some(b) => b.to_vec(),
+            None => box_blur(bgra, width, height, blur_radius.max(1)),
+        };
+        *LAST_MASK.lock().unwrap_or_else(|e| e.into_inner()) = Some((full_mask, blur_bg));
+    }
+    let guard = LAST_MASK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((m, bg)) = guard.as_ref() {
+        apply_background(bgra, width, height, m, Some(bg), blur_radius);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(all(test, feature = "vision"))]
