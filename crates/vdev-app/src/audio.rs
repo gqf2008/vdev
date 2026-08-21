@@ -259,6 +259,14 @@ pub fn set_log_cb(cb: Option<LogFn>) {
 
 fn alog(msg: impl AsRef<str>) {
     let s = msg.as_ref().to_string();
+    // 诊断：同时落盘 /tmp/vdev-audio-push.log（音频推流状态排查用）
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true).mode(0o666);
+    if let Ok(mut f) = opts.open("/tmp/vdev-audio-push.log") {
+        let _ = writeln!(f, "[{}] {}", std::process::id(), s);
+    }
     if let Some(cb) = AUDIO_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         cb(s);
     } else {
