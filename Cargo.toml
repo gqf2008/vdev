@@ -6,6 +6,7 @@ members = [
     "crates/vdev-camera",
     "crates/vdev-host",
     "crates/vdev-app",
+    "crates/vdev-camera-ext",
 ]
 
 [workspace.package]
