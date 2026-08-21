@@ -209,6 +209,20 @@ pub fn prepare_local_path(path: &str) -> Result<String> {
 /// 可能停顿 >2s，扩展端 2s 没收到新注入帧就回落到彩条，造成「彩条/视频交替」。
 /// 这里用保活线程：最后发送超过 500ms 就重发最后一帧（带新时间戳），
 /// 让扩展永远等不到 2s 超时；推流真正结束后 done=true，保活退出，扩展正常回落彩条。
+/// 从 VDEV_FILTER 环境变量解析滤镜参数（"brightness,contrast,saturation,green,sharpen"）
+fn filter_params_from_env() -> vdev_filter::FilterParams {
+    let mut p = vdev_filter::FilterParams::default();
+    if let Ok(v) = std::env::var("VDEV_FILTER") {
+        let parts: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if parts.len() >= 1 { p.brightness = parts[0]; }
+        if parts.len() >= 2 { p.contrast = parts[1]; }
+        if parts.len() >= 3 { p.saturation = parts[2]; }
+        if parts.len() >= 4 { p.green_screen_threshold = parts[3].clamp(0.0, 255.0) as u8; }
+        if parts.len() >= 5 { p.sharpen = parts[4]; }
+    }
+    p
+}
+
 pub fn push_video(
     path: &str,
     access: FileAccess,
@@ -391,7 +405,23 @@ fn run(
             if target_ns > now {
                 std::thread::sleep(std::time::Duration::from_nanos(target_ns - now));
             }
-            on_frame(scaled.0, width, height, scaled.1 as u32);
+            let mut buf = scaled.0;
+            let mut stride = scaled.1 as u32;
+            // 滤镜需要紧凑 BGRA（stride == width*4）
+            if stride != width * 4 {
+                let mut compact = vec![0u8; (width * height * 4) as usize];
+                for row in 0..height as usize {
+                    let src_off = row * stride as usize;
+                    let dst_off = row * (width * 4) as usize;
+                    compact[dst_off..dst_off + (width * 4) as usize]
+                        .copy_from_slice(&buf[src_off..src_off + (width * 4) as usize]);
+                }
+                buf = compact;
+                stride = width * 4;
+            }
+            let fp = filter_params_from_env();
+            vdev_filter::process_frame(&mut buf, width, height, &fp);
+            on_frame(buf, width, height, stride);
             ffi::CFRelease(sample as *const std::ffi::c_void);
         }
         Ok(())
