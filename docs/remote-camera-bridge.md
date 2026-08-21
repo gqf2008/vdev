@@ -41,7 +41,8 @@
 - ✅ 滤镜接入 vdev-app 视频推流（VDEV_FILTER）
 - ✅ vdev-bridge 视频桥：str0m 收流 → NAL 组装 → FfmpegDecoder → RGBA→BGRA 缩放 → 滤镜 → FrameChannel
 - ✅ vdev-bridge 音频桥：Opus 解码 → SPSC ring → AudioUnit → vdev-audio 声卡
-- ⏳ 端到端运行验证（需 aerodesk SFU + signal + 发布端 + 摄像头扩展运行）
+- ✅ 端到端验证通过：aerodesk publisher(--noisy x264 + --audio-opus) → SFU → vdev-bridge
+  → H264 解码 420+ 帧(1920x1080) 推摄像头、Opus 解码 700+ 帧(960s/帧) 出声卡
 
 ## 用法
 
