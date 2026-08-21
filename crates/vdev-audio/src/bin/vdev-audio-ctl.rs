@@ -24,7 +24,10 @@ struct AudioObjectPropertyAddress {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(obj: *const c_void);
+    fn CFStringGetCString(s: *const c_void, buf: *mut std::os::raw::c_char, len: isize, encoding: u32) -> bool;
+    fn CFStringCreateWithCString(alloc: *const c_void, cstr: *const std::os::raw::c_char, encoding: u32) -> *mut c_void;
 }
+const CF_UTF8: u32 = 0x08000100; // kCFStringEncodingUTF8
 
 #[link(name = "CoreAudio", kind = "framework")]
 extern "C" {
@@ -75,11 +78,15 @@ fn find_device() -> Option<u32> {
             let mut nsize = std::mem::size_of::<*mut c_void>() as u32;
             let mut name_ref: *mut c_void = std::ptr::null_mut();
             if AudioObjectGetPropertyData(id, &na, 0, std::ptr::null(), &mut nsize, &mut name_ref as *mut *mut c_void as *mut c_void) == 0 && !name_ref.is_null() {
-                let s = std::ffi::CStr::from_ptr(name_ref as *const std::os::raw::c_char).to_string_lossy().to_string();
+                let mut buf = [0 as std::os::raw::c_char; 256];
+                let ok = CFStringGetCString(name_ref, buf.as_mut_ptr(), 256, CF_UTF8);
                 // 释放 CFString（GetPropertyData 返回 +1）
                 CFRelease(name_ref);
-                if s.to_lowercase().contains("vdev-audio") {
-                    return Some(id);
+                if ok {
+                    let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string();
+                    if s.to_lowercase().contains("vdev-audio") {
+                        return Some(id);
+                    }
                 }
             }
         }
@@ -90,17 +97,37 @@ fn find_device() -> Option<u32> {
 fn get_params(dev: u32) -> Option<[f32; 4]> {
     unsafe {
         let a = addr(SEL_VDSP);
-        let mut p = [0.0f32; 4];
-        let mut size = (std::mem::size_of::<[f32; 4]>()) as u32;
-        let rc = AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut size, p.as_mut_ptr() as *mut c_void);
-        if rc == 0 { Some(p) } else { None }
+        let mut cf: *mut c_void = std::ptr::null_mut();
+        let mut size = std::mem::size_of::<*mut c_void>() as u32;
+        let rc = AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut size, &mut cf as *mut *mut c_void as *mut c_void);
+        if rc != 0 || cf.is_null() {
+            eprintln!("GetPropertyData(vdsp) rc={}", rc);
+            return None;
+        }
+        let mut buf = [0 as std::os::raw::c_char; 128];
+        if !CFStringGetCString(cf, buf.as_mut_ptr(), 128, CF_UTF8) {
+            CFRelease(cf);
+            return None;
+        }
+        CFRelease(cf);
+        let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string();
+        let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() == 4 { Some([v[0], v[1], v[2], v[3]]) } else { None }
     }
 }
 
 fn set_params(dev: u32, p: &[f32; 4]) -> bool {
     unsafe {
         let a = addr(SEL_VDSP);
-        AudioObjectSetPropertyData(dev, &a, 0, std::ptr::null(), (std::mem::size_of::<[f32; 4]>()) as u32, p.as_ptr() as *const c_void) == 0
+        let s = format!("{:.1},{:.1},{:.1},{:.1}", p[0], p[1], p[2], p[3]);
+        let c = std::ffi::CString::new(s).unwrap();
+        let cf = CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), CF_UTF8);
+        if cf.is_null() {
+            return false;
+        }
+        let rc = AudioObjectSetPropertyData(dev, &a, 0, std::ptr::null(), std::mem::size_of::<*mut c_void>() as u32, &cf as *const *mut c_void as *const c_void);
+        CFRelease(cf);
+        rc == 0
     }
 }
 
