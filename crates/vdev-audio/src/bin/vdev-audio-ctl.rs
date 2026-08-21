@@ -10,6 +10,7 @@ const OBJ_SYSTEM: u32 = 1;
 const SEL_DEVICES: u32 = 0x64657623; // 'dev#' kAudioHardwarePropertyDevices
 const SEL_NAME: u32 = 0x6c6e616d; // 'lnam' kAudioObjectPropertyName
 const SEL_VDSP: u32 = 0x76647370; // 'vdsp' 自定义 DSP 参数
+const SEL_VRUT: u32 = 0x76727574; // 'vrut' 路由矩阵
 const SCOPE_GLOBAL: u32 = 0x676c6f62; // 'glob'
 const ELEM_MAIN: u32 = 0;
 
@@ -94,6 +95,31 @@ fn find_device() -> Option<u32> {
     None
 }
 
+fn get_cf_string(dev: u32, sel: u32) -> Option<String> {
+    unsafe {
+        let a = addr(sel);
+        let mut cf: *mut c_void = std::ptr::null_mut();
+        let mut size = std::mem::size_of::<*mut c_void>() as u32;
+        let rc = AudioObjectGetPropertyData(dev, &a, 0, std::ptr::null(), &mut size, &mut cf as *mut *mut c_void as *mut c_void);
+        if rc != 0 || cf.is_null() { return None; }
+        let mut buf = [0 as std::os::raw::c_char; 128];
+        let ok = CFStringGetCString(cf, buf.as_mut_ptr(), 128, CF_UTF8);
+        CFRelease(cf);
+        if ok { Some(std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string()) } else { None }
+    }
+}
+fn set_cf_string(dev: u32, sel: u32, s: &str) -> bool {
+    unsafe {
+        let a = addr(sel);
+        let c = std::ffi::CString::new(s).unwrap();
+        let cf = CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), CF_UTF8);
+        if cf.is_null() { return false; }
+        let rc = AudioObjectSetPropertyData(dev, &a, 0, std::ptr::null(), std::mem::size_of::<*mut c_void>() as u32, &cf as *const *mut c_void as *const c_void);
+        CFRelease(cf);
+        rc == 0
+    }
+}
+
 fn get_params(dev: u32) -> Option<[f32; 4]> {
     unsafe {
         let a = addr(SEL_VDSP);
@@ -159,8 +185,19 @@ fn main() {
             Some(p) => println!("gain={} low={} mid={} high={} (dB)", p[0], p[1], p[2], p[3]),
             None => { eprintln!("读取失败"); std::process::exit(1); }
         }
+    } else if args.len() >= 2 && args[1] == "route" && args.len() == 6 {
+        let v: Vec<f32> = args[2..6].iter().map(|s| s.parse().unwrap_or(0.0)).collect();
+        let s = format!("{:.1},{:.1},{:.1},{:.1}", v[0], v[1], v[2], v[3]);
+        if set_cf_string(dev, SEL_VRUT, &s) {
+            println!("已设置路由矩阵 [[{:.1},{:.1}],[{:.1},{:.1}]]", v[0], v[1], v[2], v[3]);
+        } else { eprintln!("设置失败"); std::process::exit(1); }
+    } else if args.len() >= 2 && args[1] == "route" && args.len() == 2 {
+        match get_cf_string(dev, SEL_VRUT) {
+            Some(s) => println!("route={}", s),
+            None => { eprintln!("读取失败"); std::process::exit(1); }
+        }
     } else {
-        eprintln!("用法: vdev-audio-ctl [set g l m h | reset]");
+        eprintln!("用法: vdev-audio-ctl [set g l m h | reset | route [r00 r01 r10 r11]]");
         std::process::exit(1);
     }
 }
