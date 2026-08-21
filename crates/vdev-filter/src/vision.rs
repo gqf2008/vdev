@@ -6,6 +6,22 @@ use objc2::runtime::AnyClass;
 
 pub type CVPixelBufferRef = *mut std::ffi::c_void;
 
+/// CVPixelBufferRef 的 ObjC type-encoding 包装（^{__CVBuffer=}）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CvBufferRef(pub CVPixelBufferRef);
+unsafe impl objc2::encode::Encode for CvBufferRef {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+        &objc2::encode::Encoding::Struct("__CVBuffer", &[]),
+    );
+}
+
+// 链接 Vision.framework（否则 AnyClass::get 找不到 Vision 的类）
+#[link(name = "Vision", kind = "framework")]
+extern "C" {
+    fn _vdev_vision_link_anchor();
+}
+
 #[link(name = "CoreVideo", kind = "framework")]
 extern "C" {
     fn CVPixelBufferLockBaseAddress(pb: CVPixelBufferRef, flags: u32) -> i32;
@@ -19,34 +35,49 @@ extern "C" {
 
 /// 对输入 BGRA CVPixelBuffer 生成人像分割 mask（8bit 灰度，255=人像）。
 /// 内部完成 mask 的取用与释放；返回与输入同宽高的 mask Vec<u8>。
-pub fn segment_person(pixel_buffer: CVPixelBufferRef) -> Option<Vec<u8>> {
+pub fn segment_person(pixel_buffer: CVPixelBufferRef) -> Option<(Vec<u8>, usize, usize)> {
     unsafe {
         let req_cls = AnyClass::get(c"VNGeneratePersonSegmentationRequest")?;
-        let req: *mut objc2::runtime::AnyObject = objc2::msg_send![req_cls, init];
+        let req: *mut objc2::runtime::AnyObject = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            objc2::msg_send![req_cls, new]
+        })).unwrap_or_else(|_| std::ptr::null_mut());
         if req.is_null() { return None; }
         // fast（流式，Neural Engine）
         let _: () = objc2::msg_send![&*req, setQualityLevel: 2u64];
 
         let handler_cls = AnyClass::get(c"VNImageRequestHandler")?;
-        let handler: *mut objc2::runtime::AnyObject = objc2::msg_send![
-            handler_cls,
-            initWithCVPixelBuffer: pixel_buffer,
-            options: std::ptr::null::<objc2::runtime::AnyObject>()
-        ];
+        let h: *mut objc2::runtime::AnyObject = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            objc2::msg_send![handler_cls, alloc]
+        })).unwrap_or_else(|_| std::ptr::null_mut());
+        if h.is_null() { return None; }
+        let opts_cls = AnyClass::get(c"NSDictionary");
+        let opts: *mut objc2::runtime::AnyObject = if let Some(c) = opts_cls {
+            objc2::msg_send![c, dictionary]
+        } else { std::ptr::null_mut() };
+        let handler: *mut objc2::runtime::AnyObject = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            objc2::msg_send![
+                h,
+                initWithCVPixelBuffer: CvBufferRef(pixel_buffer),
+                options: opts
+            ]
+        })).unwrap_or_else(|_| std::ptr::null_mut());
         if handler.is_null() { return None; }
 
         let ns_arr_cls = AnyClass::get(c"NSArray")?;
         let arr: *mut objc2::runtime::AnyObject =
             objc2::msg_send![ns_arr_cls, arrayWithObject: req];
         let mut err: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
-        let ok: bool = objc2::msg_send![&*handler, performRequests: &*arr, error: &mut err];
+        let ok: bool = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            objc2::msg_send![&*handler, performRequests: &*arr, error: &mut err]
+        })).unwrap_or_else(|_| false);
         if !ok { return None; }
 
         let results: *mut objc2::runtime::AnyObject = objc2::msg_send![&*req, results];
         if results.is_null() { return None; }
         let obs: *mut objc2::runtime::AnyObject = objc2::msg_send![&*results, firstObject];
         if obs.is_null() { return None; }
-        let mask: CVPixelBufferRef = objc2::msg_send![&*obs, pixelBuffer];
+        let mask: CvBufferRef = objc2::msg_send![&*obs, pixelBuffer];
+        let mask: CVPixelBufferRef = mask.0;
         if mask.is_null() { return None; }
 
         // 读取 mask 像素
@@ -62,7 +93,7 @@ pub fn segment_person(pixel_buffer: CVPixelBufferRef) -> Option<Vec<u8>> {
         }
         CVPixelBufferUnlockBaseAddress(mask, 1);
         CFRelease(mask as *const std::ffi::c_void);
-        Some(out)
+        Some((out, w, h))
     }
 }
 
@@ -143,4 +174,65 @@ fn box_blur(bgra: &[u8], width: u32, height: u32, radius: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// 创建 BGRA CVPixelBuffer（测试/集成用）
+pub fn create_bgra_buffer(width: usize, height: usize) -> CVPixelBufferRef {
+    unsafe extern "C" {
+        fn CVPixelBufferCreate(
+            allocator: *const std::ffi::c_void,
+            width: usize,
+            height: usize,
+            pixel_format: u32,
+            attrs: *const std::ffi::c_void,
+            out: *mut CVPixelBufferRef,
+        ) -> i32;
+    }
+    const BGRA: u32 = 0x42475241; // kCVPixelFormatType_32BGRA
+    let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+    unsafe {
+        let rc = CVPixelBufferCreate(
+            std::ptr::null(),
+            width,
+            height,
+            BGRA,
+            std::ptr::null(),
+            &mut pb,
+        );
+        if rc != 0 { return std::ptr::null_mut(); }
+    }
+    pb
+}
+
+#[cfg(all(test, feature = "vision"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_segment_person_runs() {
+        let pb = create_bgra_buffer(256, 256);
+        assert!(!pb.is_null(), "CVPixelBuffer 创建失败");
+        let r = segment_person(pb);
+        unsafe { CFRelease(pb as *const std::ffi::c_void); }
+        let (mask, mw, mh) = r.expect("人像分割失败");
+        println!("mask 尺寸 {}x{}，非零占比: {:.1}%", mw, mh, mask.iter().filter(|&&m| m > 128).count() as f32 * 100.0 / mask.len() as f32);
+    }
+
+    #[test]
+    fn test_apply_background_blur() {
+        let w = 64; let h = 64;
+        let mut bgra = vec![0u8; w * h * 4];
+        for i in 0..w*h {
+            let o = i * 4;
+            bgra[o] = 100; bgra[o+1] = 150; bgra[o+2] = 200; bgra[o+3] = 255;
+        }
+        // 全背景 mask（全 0）
+        let mask = vec![0u8; w * h];
+        let before = bgra.clone();
+        apply_background(&mut bgra, w as u32, h as u32, &mask, None, 3);
+        // 背景模糊后，像素应被平滑（纯色图模糊后仍接近原值，但不完全等于——验证不崩溃 + 仍有效）
+        let p = crate::Pixel { b: bgra[0], g: bgra[1], r: bgra[2], a: bgra[3] };
+        assert!(p.a == before[3], "alpha 应保留");
+        assert!(p.r > 0, "模糊后仍有效");
+    }
 }
