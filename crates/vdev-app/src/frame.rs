@@ -20,7 +20,7 @@ pub fn connect() -> Result<FrameClient> {
 }
 
 impl FrameClient {
-    /// 发送一帧 BGRA32：36 字节小端头 + payload（协议见 extension/FrameChannel.swift）。
+    /// 发送一帧 BGRA32：36 字节小端头 + payload（协议见 crates/vdev-camera-ext/src/frame_channel.rs）。
     pub fn send_frame(
         &mut self,
         data: &[u8],
