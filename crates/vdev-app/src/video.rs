@@ -26,6 +26,7 @@ mod ffi {
         pub fn CMClockGetHostTimeClock() -> *mut c_void;
         pub fn CMClockGetTime(clock: *mut c_void) -> CMTime;
         pub fn CMSampleBufferGetImageBuffer(sb: *mut c_void) -> *mut c_void;
+        pub fn CMSampleBufferGetPresentationTimeStamp(sb: *mut c_void) -> CMTime;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
@@ -291,7 +292,7 @@ fn run(
     path: &str,
     width: u32,
     height: u32,
-    fps: u32,
+    _fps: u32,
     mut on_frame: impl FnMut(Vec<u8>, u32, u32, u32),
 ) -> Result<()> {
     unsafe {
@@ -334,9 +335,10 @@ fn run(
             return Err(anyhow!("视频解码启动失败"));
         }
 
-        let interval_ns = 1_000_000_000u64 / fps as u64;
         let start_ns = host_time_ns();
-        let mut index: u64 = 0;
+        // 按源视频 PTS 时间戳推流（不再固定 60fps 掐帧）：
+        // 24fps 视频就 24fps 推，VFR 也精确；解码慢于实时时自然追帧（不丢帧）
+        let mut base_pts_ns: Option<i64> = None;
 
         loop {
             if crate::VIDEO_STOP.load(std::sync::atomic::Ordering::SeqCst) {
@@ -351,6 +353,14 @@ fn run(
                 ffi::CFRelease(sample as *const std::ffi::c_void);
                 continue;
             }
+            let pts = ffi::CMSampleBufferGetPresentationTimeStamp(sample);
+            let pts_ns = if pts.timescale > 0 {
+                (pts.value as f64 / pts.timescale as f64 * 1e9) as i64
+            } else {
+                0
+            };
+            let base = *base_pts_ns.get_or_insert(pts_ns);
+            let target_ns = start_ns.saturating_add((pts_ns - base).max(0) as u64);
             ffi::CVPixelBufferLockBaseAddress(pb, 1); // read-only
             let src_w = ffi::CVPixelBufferGetWidth(pb);
             let src_h = ffi::CVPixelBufferGetHeight(pb);
@@ -372,8 +382,6 @@ fn run(
                 height as usize,
             )
             .unwrap_or((raw, src_stride));
-            let target_ns = start_ns + index * interval_ns;
-            index += 1;
             let now = host_time_ns();
             if target_ns > now {
                 std::thread::sleep(std::time::Duration::from_nanos(target_ns - now));
