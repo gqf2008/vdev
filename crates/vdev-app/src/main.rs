@@ -322,6 +322,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(10);
         VIDEO_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::audio::set_log_cb(None);
+        // 隔离测试：只跑音频（正弦），不推视频，验证爆音是否来自 CPU 抢占
+        if std::env::var("VDEV_TEST_SINE").is_ok() {
+            println!("audio-only 测试（无视频推流）");
+            crate::audio::start_audio_push(&path);
+            std::thread::sleep(Duration::from_secs(dur));
+            VIDEO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            return Ok(());
+        }
         let sent: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sent_cb = sent.clone();
         // 诊断统计：帧间隔 + 发送耗时，暴露 >2s 停顿（会导致扩展回落彩条）
@@ -630,6 +640,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             append_log(&ui, &logs, "正在打开文件选择器…");
             let ui2 = ui.as_weak();
             let logs2 = logs.clone();
+            // 音频推流状态打进日志区
+            let audio_ui = ui.as_weak();
+            let audio_logs = logs.clone();
+            crate::audio::set_log_cb(Some(Arc::new(move |s: String| {
+                if let Some(ui) = audio_ui.upgrade() {
+                    append_log(&ui, &audio_logs, s);
+                }
+            })));
             let _ = slint::invoke_from_event_loop(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let ui = match ui2.upgrade() { Some(ui) => ui, None => return };

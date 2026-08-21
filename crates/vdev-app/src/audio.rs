@@ -12,7 +12,7 @@ use objc2_foundation::{NSDictionary, NSString, NSURL};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------- 常量（CoreAudio / AudioUnit）----------------
 const K_AUDIO_OBJECT_SYSTEM: u32 = 1; // kAudioObjectSystemObject
@@ -24,14 +24,15 @@ const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = 0x61756f75; // 'auou'
 const K_AUDIO_UNIT_SUBTYPE_HAL: u32 = 0x6168616c; // 'ahal'
 const K_AUDIO_UNIT_MANUF_APPLE: u32 = 0x6170706c; // 'appl'
 const K_OUTPUT_UNIT_PROP_CURRENT_DEVICE: u32 = 2000; // kAudioOutputUnitProperty_CurrentDevice
+const K_OUTPUT_UNIT_PROP_ENABLE_IO: u32 = 2003; // kAudioOutputUnitProperty_EnableIO
 const K_AUDIO_UNIT_PROP_STREAM_FORMAT: u32 = 8; // kAudioUnitProperty_StreamFormat
 const K_AUDIO_UNIT_PROP_SET_RENDER_CB: u32 = 23; // kAudioUnitProperty_SetRenderCallback
 const K_AUDIO_UNIT_SCOPE_GLOBAL: u32 = 0;
 const K_AUDIO_UNIT_SCOPE_INPUT: u32 = 1;
+const K_AUDIO_UNIT_SCOPE_OUTPUT: u32 = 2;
 const SAMPLE_RATE: f64 = 48_000.0;
 const CHANNELS: u32 = 2;
 // 环缓冲容量：约 0.5s（按 48k*2ch*f32）
-const RING_CAP: usize = SAMPLE_RATE as usize * CHANNELS as usize / 2;
 
 type AudioObjectID = u32;
 
@@ -165,34 +166,100 @@ struct AudioComponentDescription {
     component_flags_mask: u32,
 }
 
-// ---------------- 环缓冲（渲染回调与解码线程共享）----------------
-struct Ring {
-    buf: VecDeque<f32>,
-    cap: usize,
+// ---------------- 无锁 SPSC 环形缓冲（渲染回调与解码线程共享）----------------
+// 实时音频回调绝不能分配/加锁，用原子头尾指针 + 预分配数组。
+const RING_LEN: usize = 65536; // 2 的幂；约 0.68s @96k samples/s
+
+struct SpscRing {
+    buf: std::cell::UnsafeCell<Vec<f32>>,
+    mask: usize,
+    head: std::sync::atomic::AtomicUsize,
+    tail: std::sync::atomic::AtomicUsize,
 }
 
-impl Ring {
-    fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(cap), cap }
+// SPSC：生产/消费各只访问自己的区间，由 head/tail 原子同步，跨线程安全。
+unsafe impl Sync for SpscRing {}
+
+static RING: std::sync::OnceLock<SpscRing> = std::sync::OnceLock::new();
+static UNDERRUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEST_SINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SINE_PHASE: std::sync::Mutex<f32> = std::sync::Mutex::new(0.0);
+static CB_NBUFS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CB_DATA_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CB_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn ring() -> &'static SpscRing {
+    RING.get_or_init(|| SpscRing {
+        buf: std::cell::UnsafeCell::new(vec![0.0f32; RING_LEN]),
+        mask: RING_LEN - 1,
+        head: std::sync::atomic::AtomicUsize::new(0),
+        tail: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+fn ring_free() -> usize {
+    let r = ring();
+    let head = r.head.load(std::sync::atomic::Ordering::Relaxed);
+    let tail = r.tail.load(std::sync::atomic::Ordering::Relaxed);
+    (RING_LEN - 1) - (head.wrapping_sub(tail) & r.mask)
+}
+
+fn ring_used() -> usize {
+    let r = ring();
+    let head = r.head.load(std::sync::atomic::Ordering::Acquire);
+    let tail = r.tail.load(std::sync::atomic::Ordering::Relaxed);
+    head.wrapping_sub(tail) & r.mask
+}
+
+/// 生产（解码线程）：推入 samples；空间不足则只推能放下的部分并返回实际推入数。
+fn ring_push(data: &[f32]) -> usize {
+    let r = ring();
+    let head = r.head.load(std::sync::atomic::Ordering::Relaxed);
+    let tail = r.tail.load(std::sync::atomic::Ordering::Relaxed);
+    let used = head.wrapping_sub(tail) & r.mask;
+    let free = (RING_LEN - 1) - used;
+    let n = data.len().min(free);
+    let buf = unsafe { &mut *r.buf.get() };
+    for i in 0..n {
+        buf[(head + i) & r.mask] = data[i];
     }
-    fn push(&mut self, data: &[f32]) {
-        for &v in data {
-            self.buf.push_back(v);
-        }
+    r.head.store(head.wrapping_add(n), std::sync::atomic::Ordering::Release);
+    n
+}
+
+/// 消费（渲染回调）：读最多 dst.len() 个样本到 dst，返回实际读到的数量。
+fn ring_pop(dst: &mut [f32]) -> usize {
+    let r = ring();
+    let head = r.head.load(std::sync::atomic::Ordering::Acquire);
+    let tail = r.tail.load(std::sync::atomic::Ordering::Relaxed);
+    let used = head.wrapping_sub(tail) & r.mask;
+    let n = used.min(dst.len());
+    let buf = unsafe { &*r.buf.get() };
+    for i in 0..n {
+        dst[i] = buf[(tail + i) & r.mask];
     }
-    fn pop_n(&mut self, n: usize) -> Vec<f32> {
-        let take = n.min(self.buf.len());
-        let mut out: Vec<f32> = self.buf.drain(0..take).collect();
-        out.resize(n, 0.0);
-        out
+    r.tail.store(tail.wrapping_add(n), std::sync::atomic::Ordering::Release);
+    n
+}
+
+type LogFn = Arc<dyn Fn(String) + Send + Sync>;
+static AUDIO_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
+
+/// 设置音频日志回调（UI 用它把状态打到底部日志区）；None 时退回 eprintln。
+pub fn set_log_cb(cb: Option<LogFn>) {
+    *AUDIO_LOG.lock().unwrap_or_else(|e| e.into_inner()) = cb;
+}
+
+fn alog(msg: impl AsRef<str>) {
+    let s = msg.as_ref().to_string();
+    if let Some(cb) = AUDIO_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        cb(s);
+    } else {
+        eprintln!("{}", s);
     }
 }
 
-static RING: Mutex<Option<Ring>> = Mutex::new(None);
-static RENDER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RENDER_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// 渲染回调（实时线程）：拉 n 帧 x 2ch 交错 f32，环空补静音
+// 渲染回调（实时线程）：拉 n 帧 x 2ch 交错 f32，环空补静音（零分配、零加锁）
 extern "C" fn render_cb(
     _in_ref_con: *mut c_void,
     _io_action_flags: *mut AudioUnitRenderingActionFlags,
@@ -203,35 +270,62 @@ extern "C" fn render_cb(
 ) -> i32 {
     let frames = in_number_frames as usize;
     let samples = frames * CHANNELS as usize;
-    let mut out = vec![0.0f32; samples];
-    let mut popped = 0usize;
-    if let Ok(mut g) = RING.lock() {
-        if let Some(r) = g.as_mut() {
-            let before = r.buf.len();
-            out = r.pop_n(samples);
-            popped = before - r.buf.len();
+    if io_data.is_null() {
+        return 0;
+    }
+    unsafe {
+        let abl = &*io_data;
+        CB_NBUFS.compare_exchange(
+            0,
+            abl.m_number_buffers,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ).ok();
+        if abl.m_number_buffers > 0 {
+            CB_DATA_SIZE.compare_exchange(
+                0,
+                abl.m_buffers[0].m_data_byte_size,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ).ok();
         }
-    }
-    RENDER_CALLS.fetch_add(1, Ordering::SeqCst);
-    RENDER_SAMPLES.fetch_add(popped as u64, Ordering::SeqCst);
-    if RENDER_CALLS.load(Ordering::SeqCst) % 1000 == 1 {
-    }
-    if !io_data.is_null() {
-        unsafe {
-            let abl = &*io_data;
-            if abl.m_number_buffers > 0 {
-                let buf = &abl.m_buffers[0];
-                if !buf.m_data.is_null() {
-                    let dst = std::slice::from_raw_parts_mut(buf.m_data as *mut f32, samples);
-                    dst.copy_from_slice(&out);
-                }
+        CB_FRAMES.compare_exchange(
+            0,
+            in_number_frames,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ).ok();
+        if abl.m_number_buffers == 0 || abl.m_buffers[0].m_data.is_null() {
+            return 0;
+        }
+        let cap_bytes = abl.m_buffers[0].m_data_byte_size as usize;
+        let write_samples = samples.min(cap_bytes / 4);
+        let dst = std::slice::from_raw_parts_mut(
+            abl.m_buffers[0].m_data as *mut f32,
+            write_samples,
+        );
+        // 隔离测试：直接生成 440Hz 正弦（绕过环/解码），定位爆音来源
+        if TEST_SINE.load(std::sync::atomic::Ordering::Relaxed) {
+            let step = 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32;
+            let mut ph = *SINE_PHASE.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..write_samples {
+                let v = (ph + i as f32 * step).sin() * 0.5;
+                dst[i] = v;
             }
+            ph = (ph + write_samples as f32 * step) % (2.0 * std::f32::consts::PI);
+            *SINE_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = ph;
+            return 0;
+        }
+        let n = ring_pop(dst);
+        if n < write_samples {
+            dst[n..write_samples].fill(0.0);
+            UNDERRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     0
 }
 
-/// 找名字包含 keyword 的音频设备 ID（VB-Cable 等）。
+// 找名字包含 keyword 的音频设备 ID（VB-Cable 等）。
 fn find_device_id(keyword: &str) -> Option<u32> {
     unsafe {
         let addr = AudioObjectPropertyAddress {
@@ -303,7 +397,7 @@ fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
     let desc = AudioStreamBasicDescription {
         m_sample_rate: SAMPLE_RATE,
         m_format_id: 0x6c70636d, // kAudioFormatLinearPCM 'lpcm'
-        m_format_flags: 0x0c,    // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+        m_format_flags: 0x09,    // kAudioFormatFlagIsFloat(1) | kAudioFormatFlagIsPacked(8)
         m_bytes_per_packet: (CHANNELS * 4) as u32,
         m_frames_per_packet: 1,
         m_bytes_per_frame: (CHANNELS * 4) as u32,
@@ -331,11 +425,15 @@ fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
 /// 返回是否成功启动（无音轨/无 VB-Cable 则 false）。
 pub fn start_audio_push(path: &str) -> bool {
     let path = path.to_string();
-    let Some(dev_id) = find_device_id("VB-Cable") else {
-        eprintln!("音频推流: 未找到 VB-Cable，跳过（可在系统设置安装/打开虚拟声卡）");
+    // 优先 BlackHole（更稳定），其次 VB-Cable / VB-Audio 虚拟声卡
+    let dev_id = ["BlackHole", "VB-Cable", "VB-Audio"]
+        .iter()
+        .find_map(|k| find_device_id(k));
+    let Some(dev_id) = dev_id else {
+        alog("音频推流: 未找到虚拟声卡（BlackHole/VB-Cable），跳过——可 brew install blackhole-2ch");
         return false;
     };
-    eprintln!("音频推流: 使用设备 {} 播放视频音轨", dev_id);
+    alog(format!("音频推流: 使用设备 {} 播放视频音轨", dev_id));
     std::thread::spawn(move || {
         let _ = run_audio(&path, dev_id);
     });
@@ -350,11 +448,16 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
     };
     let tracks = unsafe { asset.tracksWithMediaType(objc2_av_foundation::AVMediaTypeAudio.unwrap()) };
     let Some(track) = tracks.firstObject() else {
-        eprintln!("音频推流: 视频没有音轨，跳过");
+        alog("音频推流: 视频没有音轨，跳过");
         return false;
     };
-    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }
-        .expect("AVAssetReader 创建失败");
+    let reader = match unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) } {
+        Ok(r) => r,
+        Err(_) => {
+            alog("音频推流: AVAssetReader 创建失败");
+            return false;
+        }
+    };
 
     // 简化为用 kAudioFormatLinearPCM 相关键（AVFormatIDKey）避免复杂：
     // 输出设置：48k 立体声 32bit float（交错）
@@ -392,7 +495,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
     let odesc: Retained<NSString> = unsafe { msg_send![&*output, description] };
     unsafe { reader.addOutput(&output); }
     if !unsafe { reader.startReading() } {
-        eprintln!("音频推流: startReading 失败");
+        alog("音频推流: startReading 失败");
         return false;
     }
 
@@ -406,16 +509,37 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
     };
     let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &desc) };
     if comp.is_null() {
-        eprintln!("音频推流: 找不到 HALOutput AudioUnit");
+        alog("音频推流: 找不到 HALOutput AudioUnit");
         return false;
     }
     let mut unit: *mut OpaqueAudioComponentInstance = std::ptr::null_mut();
     if unsafe { AudioComponentInstanceNew(comp, &mut unit) } != 0 || unit.is_null() {
-        eprintln!("音频推流: AudioComponentInstanceNew 失败");
+        alog("音频推流: AudioComponentInstanceNew 失败");
         return false;
     }
+    // 纯输出单元：显式启用 output element 0、禁用 input element 1
+    let enable: u32 = 1;
+    let disable: u32 = 0;
+    unsafe {
+        AudioUnitSetProperty(
+            unit,
+            K_OUTPUT_UNIT_PROP_ENABLE_IO,
+            K_AUDIO_UNIT_SCOPE_OUTPUT, // 2
+            0,
+            &enable as *const u32 as *const c_void,
+            4,
+        );
+        AudioUnitSetProperty(
+            unit,
+            K_OUTPUT_UNIT_PROP_ENABLE_IO,
+            K_AUDIO_UNIT_SCOPE_INPUT,
+            1,
+            &disable as *const u32 as *const c_void,
+            4,
+        );
+    }
     if unsafe { AudioUnitInitialize(unit) } != 0 {
-        eprintln!("音频推流: AudioUnitInitialize 失败");
+        alog("音频推流: AudioUnitInitialize 失败");
         return false;
     }
     // 指定输出设备 = VB-Cable
@@ -430,7 +554,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         )
     } != 0
     {
-        eprintln!("音频推流: 设置 CurrentDevice 失败");
+        alog("音频推流: 设置 CurrentDevice 失败");
         return false;
     }
     if set_stream_format(unit).is_err() {
@@ -457,23 +581,17 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         )
     };
     if rc != 0 {
-        eprintln!("音频推流: SetRenderCallback 失败 rc={}", rc);
+        alog(format!("音频推流: SetRenderCallback 失败 rc={}", rc));
         return false;
     }
-    *RING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ring::new(RING_CAP));
-    if unsafe { AudioOutputUnitStart(unit) } != 0 {
-        eprintln!("音频推流: AudioOutputUnitStart 失败");
-        return false;
+    if std::env::var("VDEV_TEST_SINE").is_ok() {
+        TEST_SINE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-
-    // 3) 解码循环：推入环缓冲（环满则等 = 自然按实时节奏）
-    eprintln!("音频推流: 开始");
+    // 3) 解码循环：推入环缓冲；预填充 ~100ms 后启动 AudioUnit（防启动爆音）
+    alog("音频推流: 开始");
     let mut pushed = 0usize;
-    let mut first = true;
+    let mut unit_started = false;
     loop {
-        if first {
-            first = false;
-        }
         if crate::VIDEO_STOP.load(Ordering::SeqCst) {
             break;
         }
@@ -525,33 +643,49 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             let src = unsafe {
                 std::slice::from_raw_parts((*abl).m_buffers[0].m_data as *const f32, n)
             };
-            if let Ok(mut g) = RING.lock() {
-                if let Some(r) = g.as_mut() {
-                    r.push(src);
+            // 先等有足够空间再整块推入（不丢样本，避免爆音）
+            while ring_free() < src.len() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let written = ring_push(src);
+            pushed += written;
+            if std::env::var("VDEV_AUDIO_DUMP").is_ok() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                    .open("/tmp/vdev-decoded.pcm")
+                {
+                    let bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = f.write_all(&bytes);
                 }
             }
-            pushed += n;
         }
         unsafe {
             CFRelease(sample as *const c_void);
         }
-        // 环满背压：等待渲染回调消费，按实时节奏播放（不丢开头）
-        loop {
-            let len = RING
-                .lock()
-                .map(|g| g.as_ref().map(|r| r.buf.len()).unwrap_or(0))
-                .unwrap_or(0);
-            if len < RING_CAP {
+        // 预填充 ~100ms 后启动 AudioUnit
+        if !unit_started && ring_used() >= 9600 {
+            if unsafe { AudioOutputUnitStart(unit) } != 0 {
+                alog("音频推流: AudioOutputUnitStart 失败");
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            unit_started = true;
+            alog("音频推流: AudioUnit 已启动");
         }
     }
+    if unit_started {
+        unsafe { AudioOutputUnitStop(unit); }
+    }
     unsafe {
-        AudioOutputUnitStop(unit);
         AudioUnitUninitialize(unit);
         AudioComponentInstanceDispose(unit);
     }
-    eprintln!("音频推流: 结束，共推 {} samples", pushed);
+    let ur = UNDERRUNS.load(std::sync::atomic::Ordering::Relaxed);
+    let nb = CB_NBUFS.load(std::sync::atomic::Ordering::Relaxed);
+    let ds = CB_DATA_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    let fr = CB_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    alog(format!(
+        "音频推流: 结束，共推 {} samples，欠载 {}，回调 nbufs={} dataSize={} frames={}（期望 frames*8={}）",
+        pushed, ur, nb, ds, fr, fr * 8
+    ));
     true
 }
