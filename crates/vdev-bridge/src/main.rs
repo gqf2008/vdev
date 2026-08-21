@@ -47,13 +47,9 @@ fn main() -> Result<(), String> {
 
     // 2. 摄像头推流客户端
     let mut frame_client = match frame::connect() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("警告：连接虚拟摄像头失败（{e}），仅解码不推流");
-            return Err(e.to_string());
-        }
+        Ok(f) => { println!("已连接虚拟摄像头 FrameChannel"); Some(f) }
+        Err(e) => { eprintln!("警告：{e}，仅解码不推流"); None }
     };
-    println!("已连接虚拟摄像头 FrameChannel");
 
     // 3. 滤镜参数
     let filter = filter_params_from_env();
@@ -72,6 +68,7 @@ fn main() -> Result<(), String> {
     let mut opus_decoder = audio_sink.as_ref().and_then(|_| aerodesk_codec::audio::OpusDecoder::new().ok());
 
     let mut frames = 0u64;
+    let mut audio_frames = 0u64;
     let mut buf = [0u8; 2048];
     println!("收流中… Ctrl-C 退出");
     loop {
@@ -110,6 +107,10 @@ fn main() -> Result<(), String> {
                     if let (Some(sink), Some(dec)) = (&mut audio_sink, &mut opus_decoder) {
                         if let Ok(Some(pcm)) = dec.decode(&data.data) {
                             sink.push_mono_i16(&pcm);
+                            audio_frames += 1;
+                            if audio_frames % 100 == 0 {
+                                println!("音频帧 {}（samples={}）", audio_frames, pcm.len());
+                            }
                         }
                     }
                     continue;
@@ -157,7 +158,9 @@ fn main() -> Result<(), String> {
                 vdev_filter::process_frame(&mut bgra, out_w, out_h, &filter);
 
                 // 推摄像头
-                let _ = frame_client.send_frame(&bgra, out_w, out_h, out_w * 4, host_time_ns());
+                if let Some(fc) = &mut frame_client {
+                    let _ = fc.send_frame(&bgra, out_w, out_h, out_w * 4, host_time_ns());
+                }
                 frames += 1;
                 if frames % 60 == 0 {
                     println!("已推 {frames} 帧（{}x{}）", out_w, out_h);
