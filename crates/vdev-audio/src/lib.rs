@@ -4,6 +4,7 @@
 
 use std::ffi::c_void;
 
+mod dsp;
 mod vtable;
 use vtable::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +41,12 @@ const RING_FRAMES: usize = 65536;
 const CHANNELS: usize = 2;
 #[allow(static_mut_refs)]
 static mut RING_BUF: [f32; RING_FRAMES * CHANNELS] = [0.0; RING_FRAMES * CHANNELS];
+
+// DSP 管线（EQ + 增益 + 软限幅），参数由自定义属性 'vdsp' 控制
+static DSP: std::sync::OnceLock<Mutex<dsp::Dsp>> = std::sync::OnceLock::new();
+pub(crate) fn dsp() -> &'static Mutex<dsp::Dsp> {
+    DSP.get_or_init(|| Mutex::new(dsp::Dsp::default()))
+}
 // 上次输出写入的“结束 sample time”（f64 位模式）+ 缓冲是否干净
 static RING_LAST_OUTPUT_BITS: AtomicU64 = AtomicU64::new(0);
 static RING_IS_CLEAR: AtomicBool = AtomicBool::new(true);
@@ -339,6 +346,10 @@ unsafe extern "C" fn plugin_do_io_operation(
     };
     match op {
         K_OP_WRITE_OUTPUT => {
+            // DSP：EQ + 增益 + 软限幅（实时处理，再写入环）
+            if let Ok(mut d) = dsp().lock() {
+                d.process(data);
+            }
             if sample_time >= 0.0 {
                 ring_write_out(data, sample_time, frames);
             } else {

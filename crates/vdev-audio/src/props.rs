@@ -83,6 +83,7 @@ const SEL_VMAX: u32 = 0x766d6178; // kAudioVolumeControlPropertyMaximumScalarVal
 const SEL_MUTE: u32 = 0x6d757465; // kAudioMuteControlPropertyValue 'mute'
 const SEL_LCDV: u32 = 0x6c636476; // kAudioLevelControlPropertyDecibelValue 'lcdv'
 const SEL_LCDR: u32 = 0x6c636472; // kAudioLevelControlPropertyDecibelRange 'lcdr'
+const SEL_VDSP: u32 = 0x76647370; // 自定义 DSP 参数 'vdsp'：4×f32（gain/low/mid/high dB）
 
 const SCOPE_GLOBAL: u32 = 0x676c6f62; // 'glob'
 const SCOPE_INPUT: u32 = 0x696e7074; // 'inpt'
@@ -190,7 +191,7 @@ unsafe extern "C" fn plugin_has_property(
     let ok = match obj {
         OBJ_PLUGIN => matches!(sel, SEL_PMFR | SEL_PNAM | SEL_PVER | SEL_PBOX | SEL_PDEV | SEL_UIDB | SEL_UIDD | SEL_RSRC | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
         OBJ_BOX => matches!(sel, SEL_BUID | SEL_BTRN | SEL_BHAU | SEL_BHVI | SEL_BHMI | SEL_BPRO | SEL_BXON | SEL_BXOF | SEL_BDV | SEL_BNAM | SEL_BMFR | SEL_BMOD | SEL_BSNO | SEL_BFMW | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_IDEN | SEL_SNUM | SEL_FWVN),
-        OBJ_DEVICE => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND),
+        OBJ_DEVICE => matches!(sel, SEL_UID | SEL_MUID | SEL_TRAN | SEL_GROU | SEL_CLKD | SEL_LIVN | SEL_GOIN | SEL_GONE | SEL_DFLT | SEL_SFLT | SEL_LTNC | SEL_STM | SEL_CTRL | SEL_SAFT | SEL_NSRT | SEL_NSR | SEL_HIDN | SEL_FSIZ | SEL_FSZ | SEL_VFSZ | SEL_DCH2 | SEL_LNAM | SEL_LMOD | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_RING | SEL_CSTB | SEL_CLOK | SEL_ICON | SEL_SRND | SEL_VDSP),
         OBJ_STREAM_OUTPUT | OBJ_STREAM_INPUT => matches!(sel, SEL_SACT | SEL_SDIR | SEL_TERM | SEL_SCHN | SEL_LTNC | SEL_SFMT | SEL_PFT | SEL_SFMA | SEL_PFTA | SEL_LNAM | SEL_LMAK | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND),
         OBJ_VOLUME => matches!(sel, SEL_STBL | SEL_VLSC | SEL_VMIN | SEL_VMAX | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM | SEL_LCDV | SEL_LCDR),
         OBJ_MUTE => matches!(sel, SEL_STBL | SEL_MUTE | SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_OWND | SEL_CSCP | SEL_CELM),
@@ -213,7 +214,7 @@ unsafe extern "C" fn plugin_is_property_settable(
     if addr.is_null() || out.is_null() { return BAD_SEL; }
     let sel = unsafe { (*addr).m_selector };
     let settable = match obj {
-        OBJ_DEVICE => matches!(sel, SEL_NSRT | SEL_FSIZ),
+        OBJ_DEVICE => matches!(sel, SEL_NSRT | SEL_FSIZ | SEL_VDSP),
         OBJ_VOLUME => sel == SEL_VLSC,
         OBJ_MUTE => sel == SEL_MUTE,
         _ => false,
@@ -255,6 +256,7 @@ unsafe extern "C" fn plugin_get_property_data_size(
         },
         OBJ_DEVICE => match sel {
             SEL_CLAS | SEL_BCLS | SEL_OWNE | SEL_RING | SEL_CSTB | SEL_CLOK => 4,
+            SEL_VDSP => 4 * std::mem::size_of::<f32>() as u32,
             SEL_SRND => 12, // AudioChannelLayout（tag+bitmap+count，无描述）
             SEL_ICON => std::mem::size_of::<*mut c_void>() as u32,
             SEL_OWND => 4 * std::mem::size_of::<AudioObjectID>() as u32,
@@ -361,6 +363,12 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_CLAS => write_out(out, data_size, out_size, CLASS_DEVICE),
             SEL_BCLS => write_out(out, data_size, out_size, CLASS_OBJECT),
             SEL_OWNE => write_out(out, data_size, out_size, OBJ_PLUGIN),
+            SEL_VDSP => {
+                let p = dsp().lock().unwrap_or_else(|e| e.into_inner()).params();
+                write_bytes_partial(out, data_size, out_size, unsafe {
+                    std::slice::from_raw_parts(p.as_ptr() as *const u8, std::mem::size_of::<[f32; 4]>())
+                })
+            }
             SEL_RING => write_out(out, data_size, out_size, 16384u32),
             SEL_CSTB => write_out(out, data_size, out_size, 1u32),
             SEL_CLOK => write_out(out, data_size, out_size, CLOCK_ALGO_RAW),
@@ -513,6 +521,12 @@ unsafe extern "C" fn plugin_set_property_data(
             NO_ERR
         }
         OBJ_DEVICE if sel == SEL_FSIZ => NO_ERR, // 接受任意 buffer size
+        OBJ_DEVICE if sel == SEL_VDSP => {
+            let p = unsafe { std::slice::from_raw_parts(data as *const f32, 4) };
+            let rate = SAMPLE_RATE.load(Ordering::SeqCst) as f32;
+            dsp().lock().unwrap_or_else(|e| e.into_inner()).set_params(p[0], p[1], p[2], p[3], rate);
+            NO_ERR
+        }
         OBJ_VOLUME if sel == SEL_VLSC => NO_ERR,
         OBJ_MUTE if sel == SEL_MUTE => NO_ERR,
         _ => BAD_PROP,
