@@ -8,3 +8,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+
+[[bin]]
+name = "vdev-audio-ctl"
+path = "src/bin/vdev-audio-ctl.rs"
