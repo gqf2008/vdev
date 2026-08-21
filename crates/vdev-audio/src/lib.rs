@@ -38,7 +38,7 @@ static IO_CLIENTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 // ring 容量 65536 帧 × 2ch；输出（WriteMix）写入 mOutputTime 对应位置，
 // 输入（ReadInput）读取 mInputTime 对应位置；输出未跟上时输出静音并清空。
 const RING_FRAMES: usize = 65536;
-const CHANNELS: usize = 2;
+const CHANNELS: usize = 8;
 #[allow(static_mut_refs)]
 static mut RING_BUF: [f32; RING_FRAMES * CHANNELS] = [0.0; RING_FRAMES * CHANNELS];
 
@@ -331,7 +331,7 @@ unsafe extern "C" fn plugin_do_io_operation(
     _sec_buf: *mut c_void,
 ) -> OSStatus {
     if main_buf.is_null() { return 0; }
-    let n = frames as usize * CHANNELS; // 立体声交错
+    let n = frames as usize * CHANNELS; // 多声道交错
     let data = std::slice::from_raw_parts_mut(main_buf as *mut f32, n);
     // BlackHole 同款：用 IO cycle 的 sample time 定位 ring（不是 FIFO）
     let sample_time = if _cycle.is_null() {

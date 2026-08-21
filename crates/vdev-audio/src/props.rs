@@ -107,7 +107,7 @@ const CLASS_VOLUME: u32 = 0x766c6d65; // kAudioVolumeControlClassID 'vlme'
 const CLASS_MUTE: u32 = 0x6d757465;   // kAudioMuteControlClassID 'mute'
 
 const CLOCK_ALGO_RAW: u32 = 0x72617777; // kAudioDeviceClockAlgorithmRaw 'raww'
-const LAYOUT_STEREO: u32 = 0x65000002;   // kAudioChannelLayoutTag_Stereo
+const LAYOUT_71: u32 = 0x00800008; // kAudioChannelLayoutTag_MPEG_7_1_C（L R C LFE Ls Rs Rls Rrs）
 
 const TERM_SPEAKER: u32 = 0x73706b72; // 'spkr'
 const TERM_MIC: u32 = 0x6d696372; // 'micr'
@@ -141,10 +141,10 @@ fn asbd(rate: f64) -> AudioStreamBasicDescription {
         m_sample_rate: rate,
         m_format_id: 0x6c70636d, // 'lpcm'
         m_format_flags: 0x09,    // IsFloat | IsPacked
-        m_bytes_per_packet: 8,
+        m_bytes_per_packet: 32,
         m_frames_per_packet: 1,
-        m_bytes_per_frame: 8,
-        m_channels_per_frame: 2,
+        m_bytes_per_frame: 32,
+        m_channels_per_frame: 8,
         m_bits_per_channel: 32,
         m_reserved: 0,
     }
@@ -395,7 +395,7 @@ unsafe extern "C" fn plugin_get_property_data(
             SEL_CLOK => write_out(out, data_size, out_size, CLOCK_ALGO_RAW),
             SEL_SRND => {
                 // AudioChannelLayout：stereo tag，无 channel descriptions
-                let layout: [u32; 3] = [LAYOUT_STEREO, 0, 0];
+                let layout: [u32; 3] = [LAYOUT_71, 0, 0];
                 write_bytes_partial(out, data_size, out_size, unsafe {
                     std::slice::from_raw_parts(layout.as_ptr() as *const u8, 12)
                 })
