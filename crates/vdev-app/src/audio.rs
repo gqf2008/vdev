@@ -1,5 +1,5 @@
-//! 视频音频推流：AVAssetReader 解音轨 → CoreAudio AudioUnit 输出到 VB-Cable（虚拟声卡）。
-//! 之后 QuickTime/Zoom 等把「麦克风」选成 VB-Cable 即可听到视频原声。
+//! 视频音频推流：AVAssetReader 解音轨 → CoreAudio AudioUnit 输出到 vdev-audio（自研虚拟声卡）。
+//! 之后 QuickTime/Zoom 等把「麦克风」选成 vdev-audio 即可听到视频原声。
 //! 全 Rust FFI（AudioToolbox / AudioUnit / AVFoundation）。
 
 use anyhow::{anyhow, Result};
@@ -325,7 +325,7 @@ extern "C" fn render_cb(
     0
 }
 
-// 找名字包含 keyword 的音频设备 ID（VB-Cable 等）。
+// 找名字包含 keyword 的音频设备 ID（vdev-audio / BlackHole 等）。
 fn find_device_id(keyword: &str) -> Option<u32> {
     unsafe {
         let addr = AudioObjectPropertyAddress {
@@ -421,16 +421,16 @@ fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
     Ok(())
 }
 
-/// 启动视频音频推流：解音轨 → VB-Cable（后台线程，随 crate::VIDEO_STOP 停止）。
-/// 返回是否成功启动（无音轨/无 VB-Cable 则 false）。
+/// 启动视频音频推流：解音轨 → vdev-audio（后台线程，随 crate::VIDEO_STOP 停止）。
+/// 返回是否成功启动（无音轨/无虚拟声卡则 false）。
 pub fn start_audio_push(path: &str) -> bool {
     let path = path.to_string();
-    // 优先 BlackHole（更稳定），其次 VB-Cable / VB-Audio 虚拟声卡
-    let dev_id = ["BlackHole", "VB-Cable", "VB-Audio"]
+    // 优先自研 vdev-audio，其次 BlackHole / VB-Cable 兜底
+    let dev_id = ["vdev-audio", "BlackHole", "VB-Cable", "VB-Audio"]
         .iter()
         .find_map(|k| find_device_id(k));
     let Some(dev_id) = dev_id else {
-        alog("音频推流: 未找到虚拟声卡（BlackHole/VB-Cable），跳过——可 brew install blackhole-2ch");
+        alog("音频推流: 未找到虚拟声卡（vdev-audio/BlackHole），跳过——请先安装 vdev-audio 驱动");
         return false;
     };
     alog(format!("音频推流: 使用设备 {} 播放视频音轨", dev_id));
@@ -499,7 +499,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         return false;
     }
 
-    // 2) AudioUnit HALOutput → VB-Cable
+    // 2) AudioUnit HALOutput → vdev-audio
     let desc = AudioComponentDescription {
         component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
         component_sub_type: K_AUDIO_UNIT_SUBTYPE_HAL,
@@ -542,7 +542,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         alog("音频推流: AudioUnitInitialize 失败");
         return false;
     }
-    // 指定输出设备 = VB-Cable
+    // 指定输出设备 = vdev-audio
     if unsafe {
         AudioUnitSetProperty(
             unit,

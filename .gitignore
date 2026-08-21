@@ -7,3 +7,4 @@ crates/vdev-camera/VDCamera.xcodeproj
 crates/vdev-camera/build/
 crates/vdev-camera-ext/spike/build/
 crates/vdev-camera-ext/spike/VDCameraSpike.xcodeproj/
+crates/vdev-audio/build/

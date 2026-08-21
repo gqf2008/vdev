@@ -7,6 +7,7 @@
 | 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
 | 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension 100% Rust**（手写 objc2 绑定，零 Swift） | ✅ 可用（QuickTime 可见 Rust 彩条 / 真实推流） |
 | 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
+| 虚拟声卡 | CoreAudio HAL `AudioServerPlugIn`，**100% Rust**（输出环回输入，自研 BlackHole） | ✅ 可用（音频推流走 vdev-audio，无爆音） |
 
 ## 为什么不用 kext / DriverKit
 
@@ -24,6 +25,7 @@ crates/
   vdev-hid/     虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动
   vdev-camera/  虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
   vdev-screen/  虚拟屏幕：CGVirtualDisplay 私有 API 封装
+  vdev-audio/   虚拟声卡：CoreAudio HAL AudioServerPlugIn（输出环回输入，自研 BlackHole）
   vdev-host/    宿主进程 / 统一命令行入口（二进制名 vdev）
 docs/RESEARCH.md  三条技术路线的调研笔记与参考项目
 ```
@@ -153,6 +155,32 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
 历史遗留已清理：旧 DAL 插件（`dal/`）、旧 Swift 宿主（`host/`）、旧 Swift 扩展壳
 （`crates/vdev-camera/extension/`）均已删除/替换；现在宿主与扩展 **100% Rust**，
 构建只走 `cargo build` + 手工组装签名（无 xcodebuild）。
+
+## 虚拟声卡 vdev-audio（✅ 已可用）
+
+100% Rust 的 CoreAudio HAL 驱动：**一个虚拟设备 = 输出流 + 输入流，输出环回输入**
+（同 BlackHole/Soundflower）。App 把视频音轨推到 vdev-audio 输出，会议/录制软件把
+「麦克风」选成 vdev-audio 就能收到，**无 VB-Cable/BlackHole 的周期爆音**。
+
+```bash
+cd crates/vdev-audio
+make install      # cargo 编 bundle(MH_BUNDLE) + Developer ID 签名 + 装 /Library/Audio/Plug-Ins/HAL + 重启 coreaudiod
+make uninstall    # 卸载
+make test         # 环回自测：播放 440Hz → 输出流，同时从输入流录制 3s，非静音 > 20% 即 PASS
+```
+
+- 使用：任意 App 的音频设备里选择 **vdev-audio**（输出=播放端，输入=麦克风端）。
+- App 音频推流已自动优先 vdev-audio（找不到再回退 BlackHole/VB-Cable）。
+- 驱动技术点（macOS 26 踩坑，见 `docs/RESEARCH.md`）：
+  - 产物必须是 **MH_BUNDLE**（`-Wl,-bundle`），cargo cdylib 默认 MH_DYLIB 会被 coreaudiod 跳过；
+  - 必须 **Developer ID 签名**（adhoc 也被跳过）；
+  - `AudioServerPlugInDriverRef` = `&interface_ptr`（工厂返回指针的指针），且 `QueryInterface`
+    的 `REFIID` 是 **CFUUIDBytes 按值传 x1:x2**（不是指针）；
+  - `GetZeroTimeStamp` 的 host time 必须用 `mach_absolute_time()`（ticks），sample time 用
+    timebase 换算——用纳秒会让 coreaudiod 认为时钟异常、IO 只跑几个周期就停；
+  - 输出 IO 操作是 `kAudioServerPlugInIOOperationWriteMix`（`'rite'`），不是 `'writ'`；
+  - 数组属性（`pfta`/`sfma`/`nsr#`/`ctrl`/`ownd`）在 inDataSize 不足时要**截断返回**而非报错；
+  - 必须实现 `bcls`/`clas`/`owne`/`ownd`/`lnam`/`lmod`/`lmak`/`ring`/`cstb`/`clkd` 等属性。
 
 ## 权限说明
 
