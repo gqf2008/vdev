@@ -6,6 +6,9 @@ export global AppState {
     in-out property <string> status_glyph: "○";
     in-out property <string> status_title: "虚拟摄像头未安装";
     in-out property <string> status_detail: "点击「安装虚拟摄像头」，然后在系统提示中允许扩展。";
+    in-out property <string> audio_glyph: "○";
+    in-out property <string> audio_title: "虚拟声卡未检测";
+    in-out property <string> audio_detail: "未检测到 vdev-audio。在 crates/vdev-audio 下执行 make install 安装。";
     in-out property <bool> can_install: true;
     in-out property <bool> can_uninstall: false;
     in-out property <bool> can_push: false;
@@ -63,6 +66,13 @@ export component MainWindow inherits Window {
                     PixelText { text: AppState.status_title; font-weight: 700; }
                 }
                 PixelText { text: AppState.status_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                Rectangle { height: 1px; background: PixelTheme.dim; opacity: 0.25; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    PixelText { text: AppState.audio_glyph; font-size: 18px; }
+                    PixelText { text: AppState.audio_title; font-weight: 700; }
+                }
+                PixelText { text: AppState.audio_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
             }
         }
 

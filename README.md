@@ -170,7 +170,9 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
 ```
 
 - 使用：任意 App 的音频设备里选择 **vdev-audio**（输出=播放端，输入=麦克风端）。
-- App 音频推流已自动优先 vdev-audio（找不到再回退 BlackHole/VB-Cable）。
+- App 音频推流已自动优先 vdev-audio（找不到再回退 BlackHole/VB-Cable）；
+  App 状态面板会检测并显示虚拟声卡状态（刷新状态 / 启动时自动检测，
+  CLI 验证：`/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-audio`）。
 - 驱动技术点（macOS 26 踩坑，见 `docs/RESEARCH.md`）：
   - 产物必须是 **MH_BUNDLE**（`-Wl,-bundle`），cargo cdylib 默认 MH_DYLIB 会被 coreaudiod 跳过；
   - 必须 **Developer ID 签名**（adhoc 也被跳过）；
