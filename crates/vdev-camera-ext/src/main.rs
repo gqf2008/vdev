@@ -2,6 +2,7 @@
 //! 手写 CMIOExtension ObjC 绑定（cmio.rs），帧管线用 CoreVideo/CoreMedia C FFI。
 
 mod cmio;
+mod frame_channel;
 
 use cmio::{
     property_set, CMIOExtensionDeviceSource, CMIOExtensionProviderSource,
@@ -215,7 +216,6 @@ define_class!(
 
         #[unsafe(method_id(availableProperties))]
         unsafe fn availableProperties(&self) -> Retained<NSSet<NSObject>> {
-            elog("provider: availableProperties");
             property_set(&[
                 "CMIOExtensionPropertyProviderName",
                 "CMIOExtensionPropertyProviderManufacturer",
@@ -228,12 +228,11 @@ define_class!(
             _properties: &NSSet<NSObject>,
             _out_error: *mut *mut NSObject,
         ) -> Option<Retained<NSObject>> {
-            elog("provider: providerPropertiesForProperties");
             let cls = class("CMIOExtensionProviderProperties");
             let empty: Retained<NSDictionary<NSObject, NSObject>> =
                 NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, providerPropertiesWithDictionary: &*empty];
-            let _: () = msg_send![&*p, setName: &*NSString::from_str("vdev-camera-rust")];
+            let _: () = msg_send![&*p, setName: &*NSString::from_str("vdev-camera")];
             let _: () = msg_send![&*p, setManufacturer: &*NSString::from_str("vdev")];
             Some(unsafe { Retained::retain(p).unwrap() })
         }
@@ -261,7 +260,6 @@ define_class!(
     unsafe impl CMIOExtensionDeviceSource for DeviceSource {
         #[unsafe(method_id(availableProperties))]
         unsafe fn availableProperties(&self) -> Retained<NSSet<NSObject>> {
-            elog("device: availableProperties");
             property_set(&[
                 "CMIOExtensionPropertyDeviceTransportType",
                 "CMIOExtensionPropertyDeviceModel",
@@ -274,12 +272,11 @@ define_class!(
             _properties: &NSSet<NSObject>,
             _out_error: *mut *mut NSObject,
         ) -> Option<Retained<NSObject>> {
-            elog("device: devicePropertiesForProperties");
             let cls = class("CMIOExtensionDeviceProperties");
             let empty: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, devicePropertiesWithDictionary: &*empty];
             let _: () = msg_send![&*p, setTransportType: &*NSNumber::numberWithUnsignedInt(0x7674726e)];
-            let _: () = msg_send![&*p, setModel: &*NSString::from_str("vdev-camera-rust")];
+            let _: () = msg_send![&*p, setModel: &*NSString::from_str("vdev-camera")];
             Some(unsafe { Retained::retain(p).unwrap() })
         }
 
@@ -306,7 +303,6 @@ define_class!(
     unsafe impl CMIOExtensionStreamSource for StreamSource {
         #[unsafe(method_id(formats))]
         unsafe fn formats(&self) -> Retained<NSArray<NSObject>> {
-            elog("stream: formats");
             let fmt = STREAM_FORMAT.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
             let obj = unsafe { Retained::retain(fmt).unwrap() };
             NSArray::from_retained_slice(&[obj])
@@ -314,7 +310,6 @@ define_class!(
 
         #[unsafe(method_id(availableProperties))]
         unsafe fn availableProperties(&self) -> Retained<NSSet<NSObject>> {
-            elog("stream: availableProperties");
             property_set(&[
                 "CMIOExtensionPropertyStreamActiveFormatIndex",
                 "CMIOExtensionPropertyStreamFrameDuration",
@@ -327,7 +322,6 @@ define_class!(
             _properties: &NSSet<NSObject>,
             _out_error: *mut *mut NSObject,
         ) -> Option<Retained<NSObject>> {
-            elog("stream: streamPropertiesForProperties");
             let cls = class("CMIOExtensionStreamProperties");
             let empty: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, streamPropertiesWithDictionary: &*empty];
@@ -349,7 +343,6 @@ define_class!(
 
         #[unsafe(method(authorizedToStartStreamForClient:))]
         unsafe fn authorizedToStartStreamForClient(&self, _client: &NSObject) -> bool {
-            elog("stream: authorizedToStartStream");
             true
         }
 
@@ -370,91 +363,144 @@ define_class!(
 );
 
 // ---------------- 帧循环 ----------------
-fn frame_loop() {
-    let fmt = FORMAT_DESC.lock().unwrap_or_else(|e| e.into_inner()).unwrap();
-    loop {
-        if RUNNING.load(Ordering::SeqCst) {
-            let stream = STREAM.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
-            unsafe {
-                // 带 IOSurface 属性，否则 sendSampleBuffer 可能不被消费
-                let iosurf_key = NSString::from_str("IOSurfaceProperties");
-                let empty_dict: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
-                let attrs: Retained<NSDictionary<NSObject, NSObject>> = unsafe {
-                    msg_send![
-                        <NSDictionary<NSObject, NSObject>>::class(),
-                        dictionaryWithObject: &*empty_dict,
-                        forKey: &*iosurf_key
-                    ]
-                };
-                let mut pb = CVPixelBuffer(ptr::null_mut());
-                let st = CVPixelBufferCreate(
-                    ptr::null(),
-                    WIDTH as usize,
-                    HEIGHT as usize,
-                    BGR_A,
-                    &*attrs as *const _ as *const c_void,
-                    &mut pb,
-                );
-                if st == 0 && !pb.0.is_null() {
-                    CVPixelBufferLockBaseAddress(pb, 0);
-                    let base = CVPixelBufferGetBaseAddress(pb);
-                    let stride = CVPixelBufferGetBytesPerRow(pb);
-                    let t = CFAbsoluteTimeGetCurrent();
-                    if !base.is_null() {
-                        vdev_camera::cabi::vdev_camera_render_bgra32(
-                            0,
-                            WIDTH as u32,
-                            HEIGHT as u32,
-                            t,
-                            base as *mut u8,
-                            stride * HEIGHT as usize,
-                        );
-                    }
-                    CVPixelBufferUnlockBaseAddress(pb, 0);
-
-                    let mut timing = CMSampleTimingInfo {
-                        duration: cmtime(1, FPS as i32),
-                        presentation_time_stamp: CMClockGetTime(CMClockGetHostTimeClock()),
-                        decode_time_stamp: CMTime {
-                            value: -1,
-                            timescale: 1,
-                            flags: objc2_core_media::CMTimeFlags::empty(),
-                            epoch: 0,
-                        },
-                    };
-                    let mut sb = CMSampleBuffer(ptr::null_mut());
-                    let ss = CMSampleBufferCreateForImageBuffer(
-                        ptr::null(),
-                        pb,
-                        true,
-                        ptr::null(),
-                        ptr::null(),
-                        fmt,
-                        &mut timing,
-                        &mut sb,
-                    );
-                    if ss == 0 && !sb.0.is_null() {
-                        let ns = CMClockGetTime(CMClockGetHostTimeClock());
-                        let _: () = msg_send![
-                            &*stream,
-                            sendSampleBuffer: sb.0,
-                            discontinuity: 0u64,
-                            hostTimeInNanoseconds: (ns.value as f64 / ns.timescale as f64 * 1e9) as u64
-                        ];
-                        SENT.fetch_add(1, Ordering::SeqCst);
-                        let n = SENT.load(Ordering::SeqCst);
-                        if n % 30 == 0 || n == 1 {
-                            elog(format!("sendSampleBuffer #{}", n));
-                        }
-                        CFRelease(sb.0 as *const c_void);
-                    } else {
-                        elog(format!("CMSampleBufferCreateForImageBuffer 失败 st={}", ss));
-                    }
-                    CFRelease(pb.0 as *const c_void);
+/// 把一帧 BGRA 数据包成 CMSampleBuffer 发给流。
+fn send_bgra(
+    stream: *mut NSObject,
+    fmt: CMFormatDescription,
+    data: &[u8],
+    w: u32,
+    h: u32,
+    stride: u32,
+    pts_ns: u64,
+) {
+    unsafe {
+        let iosurf_key = NSString::from_str("IOSurfaceProperties");
+        let empty_dict: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
+        let attrs: Retained<NSDictionary<NSObject, NSObject>> = unsafe {
+            msg_send![
+                <NSDictionary<NSObject, NSObject>>::class(),
+                dictionaryWithObject: &*empty_dict,
+                forKey: &*iosurf_key
+            ]
+        };
+        let mut pb = CVPixelBuffer(ptr::null_mut());
+        let st = CVPixelBufferCreate(
+            ptr::null(),
+            w as usize,
+            h as usize,
+            BGR_A,
+            &*attrs as *const _ as *const c_void,
+            &mut pb,
+        );
+        if st != 0 || pb.0.is_null() {
+            elog(format!("CVPixelBufferCreate 失败 st={} {}x{}", st, w, h));
+            return;
+        }
+        CVPixelBufferLockBaseAddress(pb, 0);
+        let base = CVPixelBufferGetBaseAddress(pb);
+        let dst_stride = CVPixelBufferGetBytesPerRow(pb);
+        if !base.is_null() && data.len() >= (stride as usize) * (h as usize) {
+            let dst = std::slice::from_raw_parts_mut(base as *mut u8, dst_stride * h as usize);
+            if stride as usize == dst_stride {
+                dst[..data.len()].copy_from_slice(&data[..(stride as usize) * (h as usize)]);
+            } else {
+                for row in 0..h as usize {
+                    let src = &data[row * stride as usize..(row + 1) * stride as usize];
+                    dst[row * dst_stride..row * dst_stride + src.len()].copy_from_slice(src);
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_micros(16_666 / 2)); // ~120Hz 轮询，出帧 60fps
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+
+        let mut timing = CMSampleTimingInfo {
+            duration: cmtime(1, FPS as i32),
+            presentation_time_stamp: CMTime {
+                value: pts_ns as i64,
+                timescale: 1_000_000_000,
+                flags: objc2_core_media::CMTimeFlags::Valid,
+                epoch: 0,
+            },
+            decode_time_stamp: CMTime {
+                value: -1,
+                timescale: 1,
+                flags: objc2_core_media::CMTimeFlags::empty(),
+                epoch: 0,
+            },
+        };
+        let mut sb = CMSampleBuffer(ptr::null_mut());
+        let ss = CMSampleBufferCreateForImageBuffer(
+            ptr::null(),
+            pb,
+            true,
+            ptr::null(),
+            ptr::null(),
+            fmt,
+            &mut timing,
+            &mut sb,
+        );
+        if ss == 0 && !sb.0.is_null() {
+            let _: () = msg_send![
+                &*stream,
+                sendSampleBuffer: sb.0,
+                discontinuity: 0u64,
+                hostTimeInNanoseconds: pts_ns
+            ];
+            SENT.fetch_add(1, Ordering::SeqCst);
+            let n = SENT.load(Ordering::SeqCst);
+            if n % 300 == 0 || n == 1 {
+                elog(format!("sendSampleBuffer #{}", n));
+            }
+            CFRelease(sb.0 as *const c_void);
+        } else {
+            elog(format!("CMSampleBufferCreateForImageBuffer 失败 st={}", ss));
+        }
+        CFRelease(pb.0 as *const c_void);
+    }
+}
+
+fn frame_loop() {
+    let fmt = FORMAT_DESC.lock().unwrap_or_else(|e| e.into_inner()).unwrap();
+    let mut last_sent: std::time::Instant = std::time::Instant::now();
+    loop {
+        if RUNNING.load(Ordering::SeqCst) {
+            let stream = STREAM.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
+            // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
+            let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
+            if let Some((data, w, h, stride, pts)) = injected {
+                send_bgra(stream, fmt, &data, w, h, stride, pts);
+            } else {
+                // 彩条：1920x1080 BGRA
+                let mut buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
+                let rc = vdev_camera::cabi::vdev_camera_render_bgra32(
+                    0,
+                    WIDTH as u32,
+                    HEIGHT as u32,
+                    unsafe { CFAbsoluteTimeGetCurrent() },
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                if rc == 0 {
+                    let pts = host_now_ns();
+                    send_bgra(stream, fmt, &buf, WIDTH as u32, HEIGHT as u32, WIDTH as u32 * 4, pts);
+                }
+            }
+            last_sent = std::time::Instant::now();
+        }
+        // 60fps 节拍
+        let elapsed = last_sent.elapsed();
+        let target = std::time::Duration::from_micros(16_666);
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+    }
+}
+
+fn host_now_ns() -> u64 {
+    unsafe {
+        let t = CMClockGetTime(CMClockGetHostTimeClock());
+        (t.value as f64 / t.timescale as f64 * 1e9) as u64
     }
 }
 
@@ -512,7 +558,7 @@ fn main() {
     let stream: *mut NSObject = unsafe {
         msg_send![
             stream_cls,
-            streamWithLocalizedName: &*NSString::from_str("vdev-camera-rust"),
+            streamWithLocalizedName: &*NSString::from_str("vdev-camera"),
             streamID: &*stream_id,
             direction: 0i64,
             clockType: 0i64,
@@ -528,7 +574,7 @@ fn main() {
     let device: *mut NSObject = unsafe {
         msg_send![
             dev_cls,
-            deviceWithLocalizedName: &*NSString::from_str("vdev-camera-rust"),
+            deviceWithLocalizedName: &*NSString::from_str("vdev-camera"),
             deviceID: &*device_id,
             legacyDeviceID: &*device_id.UUIDString(),
             source: device_source
@@ -568,6 +614,8 @@ fn main() {
     unsafe {
         let _: () = msg_send![provider_cls, startServiceWithProvider: &*provider];
     }
+    // 启动真实帧推流通道（宿主 App 连 127.0.0.1:27890 推帧）
+    frame_channel::start();
     eprintln!("vdev-camera-ext: 服务已启动，进入 runloop");
     elog("startService 完成，进入 runloop");
     unsafe { CFRunLoopRun() };

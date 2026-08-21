@@ -719,6 +719,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.iter().any(|a| a == "--install-extension") {
+        // 提交扩展激活请求并保持进程 120s（等价于点「安装虚拟摄像头」，供自动化/CLI 用）
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_cb = events.clone();
+        sysext::submit(
+            BUNDLE_ID,
+            true,
+            Box::new(move |ev| {
+                let s = match ev {
+                    sysext::SysextEvent::NeedsApproval => "NeedsApproval".to_string(),
+                    sysext::SysextEvent::Finished(n) => format!("Finished({})", n),
+                    sysext::SysextEvent::Failed(e) => format!("Failed({})", e),
+                };
+                println!("install-extension: {}", s);
+                ev_cb.lock().unwrap().push(s);
+            }),
+        )?;
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.ExtensionsPreferences")
+            .spawn();
+        sysext::service_main_queue(120.0);
+        println!("install-extension: events={:?}", *events.lock().unwrap());
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--selftest-recover") {
         let log = Arc::new(|line: String| println!("recover: {}", line));
         recover_extension(log);
