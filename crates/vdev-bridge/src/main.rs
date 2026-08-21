@@ -16,6 +16,7 @@ use aerodesk_core::protocol::signal::Role;
 use aerodesk_codec::decode::FfmpegDecoder;
 use str0m::{Input, Output};
 
+mod audio;
 mod frame;
 use frame::FrameClient;
 
@@ -63,6 +64,13 @@ fn main() -> Result<(), String> {
     let mut decoder: Option<FfmpegDecoder> = None;
     let mut assembler = AccessUnitAssembler::new();
 
+    // 5. 音频输出（声卡）+ Opus 解码
+    let mut audio_sink = match audio::AudioSink::new() {
+        Ok(s) => Some(s),
+        Err(e) => { eprintln!("警告：{e}，跳过音频"); None }
+    };
+    let mut opus_decoder = audio_sink.as_ref().and_then(|_| aerodesk_codec::audio::OpusDecoder::new().ok());
+
     let mut frames = 0u64;
     let mut buf = [0u8; 2048];
     println!("收流中… Ctrl-C 退出");
@@ -97,10 +105,16 @@ fn main() -> Result<(), String> {
         // 事件 → 媒体
         while let Some(ev) = endpoint.poll_event() {
             if let ClientEvent::Media(data) = ev {
-                // 音频轨跳过（后续接声卡）
-                if data.params.spec().codec == str0m::format::Codec::Opus
-                    || data.params.spec().codec == str0m::format::Codec::PCMU
-                {
+                // 音频轨：Opus 解码 → 声卡
+                if data.params.spec().codec == str0m::format::Codec::Opus {
+                    if let (Some(sink), Some(dec)) = (&mut audio_sink, &mut opus_decoder) {
+                        if let Ok(Some(pcm)) = dec.decode(&data.data) {
+                            sink.push_mono_i16(&pcm);
+                        }
+                    }
+                    continue;
+                }
+                if data.params.spec().codec == str0m::format::Codec::PCMU {
                     continue;
                 }
                 // 视频轨：识别 codec
