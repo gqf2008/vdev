@@ -168,6 +168,39 @@ pub fn openpanel_selftest() -> Result<(), String> {
     .map_err(|e| format!("NSOpenPanel 创建失败: {}", panic_detail(e)))?
 }
 
+/// 网络/外置卷（/Volumes/*）的视频先复制到本地缓存再解码：
+/// AVAssetReader 直接从 ossfs/FUSE 读会卡 30s+（读索引），复制到本地后读取快且稳定。
+fn cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::Path::new(&home).join("Library/Caches/vdev");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 若路径在 /Volumes 下（外置/网络卷），复制到本地缓存并返回本地路径。
+/// 已缓存则直接复用。返回 (本地路径, 是否需要复制过)。
+pub fn prepare_local_path(path: &str) -> Result<String> {
+    if !path.starts_with("/Volumes/") {
+        return Ok(path.to_string());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    // 保留原扩展名：AVAssetReader 对无扩展名文件创建会失败（AV1 实测）
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    let name = format!("{:016x}.{}", h.finish(), ext);
+    let dest = cache_dir().join(&name);
+    if !dest.exists() {
+        eprintln!("视频推流: 复制 {} -> {}", path, dest.display());
+        std::fs::copy(path, &dest)?;
+        eprintln!("视频推流: 复制完成");
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
 /// 解码并推流视频（后台线程）。on_frame 回调已缩放 BGRA32；
 /// 结束时（自然播完或被 stop）调用 on_done。
 ///
@@ -203,7 +236,15 @@ pub fn push_video(
     std::thread::spawn(move || {
         // access 随线程存活：沙盒内 security-scoped 权限保持到推流结束
         let _access = access;
-        let r = run(&path, width, height, fps, move |buf, w, h, stride| {
+        // 网络/外置卷先复制到本地缓存（在后台线程做，不阻塞 UI）
+        let local = match prepare_local_path(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("视频推流: 复制到本地失败: {}", e);
+                path.clone()
+            }
+        };
+        let r = run(&local, width, height, fps, move |buf, w, h, stride| {
             let mut guard = cb_d.lock().unwrap_or_else(|e| e.into_inner());
             let c = guard.as_mut();
             c(buf.clone(), w, h, stride);
