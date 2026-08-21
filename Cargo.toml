@@ -8,6 +8,7 @@ members = [
     "crates/vdev-app",
     "crates/vdev-camera-ext",
     "crates/vdev-audio",
+    "crates/vdev-filter",
 ]
 
 [workspace.package]
