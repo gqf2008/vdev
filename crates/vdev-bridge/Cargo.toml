@@ -1,0 +1,18 @@
+[package]
+name = "vdev-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vdev-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# 复用 aerodesk 的 WebRTC 收流（str0m + SFU 连接）与 FFmpeg 解码
+aerodesk-core = { path = "../../../aerodesk/crates/aerodesk-core" }
+aerodesk-codec = { path = "../../../aerodesk/crates/aerodesk-codec" }
+str0m = { git = "https://github.com/aerodesk-labs/str0m.git", rev = "f5b4fd6e79d23f8bc368873603f453c05314b4e2", default-features = false, features = ["rust-crypto"] }
+ffmpeg-next = "8"
+vdev-filter = { path = "../vdev-filter" }
+anyhow = "1.0.104"
