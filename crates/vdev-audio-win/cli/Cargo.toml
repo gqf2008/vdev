@@ -1,0 +1,12 @@
+[package]
+name = "vdev-audio-win"
+version = "0.1.0"
+edition = "2021"
+description = "vdev 虚拟声卡（PortCls 内核驱动）安装与控制器"
+
+[[bin]]
+name = "vdev-audio-win"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.93"
