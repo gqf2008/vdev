@@ -2,9 +2,16 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub use core::ffi::c_void;
 pub type NTSTATUS = i32;
 pub const STATUS_SUCCESS: NTSTATUS = 0;
 pub const STATUS_UNSUCCESSFUL: NTSTATUS = -1_073_741_823; // 0xC0000001
+pub const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = -1_073_741_803; // 0xC000009A
+pub const STATUS_INVALID_PARAMETER: NTSTATUS = -1_073_741_815; // 0xC000000D
+pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = -1_073_741_811; // 0xC0000023
+pub const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = -1_073_741_810; // 0xC0000010
+pub const STATUS_DEVICE_BUSY: NTSTATUS = -1_073_741_771; // 0xC0000011
+pub type PRESOURCELIST = *mut c_void;
 
 pub type PVOID = *mut core::ffi::c_void;
 pub type PCHAR = *mut i8;
@@ -53,3 +60,197 @@ pub struct IRP {
     _private: [u8; 0],
 }
 pub type PIRP = *mut IRP;
+
+// ---- GUID ----
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+pub type REFGUID = *const GUID;
+
+pub fn is_equal_guid(a: *const GUID, b: *const GUID) -> bool {
+    unsafe { (*a) == (*b) }
+}
+
+// ---- KS 基础类型 ----
+#[repr(C)]
+pub struct KSDATARANGE {
+    pub FormatSize: ULONG,
+    pub Flags: ULONG,
+    pub SampleSize: ULONG,
+    pub Reserved: ULONG,
+    pub MajorFormat: GUID,
+    pub SubFormat: GUID,
+    pub Specifier: GUID,
+}
+
+#[repr(C)]
+pub struct KSDATAFORMAT {
+    pub FormatSize: ULONG,
+    pub Flags: ULONG,
+    pub SampleSize: ULONG,
+    pub Reserved: ULONG,
+    pub MajorFormat: GUID,
+    pub SubFormat: GUID,
+    pub Specifier: GUID,
+}
+pub type PKSDATAFORMAT = *mut KSDATAFORMAT;
+
+#[repr(C)]
+pub struct KSDATAFORMAT_WAVEFORMATEX {
+    pub DataFormat: KSDATAFORMAT,
+    pub WaveFormatEx: *mut WAVEFORMATEX,
+}
+
+#[repr(C)]
+pub struct WAVEFORMATEX {
+    pub wFormatTag: u16,
+    pub nChannels: u16,
+    pub nSamplesPerSec: u32,
+    pub nAvgBytesPerSec: u32,
+    pub nBlockAlign: u16,
+    pub wBitsPerSample: u16,
+    pub cbSize: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KSSTATE {
+    KSSTATE_STOP,
+    KSSTATE_ACQUIRE,
+    KSSTATE_PAUSE,
+    KSSTATE_RUN,
+}
+pub type PKSSTATE = *mut KSSTATE;
+
+// ---- 音频专用 ----
+#[repr(C)]
+pub struct KSAUDIO_POSITION {
+    pub PlayOffset: u64,
+    pub WriteOffset: u64,
+}
+
+#[repr(C)]
+pub struct KSRTAUDIO_HWLATENCY {
+    pub FifoSize: u32,
+    pub ChipsetDelay: u32,
+    pub CodecDelay: u32,
+}
+
+#[repr(C)]
+pub struct KSRTAUDIO_HWREGISTER {
+    pub Register: *mut c_void,
+    pub Width: ULONG,
+    pub Numerator: u64,
+    pub Denominator: u64,
+    pub Accuracy: ULONG,
+}
+
+pub type MEMORY_CACHING_TYPE = u32;
+
+pub type PPCFILTER_DESCRIPTOR = *mut *mut PCFILTER_DESCRIPTOR;
+
+#[repr(C)]
+pub struct PCFILTER_DESCRIPTOR {
+    pub Version: ULONG,
+    pub AutomationTable: *mut c_void,
+    pub PinSize: ULONG,
+    pub PinCount: ULONG,
+    pub Pins: *mut PCPIN_DESCRIPTOR,
+    pub NodeSize: ULONG,
+    pub NodeCount: ULONG,
+    pub Nodes: *mut PCNODE_DESCRIPTOR,
+    pub ConnectionSize: ULONG,
+    pub ConnectionCount: ULONG,
+    pub Connections: *mut PCCONNECTION_DESCRIPTOR,
+    pub Category: GUID,
+    pub Name: GUID,
+    pub ComponentId: GUID,
+    pub Topology: GUID,
+    pub CapsFlags: ULONG,
+    pub DeviceInterfaceGuid: GUID,
+}
+
+#[repr(C)]
+pub struct PCPIN_DESCRIPTOR {
+    pub MaxInstances: ULONG,
+    pub Interrupts: ULONG,
+    pub AutomationTable: *mut c_void,
+    pub KsPinDescriptor: *mut KSPIN_DESCRIPTOR,
+}
+
+#[repr(C)]
+pub struct KSPIN_DESCRIPTOR {
+    pub InterfacesCount: ULONG,
+    pub Interfaces: *mut KSPIN_INTERFACE,
+    pub MediumsCount: ULONG,
+    pub Mediums: *mut KSPIN_MEDIUM,
+    pub DataRangesCount: ULONG,
+    pub DataRanges: *mut *mut KSDATARANGE,
+    pub Category: GUID,
+    pub Name: GUID,
+    pub Communication: u32,
+}
+
+#[repr(C)]
+pub struct KSPIN_INTERFACE {
+    pub Set: GUID,
+    pub Id: ULONG,
+    pub Flags: ULONG,
+}
+
+#[repr(C)]
+pub struct KSPIN_MEDIUM {
+    pub Set: GUID,
+    pub Id: ULONG,
+    pub Flags: ULONG,
+}
+
+#[repr(C)]
+pub struct PCNODE_DESCRIPTOR {
+    pub AutomationTable: *mut c_void,
+    pub Type: GUID,
+    pub Name: GUID,
+}
+
+#[repr(C)]
+pub struct PCCONNECTION_DESCRIPTOR {
+    pub FromNode: ULONG,
+    pub FromPin: ULONG,
+    pub ToNode: ULONG,
+    pub ToPin: ULONG,
+}
+
+#[repr(C)]
+pub struct DEVICE_DESCRIPTION {
+    pub Version: ULONG,
+    pub Master: BOOLEAN,
+    pub ScatterGather: BOOLEAN,
+    pub DemandMode: BOOLEAN,
+    pub AutoInitialize: BOOLEAN,
+    pub Paging: BOOLEAN,
+    pub Dma32BitAddresses: BOOLEAN,
+    pub IgnoreCount: BOOLEAN,
+    pub Reserved1: BOOLEAN,
+    pub Dma64BitAddresses: BOOLEAN,
+    pub BusNumber: ULONG,
+    pub DmaWidth: ULONG,
+    pub DmaTransferWidth: ULONG,
+    pub MaximumLength: ULONG,
+    pub DmaPort: ULONG,
+}
+
+// 静态描述符含裸指针，Rust 2024 要求 Sync；这些仅作静态只读数据
+unsafe impl Sync for PCFILTER_DESCRIPTOR {}
+unsafe impl Sync for PCPIN_DESCRIPTOR {}
+unsafe impl Sync for KSDATARANGE {}
+unsafe impl Sync for KSDATAFORMAT {}
+unsafe impl Sync for KSPIN_DESCRIPTOR {}
+unsafe impl Sync for PCNODE_DESCRIPTOR {}
+unsafe impl Sync for PCCONNECTION_DESCRIPTOR {}
+unsafe impl Sync for KSPIN_MEDIUM {}
+unsafe impl Sync for KSPIN_INTERFACE {}
