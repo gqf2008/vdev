@@ -1,0 +1,50 @@
+[workspace]
+# vdev-camera-win 独立 workspace：主 workspace 是 macOS-only，
+# Windows 专用 crate 需要独立构建（不影响 macOS 主仓库）。
+resolver = "2"
+members = ["."]
+
+[package]
+name = "vdev-camera-win"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Windows 虚拟摄像头：DirectShow 源过滤器（100% Rust，安全封装优先）"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "vdev-camera-win"
+path = "src/main.rs"
+
+[dependencies]
+# 复用 vdev-camera 的纯 Rust 帧核心（RGB24 测试图案，跨平台）
+vdev-camera = { path = "../vdev-camera" }
+# Microsoft 官方安全绑定（Windows API / COM / DirectShow）
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+] }
+windows-core = "0.62"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+
+
+
+

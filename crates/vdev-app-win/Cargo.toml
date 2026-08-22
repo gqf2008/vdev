@@ -1,0 +1,28 @@
+[workspace]
+# vdev-app-win 独立 workspace：Windows 专用 GUI（Slint），不影响 macOS 主仓库。
+resolver = "2"
+members = ["."]
+
+[package]
+name = "vdev-app-win"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Windows 版 vdev 虚拟摄像头 GUI（Slint + slint-pixel，复用 vdev-app 像素风）"
+
+[[bin]]
+name = "vdev-app-win"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "1.17"
+slint-pixel = { git = "https://github.com/gqf2008/slint-pixel" }
+
+[dependencies]
+slint = { version = "1.17", features = ["unstable-winit-030"] }
+slint-pixel = { git = "https://github.com/gqf2008/slint-pixel" }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+# 复用 Windows 虚拟摄像头的安全封装（注册/注销/推流/枚举）
+vdev-camera-win = { path = "../vdev-camera-win" }
