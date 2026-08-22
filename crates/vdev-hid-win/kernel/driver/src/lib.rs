@@ -220,14 +220,9 @@ unsafe extern "C" fn evt_io_internal_device_control(
     // SAFETY: request 有效
     let result = unsafe { dispatch_ioctl(request, output_len, input_len, ioctl_code) };
     if let DispatchResult::Complete(status) = result {
-        // SAFETY: 完成请求
+        // SAFETY: 完成请求（WdfRequestComplete 保留 SetInformation 的字节数）
         unsafe {
-            call_unsafe_wdf_function_binding!(
-                WdfRequestCompleteWithInformation,
-                request,
-                status,
-                0
-            );
+            call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status);
         }
     }
 }
@@ -330,7 +325,7 @@ unsafe fn handle_read_report(request: WDFREQUEST, _output_len: usize) -> Dispatc
         // SAFETY: req 有效，输出缓冲区由 hidclass 提供
         let status = unsafe { copy_to_output(req, &report) };
         unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestCompleteWithInformation, req, status, 0);
+            call_unsafe_wdf_function_binding!(WdfRequestComplete, req, status);
         }
         return DispatchResult::Pending;
     }
@@ -433,7 +428,7 @@ fn inject_report(report: [u8; KEYBOARD_REPORT_SIZE]) {
         // SAFETY: req 有效
         let status = unsafe { copy_to_output(req, &report) };
         unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestCompleteWithInformation, req, status, 0);
+            call_unsafe_wdf_function_binding!(WdfRequestComplete, req, status);
         }
     }
 }
