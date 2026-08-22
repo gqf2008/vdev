@@ -1,0 +1,45 @@
+﻿;
+; vdev-audio.inf — vdev 虚拟声卡（PortCls 内核驱动）
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class = MEDIA
+ClassGuid = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer = 08/22/2026,0.1.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=vdev_audio_Install, Root\vdev-audio
+
+[SourceDisksFiles]
+vdev_audio.sys=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[vdev_audio_Install.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration, WDMAUDIO.Registration
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+vdev_audio.sys
+
+[vdev_audio_Install.NT.Services]
+AddService = vdev_audio, 0x00000002, vdev_audio_Service_Inst
+
+[vdev_audio_Service_Inst]
+DisplayName = %ServiceDesc%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\vdev_audio.sys
+
+[Strings]
+ManufacturerName="vdev"
+DeviceName="vdev 虚拟声卡"
+ServiceDesc="vdev Audio Service"
