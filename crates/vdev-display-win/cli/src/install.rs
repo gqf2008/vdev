@@ -45,7 +45,8 @@ fn read_multi_sz(
         }
         // 缓冲区太小：required 给出所需大小
         let err = windows::core::Error::from_win32();
-        if err.code().0 != windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER.0 as i32 {
+        if err.code().0 as u32 != 0x8007_007A {
+            // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
             return Vec::new();
         }
         if required == 0 {
