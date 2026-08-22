@@ -295,6 +295,20 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
         crate::miniport::miniport_release(miniport.cast());
         return st;
     }
+    // 注册 KSCATEGORY_AUDIO 设备接口（控制面板音频端点可见）
+    // SAFETY: pdo 有效；reference 为局部宽字符串，符号链接输出可丢弃
+    let pdo = adapter.physical_device_object;
+    let mut symbolic = UNICODE_STRING {
+        Length: 0,
+        MaximumLength: 0,
+        Buffer: core::ptr::null_mut(),
+    };
+    let mut ref_us = UNICODE_STRING {
+        Length: (name_wide.len().saturating_sub(1) * 2) as u16,
+        MaximumLength: (name_wide.len() * 2) as u16,
+        Buffer: name_wide.as_ptr() as PWSTR,
+    };
+    IoRegisterDeviceInterface(pdo, &KSCATEGORY_AUDIO, &mut ref_us, &mut symbolic);
     if capture {
         adapter.mic = miniport;
         adapter.mic_port = port;

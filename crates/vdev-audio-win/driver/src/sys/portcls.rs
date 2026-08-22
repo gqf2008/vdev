@@ -53,6 +53,13 @@ pub const IID_IAdapterCommon: GUID = GUID {
     data3: 0x11d0,
     data4: [0x87, 0x1f, 0x00, 0xa0, 0xc9, 0x11, 0xb5, 0x44],
 };
+pub const KSCATEGORY_AUDIO: GUID = GUID {
+    data1: 0x6994_ad04,
+    data2: 0x93ef,
+    data3: 0x11d0,
+    data4: [0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
+};
+
 pub const IID_IUnknown: GUID = GUID {
     data1: 0x0000_0000,
     data2: 0x0000,
@@ -109,5 +116,15 @@ unsafe extern "system" {
     pub fn PcGetPhysicalDeviceObject(
         DeviceObject: PDEVICE_OBJECT,
         PhysicalDeviceObject: *mut PDEVICE_OBJECT,
+    ) -> NTSTATUS;
+    /// 注册设备接口（音频端点可见性）
+    ///
+    /// # Safety
+    /// 参数必须为有效指针，SymbolicLinkName 输出缓冲区由调用方管理。
+    pub fn IoRegisterDeviceInterface(
+        PhysicalDeviceObject: PDEVICE_OBJECT,
+        InterfaceClassGuid: *const GUID,
+        ReferenceString: PUNICODE_STRING,
+        SymbolicLinkName: PUNICODE_STRING,
     ) -> NTSTATUS;
 }
