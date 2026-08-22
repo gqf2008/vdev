@@ -1,6 +1,6 @@
 # Windows 虚拟显示器 + 虚拟声卡（内核驱动路线，Rust）
 
-> 状态：调研完成，待实现。用户已拍板：接受开测试签名 + 装 WDK，走内核驱动路线；
+> 状态：虚拟显示器（IddCx UMDF）代码已交付（issue #3，PR 待合）；虚拟声卡待实现。用户已拍板：接受开测试签名 + 装 WDK，走内核驱动路线；
 > 实现语言必须 Rust（C/C++ 能实现的 Rust 一样可以实现）。
 
 ## 1. 目标与验收标准
@@ -162,12 +162,13 @@ bcdedit /set testsigning on
 
 ## 6. 里程碑
 
-1. [ ] 环境：装 WDK（winget，提权）；生成签名证书；装 nefcon
-2. [ ] 虚拟显示器驱动移植（wdf-umdf-sys + wdf-umdf + driver + CLI），构建出 DLL
-3. [ ] 虚拟显示器安装/枚举/多屏/分辨率实测（含与 ToDesk 共存）
+1. [x] 环境：装 WDK 10.0.26100 + LLVM(libclang)（winget，提权）；生成自签名证书并装入 TrustedPublisher+Root
+2. [x] 虚拟显示器驱动移植（wdf-umdf-sys + wdf-umdf + driver + CLI），构建出 vdev_display.dll（fmt/clippy/test 全绿）
+3. [ ] 虚拟显示器安装/枚举/多屏/分辨率实测（代码就绪，等用户点 UAC 完成安装验证）
 4. [ ] 虚拟显示器 GUI 集成（vdev-app-win 新增页）
 5. [ ] 开测试签名（需重启）
 6. [ ] 虚拟声卡驱动移植（bindgen + miniport + ringbuffer + CLI），构建出 SYS
 7. [ ] 虚拟声卡安装/环回/注入实测
 8. [ ] 虚拟声卡 GUI 集成
 9. [ ] 审查、合并、清理、沉淀 LESSON
+

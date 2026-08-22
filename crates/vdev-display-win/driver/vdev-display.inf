@@ -1,5 +1,5 @@
-;
-; vdev-display.inf ? vdev ??????IddCx UMDF ???
+﻿;
+; vdev-display.inf — vdev 虚拟显示器（IddCx UMDF 驱动）
 ;
 
 [Version]
@@ -43,10 +43,9 @@ AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
 UmdfService=vdev-display,vdev_display_Install
 UmdfServiceOrder=vdev-display
 UmdfKernelModeClientPolicy = AllowKernelModeClients
-UmdfHostProcessSharing = ProcessSharingDisabled
 
 [vdev_display_Install]
-UmdfLibraryVersion=$UMDFVERSION$
+UmdfLibraryVersion=2.25.0
 ServiceBinary=%12%\UMDF\vdev_display.dll
 UmdfExtensions = IddCx0102
 
@@ -69,7 +68,7 @@ vdev_display.dll
 ManufacturerName="vdev"
 DiskName = "vdev Display Installation Disk"
 WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
-DeviceName="vdev ?????"
+DeviceName="vdev 虚拟显示器"
 
 REG_MULTI_SZ  = 0x00010000
 REG_SZ        = 0x00000000
