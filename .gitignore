@@ -11,3 +11,5 @@ crates/vdev-audio/build/
 
 crates/vdev-camera-win/target/
 
+crates/vdev-app-win/target/
+
