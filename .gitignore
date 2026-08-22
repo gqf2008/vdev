@@ -16,3 +16,4 @@ crates/vdev-app-win/target/
 crates/vdev-display-win/target/
 
 crates/vdev-audio-win/target/
+crates/vdev-hid-win/target/
