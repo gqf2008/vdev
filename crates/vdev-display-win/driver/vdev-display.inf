@@ -1,0 +1,77 @@
+﻿;
+; vdev-display.inf — vdev 虚拟显示器（IddCx UMDF 驱动）
+;
+
+[Version]
+PnpLockdown=1
+Signature="$Windows NT$"
+ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Class = Display
+ClassVer = 2.0
+Provider=%ManufacturerName%
+CatalogFile=vdev-display.cat
+DriverVer = 08/22/2026,0.1.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=vdev_display_Install, Root\vdev-display
+
+[SourceDisksFiles]
+vdev_display.dll=1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; =================== UMDF Device ==================================
+
+[vdev_display_Install.NT]
+CopyFiles=UMDriverCopy
+
+[vdev_display_Install.NT.hw]
+AddReg = vdev_display_HardwareDeviceSettings
+
+[vdev_display_HardwareDeviceSettings]
+HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "vdev-display-group"
+
+[vdev_display_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[vdev_display_Install.NT.Wdf]
+UmdfService=vdev-display,vdev_display_Install
+UmdfServiceOrder=vdev-display
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+[vdev_display_Install]
+UmdfLibraryVersion=2.25.0
+ServiceBinary=%12%\UMDF\vdev_display.dll
+UmdfExtensions = IddCx0102
+
+[WUDFRD_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF ; copy to drivers\umdf
+
+[UMDriverCopy]
+vdev_display.dll
+
+; =================== Generic ==================================
+
+[Strings]
+ManufacturerName="vdev"
+DiskName = "vdev Display Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+DeviceName="vdev 虚拟显示器"
+
+REG_MULTI_SZ  = 0x00010000
+REG_SZ        = 0x00000000
+REG_EXPAND_SZ = 0x00020000
+REG_DWORD     = 0x00010001
+

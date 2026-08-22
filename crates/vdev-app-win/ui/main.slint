@@ -1,8 +1,10 @@
-// VDCamera (Windows) — vdev 虚拟摄像头宿主（Rust + Slint + slint-pixel）
+// vdev (Windows) — vdev 虚拟设备宿主（Rust + Slint + slint-pixel）
+// Tab 0：虚拟摄像头；Tab 1：虚拟显示器
 import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme } from "@slint_pixel";
 import { ScrollView } from "std-widgets.slint";
 
 export global AppState {
+    // 摄像头
     in-out property <string> status_glyph: "○";
     in-out property <string> status_title: "虚拟摄像头未安装";
     in-out property <string> status_detail: "点击「安装虚拟摄像头」，然后刷新状态确认。";
@@ -10,22 +12,37 @@ export global AppState {
     in-out property <bool> can_uninstall: false;
     in-out property <bool> can_push: false;
     in-out property <string> push_btn_text: "开始推流";
+    // 显示器
+    in-out property <int> current_tab: 0;
+    in-out property <string> disp_glyph: "○";
+    in-out property <string> disp_title: "虚拟显示器未安装";
+    in-out property <string> disp_detail: "点击「安装虚拟显示器」安装 IddCx 驱动，然后刷新状态。";
+    in-out property <bool> disp_can_install: true;
+    in-out property <bool> disp_can_uninstall: false;
+    in-out property <bool> disp_can_add: false;
+    in-out property <string> disp_monitors_text: "暂无虚拟显示器";
+    // 共享日志
     in-out property <string> log_text: "";
 }
 
 export component MainWindow inherits Window {
-    title: "VDCamera (Windows)";
+    title: "vdev (Windows)";
     no-frame: true;
-    preferred-width: 560px;
-    preferred-height: 540px;
-    min-width: 560px;
-    min-height: 540px;
+    preferred-width: 620px;
+    preferred-height: 620px;
+    min-width: 620px;
+    min-height: 620px;
     background: PixelTheme.bg;
 
     callback install();
     callback uninstall();
     callback refresh();
     callback push();
+    callback display-install();
+    callback display-uninstall();
+    callback display-refresh();
+    callback display-add();
+    callback display-remove-all();
     callback drag-start();
     callback minimize();
     callback toggle-maximize();
@@ -36,38 +53,90 @@ export component MainWindow inherits Window {
         spacing: 8px;
 
         PixelTitleBar {
-            title: "VDCamera · vdev 虚拟摄像头 (Windows)";
+            title: "vdev · 虚拟设备 (Windows)";
             drag-start => { root.drag-start(); }
             minimize => { root.minimize(); }
             toggle-maximize => { root.toggle-maximize(); }
             close-window => { root.close-window(); }
         }
 
-        PixelPanel {
-            title: "状态";
-            VerticalLayout {
-                spacing: 4px;
-                HorizontalLayout {
-                    spacing: 8px;
-                    PixelText { text: AppState.status_glyph; font-size: 18px; }
-                    PixelText { text: AppState.status_title; font-weight: 700; }
-                }
-                PixelText { text: AppState.status_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+        HorizontalLayout { spacing: 8px;
+            PixelButton {
+                text: "虚拟摄像头";
+                background: AppState.current_tab == 0 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 0; }
+            }
+            PixelButton {
+                text: "虚拟显示器";
+                background: AppState.current_tab == 1 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 1; }
             }
         }
 
-        HorizontalLayout { spacing: 8px;
-            PixelButton { text: "安装虚拟摄像头"; enabled: AppState.can_install; clicked => { install(); } }
-            PixelButton { text: "卸载虚拟摄像头"; enabled: AppState.can_uninstall; clicked => { uninstall(); } }
-            PixelButton { text: "刷新状态"; clicked => { refresh(); } }
+        // ============ Tab 0: 虚拟摄像头 ============
+        if AppState.current_tab == 0 : VerticalLayout {
+            spacing: 8px;
+            PixelPanel {
+                title: "状态";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PixelText { text: AppState.status_glyph; font-size: 18px; }
+                        PixelText { text: AppState.status_title; font-weight: 700; }
+                    }
+                    PixelText { text: AppState.status_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "安装虚拟摄像头"; enabled: AppState.can_install; clicked => { install(); } }
+                PixelButton { text: "卸载虚拟摄像头"; enabled: AppState.can_uninstall; clicked => { uninstall(); } }
+                PixelButton { text: "刷新状态"; clicked => { refresh(); } }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: AppState.push_btn_text; enabled: AppState.can_push; clicked => { push(); } }
+            }
         }
 
-        HorizontalLayout { spacing: 8px;
-            PixelButton { text: AppState.push_btn_text; enabled: AppState.can_push; clicked => { push(); } }
+        // ============ Tab 1: 虚拟显示器 ============
+        if AppState.current_tab == 1 : VerticalLayout {
+            spacing: 8px;
+            PixelPanel {
+                title: "状态";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PixelText { text: AppState.disp_glyph; font-size: 18px; }
+                        PixelText { text: AppState.disp_title; font-weight: 700; }
+                    }
+                    PixelText { text: AppState.disp_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "安装虚拟显示器"; enabled: AppState.disp_can_install; clicked => { display-install(); } }
+                PixelButton { text: "卸载虚拟显示器"; enabled: AppState.disp_can_uninstall; clicked => { display-uninstall(); } }
+                PixelButton { text: "刷新状态"; clicked => { display-refresh(); } }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "添加 1920x1080"; enabled: AppState.disp_can_add; clicked => { display-add(); } }
+                PixelButton { text: "移除全部"; enabled: AppState.disp_can_add; clicked => { display-remove-all(); } }
+            }
+            PixelPanel {
+                title: "虚拟显示器";
+                ScrollView {
+                    height: 120px;
+                    Text {
+                        text: AppState.disp_monitors_text;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
         }
 
         ScrollView {
-            height: 160px;
+            height: 140px;
             Text {
                 text: AppState.log_text;
                 font-size: 11px;

@@ -5359,6 +5359,8 @@ dependencies = [
  "anyhow",
  "env_logger",
  "log",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "slint-pixel",
