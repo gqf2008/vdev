@@ -6,6 +6,7 @@ members = ["driver", "cli"]
 strip = true
 codegen-units = 1
 lto = true
+panic = "abort"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -17,3 +18,6 @@ ignored_unit_patterns = "allow"
 missing_errors_doc = "allow"
 module_inception = "allow"
 module_name_repetitions = "allow"
+
+[profile.dev]
+panic = "abort"
