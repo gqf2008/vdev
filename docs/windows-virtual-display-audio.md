@@ -166,9 +166,9 @@ bcdedit /set testsigning on
 2. [x] 虚拟显示器驱动移植（wdf-umdf-sys + wdf-umdf + driver + CLI），构建出 vdev_display.dll（fmt/clippy/test 全绿）
 3. [ ] 虚拟显示器安装/枚举/多屏/分辨率实测（代码就绪，等用户点 UAC 完成安装验证）
 4. [ ] 虚拟显示器 GUI 集成（vdev-app-win 新增页）
-5. [ ] 开测试签名（需重启）
-6. [ ] 虚拟声卡驱动移植（bindgen + miniport + ringbuffer + CLI），构建出 SYS
-7. [ ] 虚拟声卡安装/环回/注入实测
-8. [ ] 虚拟声卡 GUI 集成
+5. [x] 开测试签名（bcdedit /set testsigning on，待重启生效）
+6. [x] 虚拟声卡驱动（手写 WDM/PortCls 绑定 + AdapterCommon + WaveRT miniport + 环回流 + INF + CLI），构建出 vdev_audio.sys（门禁全绿）
+7. [ ] 虚拟声卡安装/环回/注入实测（等重启后测试签名生效）
+8. [x] 虚拟声卡 GUI 集成（vdev-app-win 新增声卡 Tab）
 9. [ ] 审查、合并、清理、沉淀 LESSON
 
