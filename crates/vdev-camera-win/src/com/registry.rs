@@ -52,6 +52,7 @@ impl RegKey {
         let name_wide = to_wide(name);
         let value_wide = to_wide(value);
         // REG_SZ 要求包含结尾 NUL：value_wide 已含 NUL，按字节传。
+        // SAFETY: value_wide 在调用期间存活，按字节视图传入。
         let bytes = unsafe {
             std::slice::from_raw_parts(value_wide.as_ptr() as *const u8, value_wide.len() * 2)
         };

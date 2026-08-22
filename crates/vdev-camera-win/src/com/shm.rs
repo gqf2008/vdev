@@ -85,6 +85,7 @@ impl SharedFrameChannel {
         let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, total_len) };
         if view.Value.is_null() {
             let err = io::Error::last_os_error();
+            // SAFETY: mapping 有效（CreateFileMappingW 成功）。
             unsafe { CloseHandle(mapping) }.ok();
             return Err(err);
         }
@@ -93,12 +94,14 @@ impl SharedFrameChannel {
         // SAFETY: 命名事件（auto-reset），初始无信号，名称在调用期间存活。
         let event = unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }
             .map_err(|e| {
+                // SAFETY: view/mapping 均有效，错误路径释放句柄。
                 unsafe { UnmapViewOfFile(view) }.ok();
                 unsafe { CloseHandle(mapping) }.ok();
                 io::Error::from_raw_os_error(e.code().0)
             })?;
 
         // 首个创建者写入魔数。
+        // SAFETY: view 已映射且长度 >= HEADER_LEN，对齐由 Header 定义保证。
         let header = unsafe { &mut *view.Value.cast::<Header>() };
         if header.magic != MAGIC {
             header.magic = MAGIC;

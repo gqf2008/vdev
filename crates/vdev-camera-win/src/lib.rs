@@ -12,10 +12,12 @@
 //!   dshow/
 //!     media_type.rs   AM_MEDIA_TYPE / VIDEOINFOHEADER 安全封装
 //!     filter.rs       VirtualCameraFilter（IBaseFilter/IMediaFilter/IPersist/IAMFilterMiscFlags）
-//!     pin.rs          OutputPin（IPin/IAMStreamConfig）
+//!     pin.rs          OutputPin（IPin/IAMStreamConfig/IKsPropertySet）
+//!     device.rs       视频捕获源枚举安全封装（ICreateDevEnum + IPropertyBag）
+//!     selftest.rs     进程内自测图安全封装（源 → NullRenderer）
 //!     enum_pins.rs / enum_media_types.rs / streaming.rs / util.rs
 //!   camera.rs       面向宿主的高层安全 API（install/uninstall/push_frame）
-//!   main.rs         CLI：install / uninstall / selftest / push
+//!   main.rs         CLI：install / uninstall / selftest / push / list（纯业务层，零 unsafe）
 //! ```
 //!
 //! 本 crate 是 Windows 系统互操作白名单 crate（需要 `unsafe` 实现 COM 接口与

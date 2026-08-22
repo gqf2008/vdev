@@ -120,6 +120,7 @@ fn stream_loop(
 
         // 取下游缓冲区（阻塞直到可用或失败）。
         let mut sample_slot: Option<IMediaSample> = None;
+        // SAFETY: 分配器已 Commit；GetBuffer 输出 sample_slot 并持有引用。
         let sample = match unsafe { conn.allocator.GetBuffer(&mut sample_slot, None, None, 0) } {
             Ok(()) => match sample_slot.take() {
                 Some(s) => s,
@@ -150,6 +151,7 @@ fn stream_loop(
         pin.note_frame();
 
         // 交给下游；下游停止（S_FALSE 等）时继续等待。
+        // SAFETY: 连接已建立，sample 来自已 Commit 的分配器。
         if let Err(e) = unsafe { conn.input.Receive(&sample) } {
             log::debug!("downstream Receive failed: {e:?}");
             if stop.load(Ordering::Relaxed) {
@@ -183,6 +185,7 @@ fn deliver_sample(
         Ok(p) => p,
         Err(_) => return false,
     };
+    // SAFETY: COM 方法调用，返回样本缓冲区大小。
     let size = unsafe { sample.GetSize() } as usize;
     let need = (width as usize) * (height as usize) * 4;
     if size < need {
@@ -198,6 +201,7 @@ fn deliver_sample(
     // 不设置样本时间戳：虚拟摄像头是推源，设置时间戳会让基于 CBaseRenderer 的
     // 下游（如 NullRenderer）按参考时钟等待，造成帧率被拖慢/卡死。
     // （无时间戳时渲染器立即渲染；需要 A/V 同步的场景后续再按时钟补。）
+    // SAFETY: COM 方法调用，设置样本标志位。
     let _ = unsafe { sample.SetSyncPoint(true) };
     let _ = unsafe { sample.SetPreroll(false) };
     true

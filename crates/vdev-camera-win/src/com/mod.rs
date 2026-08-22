@@ -32,6 +32,7 @@ impl ComInit {
 
 impl Drop for ComInit {
     fn drop(&mut self) {
+        // SAFETY: 与构造时 CoInitializeEx 配对；当前线程 COM 已初始化。
         unsafe { CoUninitialize() };
     }
 }
@@ -56,6 +57,7 @@ impl IClassFactory_Impl for FilterClassFactory_Impl {
             return Err(windows_core::Error::from_hresult(E_POINTER));
         }
         let filter = crate::dshow::filter::create_filter()?;
+        // SAFETY: riid/ppvobject 已在上方校验非空；query 写入 ppvobject 并 AddRef。
         let hr = unsafe { filter.query(riid, ppvobject) };
         if hr.is_ok() {
             Ok(())
@@ -83,15 +85,18 @@ pub(crate) mod dll {
         if ppv.is_null() {
             return E_POINTER;
         }
+        // SAFETY: ppv 已校验非空；COM 惯例：失败路径先置 null。
         unsafe { *ppv = std::ptr::null_mut() };
         if rclsid.is_null() || riid.is_null() {
             return E_POINTER;
         }
+        // SAFETY: rclsid 已校验非空，指向调用方传入的 CLSID。
         let clsid = unsafe { *rclsid };
         if clsid != CLSID_VirtualCameraFilter {
             return E_NOTIMPL; // CLASS_E_CLASSNOTAVAILABLE 语义
         }
         let factory: IClassFactory = FilterClassFactory.into();
+        // SAFETY: riid/ppv 已校验非空；query 写入 ppv 并 AddRef。
         unsafe { factory.query(riid, ppv) }
     }
 

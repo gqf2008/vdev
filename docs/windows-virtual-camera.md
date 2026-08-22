@@ -33,11 +33,13 @@ crates/vdev-camera-win (独立 workspace，不影响 macOS 主仓库)
     media_type.rs   AM_MEDIA_TYPE / VIDEOINFOHEADER 安全封装（CoTaskMem 分配/释放/深拷贝）
     filter.rs       VirtualCameraFilter（IBaseFilter/IMediaFilter/IPersist/IAMFilterMiscFlags）
     pin.rs          OutputPin（IPin 全 15 方法 + IAMStreamConfig + IKsPropertySet）
+    device.rs       视频捕获源枚举安全封装（ICreateDevEnum + IPropertyBag）
+    selftest.rs     进程内自测图安全封装（源 → NullRenderer）
     enum_pins.rs / enum_media_types.rs
     streaming.rs    推流线程（取最新帧 → 填 IMediaSample → IMemInputPin::Receive；
                      无帧回退棋盘格；生产者帧尺寸≠协商尺寸时最近邻缩放）
   camera.rs       面向宿主的高层安全 API：register/unregister/push_frame
-  main.rs         CLI：install / uninstall / selftest / push / list
+  main.rs         CLI：install / uninstall / selftest / push / list（纯业务层，零 unsafe）
 ```
 
 关键 COM 接口：
@@ -128,3 +130,5 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
 - 固定输出 RGB32（BGRA），3 档分辨率（1920x1080 / 1280x720 / 640x480）@ 30fps。
 - 推流端是简单棋盘格图案 + 共享帧通道；音频、多分辨率动态协商、配置 UI 等后续再做。
 - 仅 64 位（DLL 注册在 64 位视图；32 位进程如需使用需另行注册 WOW6432Node）。
+
+

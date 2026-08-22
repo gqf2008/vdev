@@ -169,6 +169,7 @@ impl IPin_Impl for OutputPin_Impl {
             Ok(i) => i,
             Err(_) => {
                 // 下游不支持内存输入 → 释放已协商连接（尽力而为）。
+                // SAFETY: peer 有效；Disconnect 撤销尚未正式提交的连接。
                 let _ = unsafe { peer.Disconnect() };
                 return Err(Error::from_hresult(VFW_E_CANNOT_CONNECT));
             }
