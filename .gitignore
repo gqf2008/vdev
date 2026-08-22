@@ -17,3 +17,4 @@ crates/vdev-display-win/target/
 
 crates/vdev-audio-win/target/
 crates/vdev-hid-win/target/
+crates/vdev-hid-win/kernel/target/
