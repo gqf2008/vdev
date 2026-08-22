@@ -55,8 +55,16 @@ cd crates/vdev-camera-win
 cargo build --release
 ```
 
-产物：`target\release\vdev_camera_win.dll`（过滤器 DLL）+ `target\release\vdev-camera-win.exe`（CLI）。
+产物：`target\release\vdev_camera_win.dll`（64 位过滤器 DLL）+ `vdev_camera_win32.dll`（32 位）+ `vdev-camera-win.exe`（CLI）。
 （crate 名 `vdev-camera-win` 的默认 lib target 名带下划线，DLL 就叫 `vdev_camera_win.dll`。）
+
+32 位 DLL 编译（32 位应用如 32 位 VLC 需要，走 WOW6432Node 视图）：
+
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo build --release --target i686-pc-windows-msvc
+Copy-Item target\i686-pc-windows-msvc\release\vdev_camera_win.dll target\release\vdev_camera_win32.dll
+```
 
 ## 安装 / 卸载
 
@@ -129,6 +137,7 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
 
 - 固定输出 RGB32（BGRA），3 档分辨率（1920x1080 / 1280x720 / 640x480）@ 30fps。
 - 推流端是简单棋盘格图案 + 共享帧通道；音频、多分辨率动态协商、配置 UI 等后续再做。
-- 仅 64 位（DLL 注册在 64 位视图；32 位进程如需使用需另行注册 WOW6432Node）。
+- 同时注册 64 位视图与 32 位视图（WOW6432Node）：32 位进程（如 32 位 VLC）通过 WOW64 重定向只能看到 WOW6432Node 视图，install 时若同目录存在 `vdev_camera_win32.dll` 会自动注册 32 位视图。
+
 
 

@@ -34,25 +34,42 @@ impl CameraServer {
 
 /// 注册过滤器到系统（CLSID + Video Capture Sources 类别）。
 ///
-/// 优先系统级（HKLM\Software\Classes，需管理员），失败自动回退到当前用户级
-/// （HKCU\Software\Classes，无需管理员，DirectShow 枚举同样可见）。
-/// 模块路径取「当前可执行文件同目录下的 filter DLL」。
+/// 同时注册 **64 位视图**（`Software\Classes`）与 **32 位视图**
+/// （`Software\Classes\WOW6432Node`）：32 位进程（如 32 位 VLC）通过 WOW64
+/// 重定向只能看到 WOW6432Node 视图，只注册 64 位视图时它们看不到设备。
+/// 32 位 DLL（`vdev_camera_win32.dll`）存在时才注册 32 位视图。
+///
+/// 优先系统级（HKLM，需管理员），失败自动回退到当前用户级（HKCU，无需管理员，
+/// HKCR 合并视图同样可见）。模块路径取「当前可执行文件同目录下的 filter DLL」。
 pub fn register_filter() -> Result<()> {
     let exe = module_file_path().context("get module path")?;
     let dir = Path::new(&exe)
         .parent()
         .ok_or_else(|| anyhow!("module path has no parent: {exe}"))?;
-    let dll = dir.join("vdev_camera_win.dll");
-    register_with_path(&dll.to_string_lossy())
+    let dll64 = dir.join("vdev_camera_win.dll");
+    register_arch(&dll64.to_string_lossy(), "Software\\Classes")?;
+
+    let dll32 = dir.join("vdev_camera_win32.dll");
+    if dll32.exists() {
+        log::info!("检测到 32 位 DLL，注册 32 位（WOW6432Node）视图");
+        register_arch(&dll32.to_string_lossy(), "Software\\Classes\\WOW6432Node")?;
+    } else {
+        log::warn!("未找到 vdev_camera_win32.dll，跳过 32 位注册（32 位应用将看不到）");
+    }
+    Ok(())
 }
 
 /// 注销过滤器（清理 HKLM 与 HKCU 两个根的注册）。
 pub fn unregister_filter() -> Result<()> {
     let clsid = guid_string(&CLSID_VirtualCameraFilter);
     let cat = guid_string(&CLSID_VideoInputDeviceCategory);
+    // 64 位视图（Software\Classes）与 32 位视图（Software\Classes\WOW6432Node）
+    // × HKLM/HKCU 两个根，全部清理。
     for (root, prefix) in [
         (HKEY_LOCAL_MACHINE, "Software\\Classes"),
         (HKEY_CURRENT_USER, "Software\\Classes"),
+        (HKEY_LOCAL_MACHINE, "Software\\Classes\\WOW6432Node"),
+        (HKEY_CURRENT_USER, "Software\\Classes\\WOW6432Node"),
     ] {
         let _ = delete_tree(root, &format!("{prefix}\\CLSID\\{cat}\\Instance\\{clsid}"));
         let _ = delete_tree(root, &format!("{prefix}\\CLSID\\{clsid}"));
@@ -60,18 +77,22 @@ pub fn unregister_filter() -> Result<()> {
     Ok(())
 }
 
-/// 用显式 DLL 路径注册。
+/// 用显式 DLL 路径注册（64 位视图；32 位视图见 [`register_filter`]）。
 pub fn register_with_path(dll_path: &str) -> Result<()> {
+    register_arch(dll_path, "Software\\Classes")
+}
+
+/// 把过滤器注册到指定注册表视图（`prefix` = `Software\Classes` 或
+/// `Software\Classes\WOW6432Node`）。先试系统级（HKLM，需管理员），失败
+/// 自动回退到当前用户级（HKCU，无需管理员，HKCR 合并视图同样可见）。
+fn register_arch(dll_path: &str, prefix: &str) -> Result<()> {
     let clsid = guid_string(&CLSID_VirtualCameraFilter);
     let cat = guid_string(&CLSID_VideoInputDeviceCategory);
 
     // 先试系统级，失败（通常是权限）再回退当前用户级。
     let mut last_err = None;
-    for (root, prefix) in [
-        (HKEY_LOCAL_MACHINE, "Software\\Classes"),
-        (HKEY_CURRENT_USER, "Software\\Classes"),
-    ] {
-        match write_registration(root, prefix, dll_path, &clsid, &cat) {
+    for (root, root_prefix) in [(HKEY_LOCAL_MACHINE, prefix), (HKEY_CURRENT_USER, prefix)] {
+        match write_registration(root, root_prefix, dll_path, &clsid, &cat) {
             Ok(()) => {
                 if root == HKEY_CURRENT_USER {
                     log::warn!("系统级注册失败，已注册到当前用户（HKCR 视图可见）");
