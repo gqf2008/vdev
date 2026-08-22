@@ -77,6 +77,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::Install { inf_dir } => {
+            ensure_elevated()?;
             let dir = inf_dir.unwrap_or_else(|| {
                 std::env::current_exe()
                     .ok()
@@ -86,6 +87,7 @@ fn main() -> Result<()> {
             install::install(&dir)?;
         }
         Command::Uninstall => {
+            ensure_elevated()?;
             install::uninstall()?;
         }
         Command::Status => {
@@ -260,4 +262,46 @@ fn print_monitors(monitors: &[Monitor], json: bool) {
             println!("  {}x{}@{}", mode.width, mode.height, rates);
         }
     }
+}
+
+/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后退出（返回 true 表示已提权重跑）。
+fn ensure_elevated() -> Result<()> {
+    // SAFETY: IsUserAnAdmin 只读当前令牌
+    if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("无法定位自身路径")?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let exe_wide: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let args_wide: Vec<u16> = args
+        .join(" ")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut sei = windows::Win32::UI::Shell::SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<windows::Win32::UI::Shell::SHELLEXECUTEINFOW>() as u32,
+        fMask: windows::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: windows::core::w!("runas"),
+        lpFile: windows::core::PCWSTR(exe_wide.as_ptr()),
+        lpParameters: windows::core::PCWSTR(args_wide.as_ptr()),
+        nShow: windows::Win32::UI::WindowsAndMessaging::SW_HIDE.0,
+        ..Default::default()
+    };
+
+    unsafe { windows::Win32::UI::Shell::ShellExecuteExW(&mut sei) }
+        .context("请求管理员权限失败（请以管理员身份重试）")?;
+
+    // 等待提权后的实例完成，再退出本进程
+    if !sei.hProcess.is_invalid() {
+        unsafe {
+            windows::Win32::System::Threading::WaitForSingleObject(sei.hProcess, u32::MAX);
+        }
+    }
+    std::process::exit(0);
 }
