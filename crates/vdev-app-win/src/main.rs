@@ -63,8 +63,7 @@ fn append_log(ui: &MainWindow, logs: &Logs, s: impl AsRef<str>) {
     if v.len() > 300 {
         v.remove(0);
     }
-    ui.global::<AppState>()
-        .set_log_text(v.join("\n").into());
+    ui.global::<AppState>().set_log_text(v.join("\n").into());
 }
 
 fn set_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
@@ -239,7 +238,9 @@ fn toggle_push(ui: &MainWindow, logs: &Logs) {
                     let start = std::time::Instant::now();
                     let mut count: u64 = 0;
                     while PUSH_RUNNING.load(Ordering::SeqCst) {
-                        vdev_camera_win::dshow::streaming::render_pattern(&mut buf, &format, &mut t);
+                        vdev_camera_win::dshow::streaming::render_pattern(
+                            &mut buf, &format, &mut t,
+                        );
                         if let Err(e) = server.push_frame(PUSH_WIDTH, PUSH_HEIGHT, &buf) {
                             if let Some(ui) = weak.upgrade() {
                                 append_log(&ui, &logs2, format!("推流失败: {e:#}"));
@@ -248,7 +249,8 @@ fn toggle_push(ui: &MainWindow, logs: &Logs) {
                         }
                         count += 1;
                         let next = start + interval * (count as u32);
-                        if let Some(remain) = next.checked_duration_since(std::time::Instant::now()) {
+                        if let Some(remain) = next.checked_duration_since(std::time::Instant::now())
+                        {
                             std::thread::sleep(remain);
                         }
                     }
