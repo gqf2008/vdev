@@ -1,0 +1,58 @@
+;
+; vdev-hid.inf — vdev 虚拟 HID（KMDF 内核 HID minidriver）
+;
+
+[Version]
+Signature="$Windows NT$"
+Class = HIDClass
+ClassGuid = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%ManufacturerName%
+CatalogFile=vdev-hid.cat
+DriverVer = 08/22/2026,0.1.0.0
+DriverPackageDisplayName=%DriverDisplayName%
+
+[DestinationDirs]
+DefaultDestDir = 12 ; DIRID_DRIVERS
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+vdev_hid.sys  = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=vdev_hid_Install, Root\vdev-hid
+
+; ================= Install =====================
+
+[vdev_hid_Install.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+vdev_hid.sys
+
+[vdev_hid_Install.NT.Services]
+AddService = vdev_hid, 0x00000002, vdev_hid_Service_Inst
+
+[vdev_hid_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\vdev_hid.sys
+
+[vdev_hid_Install.NT.Wdf]
+KmdfService = vdev_hid, vdev_hid_wdfsect
+
+[vdev_hid_wdfsect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ManufacturerName="vdev"
+DriverDisplayName="vdev HID Drivers"
+DiskName="vdev HID Installation Disk"
+DeviceName="vdev 虚拟键盘"
+ServiceDesc="vdev HID Service"
