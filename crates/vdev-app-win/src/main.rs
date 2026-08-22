@@ -47,6 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wire_ui(&ui, &logs);
     refresh_status(&ui, &logs);
     refresh_display_status(&ui, &logs);
+    refresh_audio_status(&ui, &logs);
+    refresh_hid_status(&ui, &logs);
 
     ui.run()?;
     // 退出时确保推流线程停止。
@@ -162,6 +164,18 @@ fn run_camera_cli(args: &[&str], ui: &MainWindow, logs: &Logs) {
     }
 }
 
+/// vdev-audio-win CLI 输出 JSON 的解析结构
+#[derive(serde::Deserialize)]
+struct AudioStatusOut {
+    present: bool,
+}
+
+/// vdev-hid-win CLI 输出 JSON 的解析结构
+#[derive(serde::Deserialize)]
+struct HidStatusOut {
+    present: bool,
+}
+
 /// vdev-display-win CLI 输出 JSON 的解析结构
 #[derive(serde::Deserialize)]
 struct DisplayStatusOut {
@@ -211,7 +225,226 @@ fn display_cli() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.exists())
 }
 
+/// 定位 vdev-audio-win CLI：环境变量 VDEV_AUDIO_WIN_EXE 优先，其次
+/// 同目录 / 开发布局（../vdev-audio-win/target/x86_64-pc-windows-msvc/release）。
+fn audio_cli() -> Option<PathBuf> {
+    let mut cands = Vec::new();
+    if let Ok(p) = std::env::var("VDEV_AUDIO_WIN_EXE") {
+        cands.push(PathBuf::from(p));
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            cands.push(dir.join("vdev-audio-win.exe"));
+            cands.push(
+                dir.join("..")
+                    .join("..")
+                    .join("..")
+                    .join("vdev-audio-win")
+                    .join("target")
+                    .join("x86_64-pc-windows-msvc")
+                    .join("release")
+                    .join("vdev-audio-win.exe"),
+            );
+        }
+    }
+    cands.into_iter().find(|p| p.exists())
+}
+
+fn run_audio_cli(args: &[&str], ui: &MainWindow, logs: &Logs) {
+    match audio_cli() {
+        Some(exe) => match Command::new(&exe).args(args).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    append_log(ui, logs, format!("✅ {}", stdout.trim()));
+                } else {
+                    append_log(ui, logs, format!("❌ CLI 失败: {}", stderr.trim()));
+                }
+            }
+            Err(e) => append_log(ui, logs, format!("❌ 调用 CLI 失败: {e}")),
+        },
+        None => append_log(
+            ui,
+            logs,
+            "❌ 未找到 vdev-audio-win.exe（设置 VDEV_AUDIO_WIN_EXE 或放到 GUI 同目录）",
+        ),
+    }
+}
+
+fn set_audio_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
+    let g = ui.global::<AppState>();
+    g.set_audio_glyph(glyph.into());
+    g.set_audio_title(title.into());
+    g.set_audio_detail(detail.into());
+}
+
+/// 刷新声卡状态：跑 vdev-audio-win --json status 并解析
+fn refresh_audio_status(ui: &MainWindow, logs: &Logs) {
+    append_log(ui, logs, "刷新声卡状态…");
+    let Some(exe) = audio_cli() else {
+        set_audio_status(
+            ui,
+            "!",
+            "未找到 vdev-audio-win",
+            "请把 vdev-audio-win.exe 放到 GUI 同目录，或设置 VDEV_AUDIO_WIN_EXE。",
+        );
+        return;
+    };
+    let out = Command::new(&exe).args(["--json", "status"]).output();
+    let Ok(out) = out else {
+        set_audio_status(
+            ui,
+            "!",
+            "状态查询失败",
+            "无法运行 vdev-audio-win --json status。",
+        );
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        set_audio_status(ui, "!", "状态解析失败", "CLI 输出非 UTF-8。");
+        return;
+    };
+    let Ok(st) = serde_json::from_str::<AudioStatusOut>(text) else {
+        set_audio_status(ui, "!", "状态解析失败", "无法解析 vdev-audio-win 输出。");
+        return;
+    };
+
+    let g = ui.global::<AppState>();
+    if st.present {
+        set_audio_status(
+            ui,
+            "✓",
+            "已安装，虚拟声卡可用",
+            "控制面板应出现「vdev 扬声器」与「vdev 麦克风」；播放到扬声器的声音会被麦克风录制。",
+        );
+        g.set_audio_can_install(false);
+        g.set_audio_can_uninstall(true);
+        append_log(ui, logs, "✅ 检测到 vdev 虚拟声卡设备");
+    } else {
+        set_audio_status(
+            ui,
+            "○",
+            "虚拟声卡未安装",
+            "点击「安装虚拟声卡」安装 PortCls 内核驱动（需管理员与测试签名，会请求管理员权限）。",
+        );
+        g.set_audio_can_install(true);
+        g.set_audio_can_uninstall(false);
+        append_log(ui, logs, "未检测到 vdev 虚拟声卡（先安装）");
+    }
+}
+
 /// 找到包含 vdev-display.inf 的目录（安装时 --inf-dir）：开发布局 target/dist 或 CLI 同目录。
+/// 找到 vdev-hid-win.exe（与声卡 CLI 同目录或开发布局）
+fn hid_cli() -> Option<PathBuf> {
+    let mut cands = Vec::new();
+    if let Ok(p) = std::env::var("VDEV_HID_WIN_EXE") {
+        cands.push(PathBuf::from(p));
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            cands.push(dir.join("vdev-hid-win.exe"));
+            cands.push(
+                dir.join("..")
+                    .join("..")
+                    .join("..")
+                    .join("vdev-hid-win")
+                    .join("target")
+                    .join("x86_64-pc-windows-msvc")
+                    .join("release")
+                    .join("vdev-hid-win.exe"),
+            );
+        }
+    }
+    cands.into_iter().find(|p| p.exists())
+}
+
+fn run_hid_cli(args: &[&str], ui: &MainWindow, logs: &Logs) {
+    match hid_cli() {
+        Some(exe) => match Command::new(&exe).args(args).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    append_log(ui, logs, format!("✅ {}", stdout.trim()));
+                } else {
+                    append_log(ui, logs, format!("❌ CLI 失败: {}", stderr.trim()));
+                }
+            }
+            Err(e) => append_log(ui, logs, format!("❌ 调用 CLI 失败: {e}")),
+        },
+        None => append_log(
+            ui,
+            logs,
+            "❌ 未找到 vdev-hid-win.exe（设置 VDEV_HID_WIN_EXE 或放到 GUI 同目录）",
+        ),
+    }
+}
+
+fn set_hid_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
+    let g = ui.global::<AppState>();
+    g.set_hid_glyph(glyph.into());
+    g.set_hid_title(title.into());
+    g.set_hid_detail(detail.into());
+}
+
+/// 刷新 HID 键盘状态：跑 vdev-hid-win --json kernel status 并解析
+fn refresh_hid_status(ui: &MainWindow, logs: &Logs) {
+    append_log(ui, logs, "刷新 HID 键盘状态…");
+    let Some(exe) = hid_cli() else {
+        set_hid_status(
+            ui,
+            "!",
+            "未找到 vdev-hid-win",
+            "请把 vdev-hid-win.exe 放到 GUI 同目录，或设置 VDEV_HID_WIN_EXE。",
+        );
+        return;
+    };
+    let out = Command::new(&exe)
+        .args(["--json", "kernel", "status"])
+        .output();
+    let Ok(out) = out else {
+        set_hid_status(
+            ui,
+            "!",
+            "状态查询失败",
+            "无法运行 vdev-hid-win --json kernel status。",
+        );
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        set_hid_status(ui, "!", "状态解析失败", "CLI 输出非 UTF-8。");
+        return;
+    };
+    let Ok(st) = serde_json::from_str::<HidStatusOut>(text) else {
+        set_hid_status(ui, "!", "状态解析失败", "无法解析 vdev-hid-win 输出。");
+        return;
+    };
+
+    let g = ui.global::<AppState>();
+    if st.present {
+        set_hid_status(
+            ui,
+            "✓",
+            "已安装，虚拟键盘可用",
+            "设备管理器 HID 类应出现「vdev 虚拟键盘」；可注入按键（经内核驱动报告）。",
+        );
+        g.set_hid_can_install(false);
+        g.set_hid_can_uninstall(true);
+        append_log(ui, logs, "✅ 检测到 vdev 虚拟键盘设备");
+    } else {
+        set_hid_status(
+            ui,
+            "○",
+            "虚拟键盘未安装",
+            "点击「安装虚拟键盘」安装 KMDF 内核 HID 驱动（需管理员与测试签名，会请求管理员权限）。",
+        );
+        g.set_hid_can_install(true);
+        g.set_hid_can_uninstall(false);
+        append_log(ui, logs, "未检测到 vdev 虚拟键盘（先安装）");
+    }
+}
+
 fn display_inf_dir(cli: &Path) -> PathBuf {
     let mut cands = Vec::new();
     if let Some(dir) = cli.parent() {
@@ -437,6 +670,38 @@ fn wire_ui(ui: &MainWindow, logs: &Logs) {
             refresh_display_status(&ui, &logs);
         });
     }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_audio_install(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(
+                &ui,
+                &logs,
+                "安装虚拟声卡…（委托 vdev-audio-win CLI，将请求管理员权限）",
+            );
+            run_audio_cli(&["install"], &ui, &logs);
+            refresh_audio_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_audio_uninstall(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, "卸载虚拟声卡…（将请求管理员权限）");
+            run_audio_cli(&["uninstall"], &ui, &logs);
+            refresh_audio_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_audio_refresh(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            refresh_audio_status(&ui, &logs);
+        });
+    }
 }
 
 /// 推流开关：点击「开始推流 / 停止推流」切换。
@@ -508,5 +773,74 @@ fn toggle_push(ui: &MainWindow, logs: &Logs) {
             *PUSH_THREAD.lock().unwrap() = Some(handle);
         }
         Err(e) => append_log(ui, logs, format!("打开推流通道失败: {e:#}")),
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_install(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(
+                &ui,
+                &logs,
+                "安装虚拟键盘…（委托 vdev-hid-win CLI，将请求管理员权限）",
+            );
+            run_hid_cli(&["kernel", "install"], &ui, &logs);
+            refresh_hid_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_uninstall(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, "卸载虚拟键盘…（将请求管理员权限）");
+            run_hid_cli(&["kernel", "uninstall"], &ui, &logs);
+            refresh_hid_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_refresh(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            refresh_hid_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_key(move |key| {
+            let Some(ui) = weak.upgrade() else { return };
+            let key: String = key.trim().to_string();
+            if key.is_empty() {
+                append_log(&ui, &logs, "⚠️ 键名为空");
+                return;
+            }
+            append_log(&ui, &logs, format!("注入按键：{key}"));
+            run_hid_cli(&["kernel", "key", &key], &ui, &logs);
+            {
+                let weak = ui.as_weak();
+                let logs = logs.clone();
+                ui.on_hid_mouse_click(move |button| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    let button: String = button.trim().to_string();
+                    append_log(&ui, &logs, format!("注入鼠标点击：{button}"));
+                    run_hid_cli(&["kernel", "mouse", "click", &button], &ui, &logs);
+                });
+            }
+            {
+                let weak = ui.as_weak();
+                let logs = logs.clone();
+                ui.on_hid_mouse_move(move |dx, dy| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    append_log(&ui, &logs, format!("注入鼠标相对移动（{dx},{dy}）"));
+                    run_hid_cli(
+                        &["kernel", "mouse", "move", &dx.to_string(), &dy.to_string()],
+                        &ui,
+                        &logs,
+                    );
+                });
+            }
+        });
     }
 }

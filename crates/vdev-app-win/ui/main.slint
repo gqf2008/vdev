@@ -21,6 +21,19 @@ export global AppState {
     in-out property <bool> disp_can_uninstall: false;
     in-out property <bool> disp_can_add: false;
     in-out property <string> disp_monitors_text: "暂无虚拟显示器";
+    // 声卡
+    in-out property <string> audio_glyph: "○";
+    in-out property <string> audio_title: "虚拟声卡未安装";
+    in-out property <string> audio_detail: "点击「安装虚拟声卡」安装 PortCls 内核驱动（需管理员，先开测试签名）。";
+    in-out property <bool> audio_can_install: true;
+    in-out property <bool> audio_can_uninstall: false;
+    // HID 键盘
+    in-out property <string> hid_glyph: "○";
+    in-out property <string> hid_title: "虚拟键盘未安装";
+    in-out property <string> hid_detail: "点击「安装虚拟键盘」安装 KMDF 内核 HID 驱动（需管理员与测试签名）。";
+    in-out property <bool> hid_can_install: true;
+    in-out property <bool> hid_can_uninstall: false;
+    in-out property <string> hid_key: "a";
     // 共享日志
     in-out property <string> log_text: "";
 }
@@ -43,6 +56,15 @@ export component MainWindow inherits Window {
     callback display-refresh();
     callback display-add();
     callback display-remove-all();
+    callback audio-install();
+    callback audio-uninstall();
+    callback audio-refresh();
+    callback hid-install();
+    callback hid-uninstall();
+    callback hid-refresh();
+    callback hid-key(string);
+    callback hid-mouse-click(string);
+    callback hid-mouse-move(int, int);
     callback drag-start();
     callback minimize();
     callback toggle-maximize();
@@ -70,6 +92,11 @@ export component MainWindow inherits Window {
                 text: "虚拟显示器";
                 background: AppState.current_tab == 1 ? PixelTheme.accent : PixelTheme.bg;
                 clicked => { AppState.current_tab = 1; }
+            }
+            PixelButton {
+                text: "虚拟声卡";
+                background: AppState.current_tab == 2 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 2; }
             }
         }
 
@@ -135,6 +162,66 @@ export component MainWindow inherits Window {
             }
         }
 
+        // ============ Tab 2: 虚拟声卡 ============
+        if AppState.current_tab == 2 : VerticalLayout {
+            spacing: 8px;
+            PixelPanel {
+                title: "状态";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PixelText { text: AppState.audio_glyph; font-size: 18px; }
+                        PixelText { text: AppState.audio_title; font-weight: 700; }
+                    }
+                    PixelText { text: AppState.audio_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "安装虚拟声卡"; enabled: AppState.audio_can_install; clicked => { audio-install(); } }
+                PixelButton { text: "卸载虚拟声卡"; enabled: AppState.audio_can_uninstall; clicked => { audio-uninstall(); } }
+                PixelButton { text: "刷新状态"; clicked => { audio-refresh(); } }
+            }
+        }
+
+        // ============ Tab 3: 虚拟键盘（内核 HID） ============
+        if AppState.current_tab == 3 : VerticalLayout {
+            spacing: 8px;
+            PixelPanel {
+                title: "状态";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PixelText { text: AppState.hid_glyph; font-size: 18px; }
+                        PixelText { text: AppState.hid_title; font-weight: 700; }
+                    }
+                    PixelText { text: AppState.hid_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "安装虚拟键盘"; enabled: AppState.hid_can_install; clicked => { hid-install(); } }
+                PixelButton { text: "卸载虚拟键盘"; enabled: AppState.hid_can_uninstall; clicked => { hid-uninstall(); } }
+                PixelButton { text: "刷新状态"; clicked => { hid-refresh(); } }
+            }
+            PixelPanel {
+                title: "测试注入";
+                VerticalLayout {
+                    spacing: 8px;
+                    TextInput {
+                        text <=> AppState.hid_key;
+                        font-size: 14px;
+                    }
+                    PixelButton { text: "注入按键"; clicked => { hid-key(AppState.hid_key); } }
+                    HorizontalLayout { spacing: 8px;
+                        PixelButton { text: "鼠标左键"; clicked => { hid-mouse-click("left"); } }
+                        PixelButton { text: "鼠标右键"; clicked => { hid-mouse-click("right"); } }
+                        PixelButton { text: "鼠标右移20"; clicked => { hid-mouse-move(20, 0); } }
+                    }
+                }
+            }
+        }
+
         ScrollView {
             height: 140px;
             Text {
@@ -145,3 +232,5 @@ export component MainWindow inherits Window {
         }
     }
 }
+
+

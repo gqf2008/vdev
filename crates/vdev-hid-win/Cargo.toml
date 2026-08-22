@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "vdev-hid-win"
+version = "0.1.0"
+edition = "2024"
+description = "vdev 虚拟 HID（Windows）：SendInput 键盘/鼠标事件注入 + CLI"
+
+[[bin]]
+name = "vdev-hid-win"
+path = "src/main.rs"
+
+[lib]
+name = "vdev_hid_win"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.5.21", features = ["derive"] }
+anyhow = "1.0.93"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+]
+
