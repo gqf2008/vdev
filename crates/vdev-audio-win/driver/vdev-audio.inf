@@ -1,121 +1,121 @@
-﻿;
-; vdev-audio.inf — vdev 虚拟声卡（PortCls 内核驱动，无 WDF）
-;
-
-[Version]
-Signature="$WINDOWS NT$"
-Class = MEDIA
-ClassGuid = {4d36e96c-e325-11ce-bfc1-08002be10318}
-Provider=%ManufacturerName%
-CatalogFile=vdev-audio.cat
-DriverVer = 08/22/2026,0.1.0.0
-DriverPackageDisplayName=%DriverDisplayName%
-
-[DestinationDirs]
-DefaultDestDir = 12 ; DIRID_DRIVERS
-
-[SourceDisksNames]
-1 = %DiskName%,,,""
-
-[SourceDisksFiles]
-vdev_audio.sys  = 1,,
-
-[Manufacturer]
-%ManufacturerName%=Standard,NTamd64
-
-[Standard.NTamd64]
-%DeviceName%=vdev_audio_Install, Root\vdev-audio
-
-; ================= Install =====================
-
-[vdev_audio_Install.NT]
-Include=ks.inf,wdmaudio.inf
-Needs=KS.Registration, WDMAUDIO.Registration
-CopyFiles=Drivers_Dir
-
-[Drivers_Dir]
-vdev_audio.sys
-
-[vdev_audio_Install.NT.Services]
-AddService = vdev_audio, 0x00000002, vdev_audio_Service_Inst
-
-[vdev_audio_Service_Inst]
-DisplayName    = %ServiceDesc%
-ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 3               ; SERVICE_DEMAND_START
-ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary  = %12%\vdev_audio.sys
-
-; ================= 端点接口模板 =====================
-
-; Capture
-[vdev_audio.Interface.WaveCaptureTemplate]
-AddReg=vdev_audio.Interface.WaveCaptureTemplate.AddReg
-[vdev_audio.Interface.WaveCaptureTemplate.AddReg]
-HKR,,CLSID,,%KSProxy.CLSID%
-HKR,,FriendlyName,,%WaveCapture.FriendlyName%
-
-[vdev_audio.Interface.TopologyCaptureTemplate]
-AddReg=vdev_audio.Interface.TopologyCaptureTemplate.AddReg
-[vdev_audio.Interface.TopologyCaptureTemplate.AddReg]
-HKR,,CLSID,,%KSProxy.CLSID%
-HKR,,FriendlyName,,%TopologyCapture.FriendlyName%
-HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
-HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
-
-; Render
-[vdev_audio.Interface.WaveRenderTemplate]
-AddReg=vdev_audio.Interface.WaveRenderTemplate.AddReg
-[vdev_audio.Interface.WaveRenderTemplate.AddReg]
-HKR,,CLSID,,%KSProxy.CLSID%
-HKR,,FriendlyName,,%WaveRender.FriendlyName%
-
-[vdev_audio.Interface.TopologyRenderTemplate]
-AddReg=vdev_audio.Interface.TopologyRenderTemplate.AddReg
-[vdev_audio.Interface.TopologyRenderTemplate.AddReg]
-HKR,,CLSID,,%KSProxy.CLSID%
-HKR,,FriendlyName,,%TopologyRender.FriendlyName%
-HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
-HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
-
-[vdev_audio_Install.NT.Interfaces]
-; Capture
-AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
-AddInterface=%KSCATEGORY_REALTIME%, %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
-AddInterface=%KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
-AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_TopologyCapture%, vdev_audio.Interface.TopologyCaptureTemplate
-AddInterface=%KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyCapture%, vdev_audio.Interface.TopologyCaptureTemplate
-; Render
-AddInterface=%KSCATEGORY_AUDIO%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
-AddInterface=%KSCATEGORY_RENDER%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
-AddInterface=%KSCATEGORY_REALTIME%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
-AddInterface=%KSCATEGORY_AUDIO%, %KSNAME_TopologyRender%, vdev_audio.Interface.TopologyRenderTemplate
-AddInterface=%KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyRender%, vdev_audio.Interface.TopologyRenderTemplate
-
-[Strings]
-ManufacturerName="vdev"
-DriverDisplayName="vdev Audio Drivers"
-DiskName="vdev Audio Installation Disk"
-DeviceName="vdev 虚拟声卡"
-ServiceDesc="vdev Audio Service"
-
-WaveCapture.FriendlyName="vdev 麦克风"
-TopologyCapture.FriendlyName="vdev 拓扑输入"
-WaveRender.FriendlyName="vdev 扬声器"
-TopologyRender.FriendlyName="vdev 拓扑输出"
-
-; non-localizable
-KSNAME_WaveCapture="WaveCaptureTemplate"
-KSNAME_TopologyCapture="TopologyCaptureTemplate"
-KSNAME_WaveRender="WaveRenderTemplate"
-KSNAME_TopologyRender="TopologyRenderTemplate"
-
-KSNODETYPE_ANY   = "{00000000-0000-0000-0000-000000000000}"
-KSProxy.CLSID="17CCA71B-ECD7-11D0-B908-00A0C9223196"
-KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
-KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
-KSCATEGORY_CAPTURE="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
-KSCATEGORY_REALTIME ="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
-KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
-PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
-PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
+﻿﻿;
+; vdev-audio.inf — vdev 虚拟声卡（PortCls 内核驱动，无 WDF）
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class = MEDIA
+ClassGuid = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=vdev-audio.cat
+DriverVer = 08/22/2026,0.1.0.0
+DriverPackageDisplayName=%DriverDisplayName%
+
+[DestinationDirs]
+DefaultDestDir = 12 ; DIRID_DRIVERS
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+vdev_audio.sys  = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName%=vdev_audio_Install, Root\vdev-audio
+
+; ================= Install =====================
+
+[vdev_audio_Install.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration, WDMAUDIO.Registration
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+vdev_audio.sys
+
+[vdev_audio_Install.NT.Services]
+AddService = vdev_audio, 0x00000002, vdev_audio_Service_Inst
+
+[vdev_audio_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\vdev_audio.sys
+
+; ================= 端点接口模板 =====================
+
+; Capture
+[vdev_audio.Interface.WaveCaptureTemplate]
+AddReg=vdev_audio.Interface.WaveCaptureTemplate.AddReg
+[vdev_audio.Interface.WaveCaptureTemplate.AddReg]
+HKR,,CLSID,,%KSProxy.CLSID%
+HKR,,FriendlyName,,%WaveCapture.FriendlyName%
+
+[vdev_audio.Interface.TopologyCaptureTemplate]
+AddReg=vdev_audio.Interface.TopologyCaptureTemplate.AddReg
+[vdev_audio.Interface.TopologyCaptureTemplate.AddReg]
+HKR,,CLSID,,%KSProxy.CLSID%
+HKR,,FriendlyName,,%TopologyCapture.FriendlyName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+; Render
+[vdev_audio.Interface.WaveRenderTemplate]
+AddReg=vdev_audio.Interface.WaveRenderTemplate.AddReg
+[vdev_audio.Interface.WaveRenderTemplate.AddReg]
+HKR,,CLSID,,%KSProxy.CLSID%
+HKR,,FriendlyName,,%WaveRender.FriendlyName%
+
+[vdev_audio.Interface.TopologyRenderTemplate]
+AddReg=vdev_audio.Interface.TopologyRenderTemplate.AddReg
+[vdev_audio.Interface.TopologyRenderTemplate.AddReg]
+HKR,,CLSID,,%KSProxy.CLSID%
+HKR,,FriendlyName,,%TopologyRender.FriendlyName%
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[vdev_audio_Install.NT.Interfaces]
+; Capture
+AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
+AddInterface=%KSCATEGORY_REALTIME%, %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
+AddInterface=%KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture%, vdev_audio.Interface.WaveCaptureTemplate
+AddInterface=%KSCATEGORY_AUDIO%,    %KSNAME_TopologyCapture%, vdev_audio.Interface.TopologyCaptureTemplate
+AddInterface=%KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyCapture%, vdev_audio.Interface.TopologyCaptureTemplate
+; Render
+AddInterface=%KSCATEGORY_AUDIO%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
+AddInterface=%KSCATEGORY_RENDER%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
+AddInterface=%KSCATEGORY_REALTIME%, %KSNAME_WaveRender%, vdev_audio.Interface.WaveRenderTemplate
+AddInterface=%KSCATEGORY_AUDIO%, %KSNAME_TopologyRender%, vdev_audio.Interface.TopologyRenderTemplate
+AddInterface=%KSCATEGORY_TOPOLOGY%, %KSNAME_TopologyRender%, vdev_audio.Interface.TopologyRenderTemplate
+
+[Strings]
+ManufacturerName="vdev"
+DriverDisplayName="vdev Audio Drivers"
+DiskName="vdev Audio Installation Disk"
+DeviceName="vdev 虚拟声卡"
+ServiceDesc="vdev Audio Service"
+
+WaveCapture.FriendlyName="vdev 麦克风"
+TopologyCapture.FriendlyName="vdev 拓扑输入"
+WaveRender.FriendlyName="vdev 扬声器"
+TopologyRender.FriendlyName="vdev 拓扑输出"
+
+; non-localizable
+KSNAME_WaveCapture="WaveCapture-0"
+KSNAME_TopologyCapture="TopologyCapture-0"
+KSNAME_WaveRender="WaveRender-0"
+KSNAME_TopologyRender="TopologyRender-0"
+
+KSNODETYPE_ANY   = "{00000000-0000-0000-0000-000000000000}"
+KSProxy.CLSID="17CCA71B-ECD7-11D0-B908-00A0C9223196"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE="{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME ="{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"

@@ -254,3 +254,26 @@ unsafe impl Sync for PCNODE_DESCRIPTOR {}
 unsafe impl Sync for PCCONNECTION_DESCRIPTOR {}
 unsafe impl Sync for KSPIN_MEDIUM {}
 unsafe impl Sync for KSPIN_INTERFACE {}
+
+// ---- KS 音频数据范围与常量 ----
+#[repr(C)]
+pub struct KSDATARANGE_AUDIO {
+    pub DataRange: KSDATARANGE,
+    pub MaximumChannels: u32,
+    pub MinimumBitsPerSample: u32,
+    pub MaximumBitsPerSample: u32,
+    pub MinimumSampleFrequency: u32,
+    pub MaximumSampleFrequency: u32,
+}
+
+// KSPIN_COMMUNICATION
+pub const KSPIN_COMMUNICATION_NONE: u32 = 0;
+pub const KSPIN_COMMUNICATION_SINK: u32 = 1;
+pub const KSPIN_COMMUNICATION_SOURCE: u32 = 2;
+pub const KSPIN_COMMUNICATION_BOTH: u32 = 3;
+pub const KSPIN_COMMUNICATION_BRIDGE: u32 = 4;
+
+// KSINTERFACE_STANDARD
+pub const KSINTERFACE_STANDARD_STREAMING: u32 = 0;
+// KSMEDIUM 任意实例
+pub const KSMEDIUM_TYPE_ANYINSTANCE: u32 = 0;

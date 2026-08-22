@@ -178,13 +178,7 @@ unsafe extern "system" fn adapter_set_etw_helper(_this: PVOID, _helper: PVOID) {
 
 unsafe extern "system" fn adapter_cleanup(this: PVOID) {
     let this = this as *mut AdapterCommon;
-    // SAFETY: 释放子设备引用
-    if !(*this).mic_port.is_null() {
-        crate::com::release_unknown((*this).mic_port);
-    }
-    if !(*this).speaker_port.is_null() {
-        crate::com::release_unknown((*this).speaker_port);
-    }
+    // SAFETY: 释放驱动持有的 miniport 引用（port 由 PortCls 持有，不在此释放）
     if !(*this).mic.is_null() {
         crate::miniport::miniport_release((*this).mic.cast());
     }
@@ -250,17 +244,20 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
     if st < 0 {
         return st;
     }
-    // 2) 创建 MiniportWaveRT
+    // 2) 创建 MiniportWaveRT（refcount=1，PcNewPort 的返回值所有权归驱动）
     let miniport = MiniportWaveRT::create(
         adapter as *mut AdapterCommon as PVOID,
         adapter.device_object,
         capture,
     );
     if miniport.is_null() {
-        // SAFETY: 释放 port
+        // SAFETY: 释放驱动持有的 port 引用
         crate::com::release_unknown(port);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    // 驱动保留自己的 miniport 引用（供 cleanup/release 使用；port->Init 会另加引用）
+    // SAFETY: miniport 有效
+    crate::miniport::miniport_addref(miniport.cast());
     // 3) port->Init(DeviceObject, Irp, miniport, adapter, ResourceList)
     let init_fn = port_iport_init(port);
     let st = init_fn(
@@ -272,6 +269,7 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
         core::ptr::null_mut(),
     );
     if st < 0 {
+        // SAFETY: 释放驱动持有的 port 与 miniport 引用
         crate::com::release_unknown(port);
         crate::miniport::miniport_release(miniport.cast());
         return st;
@@ -291,10 +289,14 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
     };
     let st = PcRegisterSubdevice(adapter.device_object, name_wide.as_ptr(), port);
     if st < 0 {
+        // SAFETY: PcRegisterSubdevice 失败则 port 未接管；释放驱动持有的两份引用
         crate::com::release_unknown(port);
         crate::miniport::miniport_release(miniport.cast());
         return st;
     }
+    // PcRegisterSubdevice 成功后 PortCls 持有 port 引用；释放驱动那份 PcNewPort 引用
+    // SAFETY: port 仍有效（PortCls 持有）
+    crate::com::release_unknown(port);
     // 注册 KSCATEGORY_AUDIO 设备接口（控制面板音频端点可见）
     // SAFETY: pdo 有效；reference 为局部宽字符串，符号链接输出可丢弃
     let pdo = adapter.physical_device_object;
@@ -308,7 +310,11 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
         MaximumLength: (name_wide.len() * 2) as u16,
         Buffer: name_wide.as_ptr() as PWSTR,
     };
-    IoRegisterDeviceInterface(pdo, &KSCATEGORY_AUDIO, &mut ref_us, &mut symbolic);
+    let st = IoRegisterDeviceInterface(pdo, &KSCATEGORY_AUDIO, &mut ref_us, &mut symbolic);
+    if st >= 0 && !symbolic.Buffer.is_null() {
+        // SAFETY: 释放内核分配的符号链接缓冲
+        RtlFreeUnicodeString(&mut symbolic);
+    }
     if capture {
         adapter.mic = miniport;
         adapter.mic_port = port;

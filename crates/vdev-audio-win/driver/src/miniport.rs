@@ -177,6 +177,10 @@ unsafe extern "system" fn stream_set_state(this: PVOID, state: KSSTATE) -> NTSTA
     let this = this as *mut WaveRTStream;
     // SAFETY: 原子写状态
     (*this).state = state;
+    // 停止/重置时复位位置（WaveRT 从 STOP 重新运行需从头开始）
+    if state == KSSTATE::KSSTATE_STOP || state == KSSTATE::KSSTATE_ACQUIRE {
+        (*this).position = 0;
+    }
     STATUS_SUCCESS
 }
 
@@ -185,7 +189,33 @@ unsafe extern "system" fn stream_get_position(
     position: *mut KSAUDIO_POSITION,
 ) -> NTSTATUS {
     let this = this as *mut WaveRTStream;
-    // SAFETY: position 为有效输出
+    // SAFETY: position 为有效输出；miniport/ring/dma 均已初始化
+    let ps = &*(this as *const WaveRTStream);
+    let state = ps.state;
+    let ring = (*ps.miniport).ring;
+    let dma = ps.dma_buffer;
+    let dma_size = ps.dma_size as usize;
+    let align = usize::from(ps.block_align).max(1);
+    if state == KSSTATE::KSSTATE_RUN && !dma.is_null() && !ring.is_null() && dma_size >= align {
+        if ps.capture {
+            // capture：从共享环读出 PCM 填入 DMA 缓冲（引擎读取）
+            let n = dma_size - (dma_size % align);
+            // SAFETY: dma 有效且长度为 n
+            let dst = core::slice::from_raw_parts_mut(dma, n);
+            let read = (*ring).read(dst);
+            // SAFETY: 单读者推进位置
+            (*this).position = (*this).position.wrapping_add(read as u64);
+        } else {
+            // render：把引擎写入 DMA 缓冲的 PCM 数据拷入共享环（帧对齐）
+            let n = dma_size - (dma_size % align);
+            // SAFETY: dma 有效且长度为 n
+            let src = core::slice::from_raw_parts(dma, n);
+            let written = (*ring).write(src);
+            // SAFETY: 单写者推进位置
+            (*this).position = (*this).position.wrapping_add(written as u64);
+        }
+    }
+    // SAFETY: position 输出
     (*position).PlayOffset = (*this).position;
     (*position).WriteOffset = (*this).position;
     STATUS_SUCCESS
@@ -373,7 +403,7 @@ unsafe extern "system" fn miniport_qi(
     }
 }
 
-unsafe extern "system" fn miniport_addref(this: PVOID) -> u32 {
+pub unsafe extern "system" fn miniport_addref(this: PVOID) -> u32 {
     // SAFETY: this 指向小端口
     interlocked_increment(core::ptr::addr_of_mut!(
         (*(this as *mut MiniportWaveRT)).refcount
@@ -395,9 +425,14 @@ unsafe extern "system" fn miniport_get_description(
     this: PVOID,
     desc: PPCFILTER_DESCRIPTOR,
 ) -> NTSTATUS {
-    // SAFETY: 输出指针有效；返回静态描述符
-    *desc = &FILTER_DESC as *const PCFILTER_DESCRIPTOR as *mut PCFILTER_DESCRIPTOR;
-    let _ = this;
+    // SAFETY: 输出指针有效；返回静态描述符（capture=SOURCE / render=SINK）
+    let this = this as *mut MiniportWaveRT;
+    // SAFETY: this 有效
+    if (*this).capture {
+        *desc = &FILTER_DESC_CAPTURE as *const PCFILTER_DESCRIPTOR as *mut PCFILTER_DESCRIPTOR;
+    } else {
+        *desc = &FILTER_DESC_RENDER as *const PCFILTER_DESCRIPTOR as *mut PCFILTER_DESCRIPTOR;
+    }
     STATUS_SUCCESS
 }
 
@@ -526,7 +561,7 @@ static WAVERT_VTABLE: IMiniportWaveRTVtbl = IMiniportWaveRTVtbl {
     get_device_description: miniport_get_device_description,
 };
 
-// ============ 过滤器描述符（单 Pin） ============
+// ============ 过滤器描述符（每端点：render=SINK / capture=SOURCE） ============
 
 static KSDATAFORMAT_TYPE_AUDIO: GUID = GUID {
     data1: 0x0000_000f,
@@ -546,55 +581,131 @@ static KSDATAFORMAT_SPECIFIER_WAVEFORMATEX: GUID = GUID {
     data3: 0x11ce,
     data4: [0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
 };
+static KSINTERFACESETID_STANDARD: GUID = GUID {
+    data1: 0x1a87_66a0,
+    data2: 0x62ce,
+    data3: 0x11cf,
+    data4: [0xa5, 0xd6, 0x28, 0xdb, 0x04, 0xc1, 0x00, 0x00],
+};
+static KSMEDIUMSETID_STANDARD: GUID = GUID {
+    data1: 0x4747_b320,
+    data2: 0x62ce,
+    data3: 0x11cf,
+    data4: [0xa5, 0xd6, 0x28, 0xdb, 0x04, 0xc1, 0x00, 0x00],
+};
 
-static PINS: [PCPIN_DESCRIPTOR; 1] = [PCPIN_DESCRIPTOR {
+/// PCM 16bit / 48kHz / 2ch 数据范围
+static AUDIO_DATA_RANGE: KSDATARANGE_AUDIO = KSDATARANGE_AUDIO {
+    DataRange: KSDATARANGE {
+        FormatSize: size_of::<KSDATARANGE_AUDIO>() as u32,
+        Flags: 0,
+        SampleSize: 0,
+        Reserved: 0,
+        MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+        SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+        Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+    },
+    MaximumChannels: 2,
+    MinimumBitsPerSample: 16,
+    MaximumBitsPerSample: 16,
+    MinimumSampleFrequency: 48000,
+    MaximumSampleFrequency: 48000,
+};
+
+/// 裸指针数组的 Sync 包装（静态只读，跨线程安全）
+struct SyncDataRanges([*const KSDATARANGE; 1]);
+// SAFETY: 静态只读数据，永不写入
+unsafe impl Sync for SyncDataRanges {}
+
+static DATA_RANGES: SyncDataRanges =
+    SyncDataRanges([&AUDIO_DATA_RANGE.DataRange as *const KSDATARANGE]);
+
+static PIN_INTERFACES: [KSPIN_INTERFACE; 1] = [KSPIN_INTERFACE {
+    Set: KSINTERFACESETID_STANDARD,
+    Id: KSINTERFACE_STANDARD_STREAMING,
+    Flags: 0,
+}];
+
+static PIN_MEDIUMS: [KSPIN_MEDIUM; 1] = [KSPIN_MEDIUM {
+    Set: KSMEDIUMSETID_STANDARD,
+    Id: KSMEDIUM_TYPE_ANYINSTANCE,
+    Flags: 0,
+}];
+
+static KSPIN_DESC_RENDER: KSPIN_DESCRIPTOR = KSPIN_DESCRIPTOR {
+    InterfacesCount: 1,
+    Interfaces: PIN_INTERFACES.as_ptr() as *mut KSPIN_INTERFACE,
+    MediumsCount: 1,
+    Mediums: PIN_MEDIUMS.as_ptr() as *mut KSPIN_MEDIUM,
+    DataRangesCount: 1,
+    DataRanges: DATA_RANGES.0.as_ptr() as *const *const KSDATARANGE as *mut *mut KSDATARANGE,
+    Category: KSCATEGORY_AUDIO,
+    Name: KSCATEGORY_AUDIO,
+    Communication: KSPIN_COMMUNICATION_SINK,
+};
+
+static KSPIN_DESC_CAPTURE: KSPIN_DESCRIPTOR = KSPIN_DESCRIPTOR {
+    InterfacesCount: 1,
+    Interfaces: PIN_INTERFACES.as_ptr() as *mut KSPIN_INTERFACE,
+    MediumsCount: 1,
+    Mediums: PIN_MEDIUMS.as_ptr() as *mut KSPIN_MEDIUM,
+    DataRangesCount: 1,
+    DataRanges: DATA_RANGES.0.as_ptr() as *const *const KSDATARANGE as *mut *mut KSDATARANGE,
+    Category: KSCATEGORY_AUDIO,
+    Name: KSCATEGORY_AUDIO,
+    Communication: KSPIN_COMMUNICATION_SOURCE,
+};
+
+static PINS_RENDER: [PCPIN_DESCRIPTOR; 1] = [PCPIN_DESCRIPTOR {
     MaxInstances: 1,
     Interrupts: 0,
     AutomationTable: core::ptr::null_mut(),
-    KsPinDescriptor: core::ptr::null_mut(),
+    KsPinDescriptor: &KSPIN_DESC_RENDER as *const KSPIN_DESCRIPTOR as *mut KSPIN_DESCRIPTOR,
 }];
 
-static FILTER_DESC: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
+static PINS_CAPTURE: [PCPIN_DESCRIPTOR; 1] = [PCPIN_DESCRIPTOR {
+    MaxInstances: 1,
+    Interrupts: 0,
+    AutomationTable: core::ptr::null_mut(),
+    KsPinDescriptor: &KSPIN_DESC_CAPTURE as *const KSPIN_DESCRIPTOR as *mut KSPIN_DESCRIPTOR,
+}];
+
+static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0x0100,
     AutomationTable: core::ptr::null_mut(),
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
     PinCount: 1,
-    Pins: PINS.as_ptr() as *mut PCPIN_DESCRIPTOR,
+    Pins: PINS_RENDER.as_ptr() as *mut PCPIN_DESCRIPTOR,
     NodeSize: 0,
     NodeCount: 0,
     Nodes: core::ptr::null_mut(),
     ConnectionSize: 0,
     ConnectionCount: 0,
     Connections: core::ptr::null_mut(),
-    Category: GUID {
-        data1: 0x17ea_fd10,
-        data2: 0x2b3f,
-        data3: 0x11d1,
-        data4: [0x8f, 0x0e, 0x00, 0xc0, 0x4f, 0xb9, 0x80, 0xb9],
-    },
-    Name: GUID {
-        data1: 0x17ea_fd10,
-        data2: 0x2b3f,
-        data3: 0x11d1,
-        data4: [0x8f, 0x0e, 0x00, 0xc0, 0x4f, 0xb9, 0x80, 0xb9],
-    },
-    ComponentId: GUID {
-        data1: 0x17ea_fd10,
-        data2: 0x2b3f,
-        data3: 0x11d1,
-        data4: [0x8f, 0x0e, 0x00, 0xc0, 0x4f, 0xb9, 0x80, 0xb9],
-    },
-    Topology: GUID {
-        data1: 0x17ea_fd10,
-        data2: 0x2b3f,
-        data3: 0x11d1,
-        data4: [0x8f, 0x0e, 0x00, 0xc0, 0x4f, 0xb9, 0x80, 0xb9],
-    },
+    Category: KSCATEGORY_AUDIO,
+    Name: KSCATEGORY_AUDIO,
+    ComponentId: KSCATEGORY_AUDIO,
+    Topology: KSCATEGORY_AUDIO,
     CapsFlags: 0,
-    DeviceInterfaceGuid: GUID {
-        data1: 0x17ea_fd10,
-        data2: 0x2b3f,
-        data3: 0x11d1,
-        data4: [0x8f, 0x0e, 0x00, 0xc0, 0x4f, 0xb9, 0x80, 0xb9],
-    },
+    DeviceInterfaceGuid: KSCATEGORY_AUDIO,
+};
+
+static FILTER_DESC_CAPTURE: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
+    Version: 0x0100,
+    AutomationTable: core::ptr::null_mut(),
+    PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
+    PinCount: 1,
+    Pins: PINS_CAPTURE.as_ptr() as *mut PCPIN_DESCRIPTOR,
+    NodeSize: 0,
+    NodeCount: 0,
+    Nodes: core::ptr::null_mut(),
+    ConnectionSize: 0,
+    ConnectionCount: 0,
+    Connections: core::ptr::null_mut(),
+    Category: KSCATEGORY_AUDIO,
+    Name: KSCATEGORY_AUDIO,
+    ComponentId: KSCATEGORY_AUDIO,
+    Topology: KSCATEGORY_AUDIO,
+    CapsFlags: 0,
+    DeviceInterfaceGuid: KSCATEGORY_AUDIO,
 };

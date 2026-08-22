@@ -127,4 +127,9 @@ unsafe extern "system" {
         ReferenceString: PUNICODE_STRING,
         SymbolicLinkName: PUNICODE_STRING,
     ) -> NTSTATUS;
+    /// 释放 IoRegisterDeviceInterface 输出的符号链接缓冲
+    ///
+    /// # Safety
+    /// UnicodeString 必须为有效指针。
+    pub fn RtlFreeUnicodeString(UnicodeString: PUNICODE_STRING);
 }
