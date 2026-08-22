@@ -1,0 +1,19 @@
+[package]
+name = "vdev-audio-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kernel = []
+
+[lib]
+name = "vdev_audio"
+crate-type = ["cdylib"]
+
+
+[build-dependencies]
+winreg = "0.52.0"

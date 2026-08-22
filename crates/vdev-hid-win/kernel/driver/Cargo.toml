@@ -1,0 +1,26 @@
+[package]
+name = "vdev-hid-driver"
+version = "0.1.0"
+edition = "2024"
+description = "vdev 虚拟 HID（KMDF 内核 HID minidriver）"
+license = "MIT"
+repository = "https://github.com/gqf2008/vdev"
+readme = "README.md"
+keywords = ["driver", "hid", "windows"]
+categories = ["os::windows-apis"]
+
+[package.metadata.wdk.driver-model]
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+
+[lib]
+name = "vdev_hid"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+[dependencies]
+wdk-sys = { path = "../vendor/wdk-sys" }
+
