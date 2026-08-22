@@ -677,3 +677,53 @@ pub fn mouse_wheel(delta: i32) -> Result<()> {
     write_report(PID_MOUSE, &rep)?;
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_to_hid_letters_and_digits() {
+        assert_eq!(key_to_hid("a").unwrap(), (0, Some(0x04)));
+        assert_eq!(key_to_hid("z").unwrap(), (0, Some(0x1D)));
+        assert_eq!(key_to_hid("A").unwrap(), (0, Some(0x04)));
+        assert_eq!(key_to_hid("0").unwrap(), (0, Some(0x1E)));
+        assert_eq!(key_to_hid("9").unwrap(), (0, Some(0x27)));
+    }
+
+    #[test]
+    fn key_to_hid_modifiers_and_named() {
+        assert_eq!(key_to_hid("ctrl").unwrap(), (0x01, None));
+        assert_eq!(key_to_hid("shift").unwrap(), (0x02, None));
+        assert_eq!(key_to_hid("alt").unwrap(), (0x04, None));
+        assert_eq!(key_to_hid("win").unwrap(), (0x08, None));
+        assert_eq!(key_to_hid("enter").unwrap(), (0, Some(0x28)));
+        assert_eq!(key_to_hid("space").unwrap(), (0, Some(0x2C)));
+        assert_eq!(key_to_hid("f1").unwrap(), (0, Some(0x3A)));
+        assert_eq!(key_to_hid("f12").unwrap(), (0, Some(0x45)));
+        assert!(key_to_hid("zzz").is_err());
+    }
+
+    #[test]
+    fn make_report_layout() {
+        assert_eq!(
+            make_report(0x03, Some(0x04)),
+            [0x03, 0, 0x04, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(make_report(0, None), [0; 8]);
+    }
+
+    #[test]
+    fn mouse_report_layout() {
+        // 键位 + X(10) + Y(-5) + 滚轮(1)
+        assert_eq!(mouse_report(0x01, 10, -5, 1), [0x01, 10, 251, 1]);
+        assert_eq!(mouse_report(0, 0, 0, 0), [0; 4]);
+    }
+
+    #[test]
+    fn mouse_button_bits() {
+        assert_eq!(mouse_button_bit("left").unwrap(), 0x01);
+        assert_eq!(mouse_button_bit("right").unwrap(), 0x02);
+        assert_eq!(mouse_button_bit("middle").unwrap(), 0x04);
+        assert!(mouse_button_bit("x1").is_err());
+    }
+}
