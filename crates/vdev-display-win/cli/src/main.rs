@@ -90,8 +90,22 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let st = install::status()?;
+            let monitors = DriverClient::new()
+                .map(|c| c.monitors().to_vec())
+                .unwrap_or_default();
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&st)?);
+                #[derive(serde::Serialize)]
+                struct StatusOut {
+                    device: install::DeviceStatus,
+                    monitors: Vec<Monitor>,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&StatusOut {
+                        device: st,
+                        monitors,
+                    })?
+                );
             } else if st.present {
                 println!("虚拟显示器设备：已安装");
                 if let Some(name) = &st.friendly_name {
@@ -100,17 +114,10 @@ fn main() -> Result<()> {
                 if let Some(drv) = &st.driver {
                     println!("  驱动：{drv}");
                 }
+                println!();
+                print_monitors(&monitors, false);
             } else {
                 println!("虚拟显示器设备：未安装（先运行 vdev-display-win install）");
-            }
-            // 附加 IPC 状态（驱动运行中才可查）
-            match DriverClient::new() {
-                Ok(client) => {
-                    let monitors = client.monitors().to_vec();
-                    println!();
-                    print_monitors(&monitors, args.json);
-                }
-                Err(_) => println!("（驱动进程未运行，无法列出虚拟显示器）"),
             }
         }
         Command::List => {
