@@ -88,7 +88,7 @@ HKCR\CLSID\{E4C01F0D-A9FC-4352-8590-F0E5AD2BFFCE}\InprocServer32   # DLL 路径 
 HKCR\CLSID\{860BB310-5D01-11D0-BD3B-00A0C911CE86}\Instance\{E4C01F0D-...}
     FriendlyName = vdev-camera     # 缺它设备枚举直接跳过（关键）
     CLSID        = {E4C01F0D-...}
-    FilterData   = REG_BINARY（REGFILTER2 v2 序列化：单 RGB32 输出 pin、MERIT_DO_NOT_USE）
+    FilterData   = REG_BINARY（REGFILTER2 v2 序列化：单 YUY2 输出 pin、MERIT_DO_NOT_USE）
 ```
 
 ## 使用
@@ -131,11 +131,21 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
 - **推流线程在 Pause 启动**（送预滚帧），Run 只更新 `tstart`；否则图一直 GetState=Paused 死锁。
 - **不要 SetTime 样本时间戳**：基于 CBaseRenderer 的下游（NullRenderer 等）会按参考时钟等待，
   帧率掉到 ~0；去掉后 ~26fps。
-- **FilterData 的媒体类型必须与 pin 实际输出一致**（本过滤器输出 RGB32/BGRA）。
+- **FilterData 的媒体类型必须与 pin 实际输出一致**（本过滤器输出 YUY2）。
+- **输出格式选 YUY2（YUV），不要用 RGB32**：DirectShow 摄像头生态以 YUV 为主，
+  VLC 3.0 等消费方无法从 RGB32（BI_RGB）媒体类型提取 fourcc（报 `unsupported format`）；
+  YUY2 是标准摄像头格式、兼容性最好（OBS Virtual Camera 用 NV12 同理）。
+- **biHeight 用正数**：VLC 把 biHeight 直接赋给 unsigned `i_height`，负值会溢出成
+  4294966216 导致「Program doesn't contain ES」黑屏；ffmpeg 8 对 YUV 负 biHeight
+  也不取绝对值。正 biHeight + top-down 数据在 VLC/ffmpeg 下都正确显示
+  （OBS/libdshowcapture 同款）。
+- **样本必须有时间戳**：VLC 的 grabber 用样本时间戳做 PTS，无时间戳会黑屏；
+  用流时间（相对 Run 开始从 0 递增，CBaseOutputPin 同款），不要用参考时钟绝对时间
+  （后者会让 CBaseRenderer 下游卡死）。
 
 ## 当前限制
 
-- 固定输出 RGB32（BGRA），3 档分辨率（1920x1080 / 1280x720 / 640x480）@ 30fps。
+- 固定输出 **YUY2**（YUV 4:2:2），3 档分辨率（1920x1080 / 1280x720 / 640x480）@ 30fps。
 - 推流端是简单棋盘格图案 + 共享帧通道；音频、多分辨率动态协商、配置 UI 等后续再做。
 - 同时注册 64 位视图与 32 位视图（WOW6432Node）：32 位进程（如 32 位 VLC）通过 WOW64 重定向只能看到 WOW6432Node 视图，install 时若同目录存在 `vdev_camera_win32.dll` 会自动注册 32 位视图。
 

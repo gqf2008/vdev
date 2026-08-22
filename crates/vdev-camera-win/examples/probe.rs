@@ -70,7 +70,10 @@ fn main() {
                             10_000_000 / vih.AvgTimePerFrame.max(1)
                         )
                     };
-                    println!("[9] GetStreamCaps[{i}] subtype={:?} {fmt}", mt.subtype);
+                    println!(
+                        "[9] GetStreamCaps[{i}] major={:?} sub={:?} fmt={:?} lSample={} cbFmt={} pbFmt={} {fmt}",
+                        mt.majortype, mt.subtype, mt.formattype, mt.lSampleSize, mt.cbFormat, mt.pbFormat.is_null()
+                    );
                     // SAFETY: 释放 CoTaskMem 媒体类型。
                     unsafe { vdev_camera_win::dshow::media_type::free_media_type_ptr(pmt) };
                 }

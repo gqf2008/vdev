@@ -45,13 +45,12 @@ pub fn start_stream(filter: Arc<FilterInner>, tstart: i64) -> StreamThread {
     let stop = Arc::new(AtomicBool::new(false));
     let tstart_atomic = Arc::new(AtomicI64::new(tstart));
     let stop2 = stop.clone();
-    let tstart2 = tstart_atomic.clone();
     let pin = filter.pin.clone();
     let channel = filter.channel.clone();
     let join = std::thread::Builder::new()
         .name("vdev-camera-win-stream".into())
         .stack_size(1 << 20) // 1 MiB（DirectShow 调用栈较深）
-        .spawn(move || stream_loop(pin, channel, stop2, tstart2))
+        .spawn(move || stream_loop(pin, channel, stop2))
         .expect("spawn stream thread");
     StreamThread {
         stop,
@@ -60,12 +59,7 @@ pub fn start_stream(filter: Arc<FilterInner>, tstart: i64) -> StreamThread {
     }
 }
 
-fn stream_loop(
-    pin: Arc<PinInner>,
-    channel: Arc<SharedFrameChannel>,
-    stop: Arc<AtomicBool>,
-    tstart: Arc<AtomicI64>,
-) {
+fn stream_loop(pin: Arc<PinInner>, channel: Arc<SharedFrameChannel>, stop: Arc<AtomicBool>) {
     // 线程要调用 COM 对象（allocator/IMemInputPin），先初始化 COM（MTA）。
     let _com = match ComInit::new() {
         Ok(c) => c,
@@ -75,10 +69,11 @@ fn stream_loop(
         }
     };
 
-    let started = Instant::now();
     let mut frame: Vec<u8> = Vec::new();
+    let mut yuy2: Vec<u8> = Vec::new();
     let mut pattern_t: f64 = 0.0;
     let mut iters: u64 = 0;
+    let mut stream_time: i64 = 0;
     let mut last_log = Instant::now();
     log::debug!("stream thread started");
 
@@ -100,7 +95,7 @@ fn stream_loop(
         // 不一致时做最近邻缩放，否则下游会因帧大小不匹配而解码失败。
         let out_w = conn.format.width as usize;
         let out_h = conn.format.height as usize;
-        let out_need = out_w * out_h * 4;
+        let bgra_need = out_w * out_h * 4;
         let _ = channel.wait_frame(1000 / conn.format.fps.max(1));
         match channel.latest(&mut frame) {
             Some((w, h)) if w as usize == out_w && h as usize == out_h => {}
@@ -113,10 +108,12 @@ fn stream_loop(
             }
         }
 
-        if frame.len() < out_need {
+        if frame.len() < bgra_need {
             continue;
         }
-        let buf: &[u8] = &frame[..out_need];
+        // 输出格式是 YUY2：生产者/图案都是 BGRA，统一转 YUY2 再投递。
+        bgra_to_yuy2(&frame[..bgra_need], out_w, out_h, &mut yuy2);
+        let buf: &[u8] = &yuy2;
 
         // 取下游缓冲区（阻塞直到可用或失败）。
         let mut sample_slot: Option<IMediaSample> = None;
@@ -136,15 +133,13 @@ fn stream_loop(
         };
 
         // 填帧。
-        let tstart_now = tstart.load(Ordering::Relaxed);
         if !deliver_sample(
             &sample,
             buf,
             out_w as u32,
             out_h as u32,
             &conn.format,
-            tstart_now,
-            &started,
+            &mut stream_time,
         ) {
             continue;
         }
@@ -170,15 +165,18 @@ fn stream_loop(
     log::debug!("stream thread exited");
 }
 
-/// 填一帧到 IMediaSample 并设置时间戳；失败返回 false。
+/// 填一帧到 IMediaSample 并设置样本时间戳；失败返回 false。
+///
+/// 时间戳用参考时钟当前时间（`IReferenceClock::GetTime`，OBS virtualcam 同款）：
+/// VLC 等下游的 grabber 用样本时间戳做 PTS，无时间戳会导致画面黑屏。
+/// 参考时钟不可用时回退墙钟（100ns 单位），保证 PTS 单调有效。
 fn deliver_sample(
     sample: &IMediaSample,
     buf: &[u8],
     width: u32,
     height: u32,
-    _format: &VideoFormat,
-    _tstart: i64,
-    _started: &Instant,
+    format: &VideoFormat,
+    stream_time: &mut i64,
 ) -> bool {
     // SAFETY: COM 方法调用。
     let ptr = match unsafe { sample.GetPointer() } {
@@ -187,7 +185,7 @@ fn deliver_sample(
     };
     // SAFETY: COM 方法调用，返回样本缓冲区大小。
     let size = unsafe { sample.GetSize() } as usize;
-    let need = (width as usize) * (height as usize) * 4;
+    let need = (width as usize) * (height as usize) * 2;
     if size < need {
         log::warn!("sample too small: {size} < {need}");
         return false;
@@ -198,9 +196,16 @@ fn deliver_sample(
     if unsafe { sample.SetActualDataLength(need as i32) }.is_err() {
         return false;
     }
-    // 不设置样本时间戳：虚拟摄像头是推源，设置时间戳会让基于 CBaseRenderer 的
-    // 下游（如 NullRenderer）按参考时钟等待，造成帧率被拖慢/卡死。
-    // （无时间戳时渲染器立即渲染；需要 A/V 同步的场景后续再按时钟补。）
+    // 样本时间戳：流时间（相对 Run 开始，从 0 递增），CBaseOutputPin 同款。
+    // 渲染器（CBaseRenderer）把样本时间戳与其时钟流时间比较，只有流时间
+    // 基准才能正确渲染；用参考时钟绝对时间会错位导致卡死（实测仅 1 帧）。
+    // VLC 等 grabber 用样本时间戳做 PTS，流时间同样有效，可修复黑屏。
+    let interval = 10_000_000 / format.fps.max(1) as i64;
+    *stream_time += interval;
+    let rt_start = *stream_time;
+    let rt_end = rt_start + interval;
+    // SAFETY: 栈上 i64，调用期间存活。
+    let _ = unsafe { sample.SetTime(Some(&rt_start as *const i64), Some(&rt_end as *const i64)) };
     // SAFETY: COM 方法调用，设置样本标志位。
     let _ = unsafe { sample.SetSyncPoint(true) };
     let _ = unsafe { sample.SetPreroll(false) };
@@ -216,12 +221,37 @@ pub fn render_pattern(out: &mut Vec<u8>, format: &VideoFormat, t: &mut f64) {
         *t,
     );
     *t += 1.0 / format.fps as f64;
-    out.resize(format.frame_size(), 0);
+    // 图案是 BGRA（4 字节/像素），不能用输出格式的 frame_size（YUY2 为 2 字节/像素）。
+    out.resize(format.width as usize * format.height as usize * 4, 0);
     for (i, px) in frame.data.chunks_exact(3).enumerate() {
         out[i * 4] = px[2]; // B
         out[i * 4 + 1] = px[1]; // G
         out[i * 4 + 2] = px[0]; // R
         out[i * 4 + 3] = 255; // A
+    }
+}
+
+/// BGRA → YUY2（BT.601 整数近似；每 2 像素输出 Y0 U Y1 V）。
+fn bgra_to_yuy2(src: &[u8], w: usize, h: usize, dst: &mut Vec<u8>) {
+    dst.resize(w * h * 2, 0);
+    for y in 0..h {
+        let row = y * w;
+        for x in (0..w).step_by(2) {
+            let x1 = (x + 1).min(w - 1);
+            let i0 = (row + x) * 4;
+            let i1 = (row + x1) * 4;
+            let (b0, g0, r0) = (src[i0] as i32, src[i0 + 1] as i32, src[i0 + 2] as i32);
+            let (b1, g1, r1) = (src[i1] as i32, src[i1 + 1] as i32, src[i1 + 2] as i32);
+            let y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
+            let y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16;
+            let u = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8) + 128;
+            let v = ((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8) + 128;
+            let d = (row + x) * 2;
+            dst[d] = y0.clamp(0, 255) as u8;
+            dst[d + 1] = u.clamp(0, 255) as u8;
+            dst[d + 2] = y1.clamp(0, 255) as u8;
+            dst[d + 3] = v.clamp(0, 255) as u8;
+        }
     }
 }
 

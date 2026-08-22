@@ -11,11 +11,19 @@ use std::ptr;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
 use windows::Win32::Media::MediaFoundation::{
-    FORMAT_VideoInfo, MEDIATYPE_Video, AM_MEDIA_TYPE, MEDIASUBTYPE_RGB32, VIDEOINFOHEADER,
+    FORMAT_VideoInfo, MEDIATYPE_Video, AM_MEDIA_TYPE, VIDEOINFOHEADER,
 };
 use windows::Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree};
+use windows_core::GUID;
 
-/// 一种支持输出格式：RGB32（BGRA）@ 指定分辨率/帧率。
+/// YUY2（YUV 4:2:2 打包）媒体子类型。
+///
+/// 选择 YUY2 而非 RGB32：DirectShow 摄像头生态以 YUV 为主，VLC 3.0 等消费方
+/// 无法从 RGB32（BI_RGB）媒体类型提取 fourcc（报 unsupported format），
+/// 而 YUY2 是标准摄像头格式、兼容性最好（OBS Virtual Camera 用 NV12 同理）。
+pub const MEDIASUBTYPE_YUY2: GUID = GUID::from_u128(0x3259_5559_0000_0010_8000_00aa_0038_9b71);
+
+/// 一种支持输出格式：YUY2 @ 指定分辨率/帧率。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoFormat {
     pub width: u32,
@@ -24,9 +32,9 @@ pub struct VideoFormat {
 }
 
 impl VideoFormat {
-    /// BGRA 帧字节数。
+    /// YUY2 输出帧字节数（每像素 2 字节）。
     pub fn frame_size(&self) -> usize {
-        self.width as usize * self.height as usize * 4
+        self.width as usize * self.height as usize * 2
     }
 
     /// 构建 `VIDEOINFOHEADER`（顶到下，biHeight 为负，与 BGRA 内存布局一致）。
@@ -46,16 +54,19 @@ impl VideoFormat {
                 right: w,
                 bottom: h,
             },
-            dwBitRate: self.width * self.height * 32 * self.fps,
+            dwBitRate: self.width * self.height * 16 * self.fps,
             dwBitErrorRate: 0,
             AvgTimePerFrame: 10_000_000 / self.fps as i64,
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: w,
-                biHeight: -h, // 负高度 = 顶到下
+                // 正 biHeight：OBS/libdshowcapture 同款。VLC/ffmpeg 对 YUV 直接按
+                // 数据顺序显示（不因 biHeight 翻转），负值反而会让 VLC 的
+                // fmt.video.i_height（unsigned）溢出为 4294966216 导致无 ES。
+                biHeight: h,
                 biPlanes: 1,
-                biBitCount: 32,
-                biCompression: 0, // BI_RGB
+                biBitCount: 16,
+                biCompression: 0x3259_5559, // MAKEFOURCC('Y','U','Y','2')
                 biSizeImage: self.frame_size() as u32,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
@@ -77,7 +88,7 @@ impl VideoFormat {
         }
         AM_MEDIA_TYPE {
             majortype: MEDIATYPE_Video,
-            subtype: MEDIASUBTYPE_RGB32,
+            subtype: MEDIASUBTYPE_YUY2,
             bFixedSizeSamples: true.into(),
             bTemporalCompression: false.into(),
             lSampleSize: self.frame_size() as u32,
@@ -108,9 +119,9 @@ pub const FORMATS: [VideoFormat; 3] = [
     },
 ];
 
-/// 校验 `AM_MEDIA_TYPE` 是否为受支持的 RGB32 视频格式，返回对应 [`VideoFormat`]。
+/// 校验 `AM_MEDIA_TYPE` 是否为受支持的 YUY2 视频格式，返回对应 [`VideoFormat`]。
 pub fn media_type_matches(mt: &AM_MEDIA_TYPE) -> Option<VideoFormat> {
-    if mt.majortype != MEDIATYPE_Video || mt.subtype != MEDIASUBTYPE_RGB32 {
+    if mt.majortype != MEDIATYPE_Video || mt.subtype != MEDIASUBTYPE_YUY2 {
         return None;
     }
     if mt.formattype != FORMAT_VideoInfo

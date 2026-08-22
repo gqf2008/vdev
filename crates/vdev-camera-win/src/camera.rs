@@ -152,10 +152,11 @@ fn write_registration(
 ///   dwOffsetMajor / dwOffsetMinor
 /// - 末尾 clsidStore：被偏移引用的原始 GUID
 ///
-/// 本过滤器：单个 RGB32（BGRA）输出 pin、MERIT_DO_NOT_USE（不参与自动图连接，只能被显式选择）。
+/// 本过滤器：单个 YUY2 输出 pin、MERIT_DO_NOT_USE（不参与自动图连接，只能被显式选择）。
 fn serialize_filter_data() -> Vec<u8> {
+    use crate::dshow::media_type::MEDIASUBTYPE_YUY2;
     use windows::Win32::Media::DirectShow::MERIT_DO_NOT_USE;
-    use windows::Win32::Media::MediaFoundation::{MEDIATYPE_Video, MEDIASUBTYPE_RGB32};
+    use windows::Win32::Media::MediaFoundation::MEDIATYPE_Video;
 
     // mainStore 长度：REG_RF(16) + REG_RFP(24) + REG_TYPE(16) = 56。
     const MAIN_STORE: u32 = 56;
@@ -175,7 +176,7 @@ fn serialize_filter_data() -> Vec<u8> {
     out.extend_from_slice(&0u32.to_le_bytes()); // dwMediums
     out.extend_from_slice(&0u32.to_le_bytes()); // bCategory
 
-    // REG_TYPE：RGB32（BGRA）输出媒体类型
+    // REG_TYPE：YUY2 输出媒体类型
     out.extend_from_slice(b"0ty3"); // signature
     out.extend_from_slice(&0u32.to_le_bytes()); // dwUnused
     out.extend_from_slice(&MAIN_STORE.to_le_bytes()); // dwOffsetMajor
@@ -183,7 +184,7 @@ fn serialize_filter_data() -> Vec<u8> {
 
     // clsidStore
     out.extend_from_slice(&guid_bytes(&MEDIATYPE_Video));
-    out.extend_from_slice(&guid_bytes(&MEDIASUBTYPE_RGB32));
+    out.extend_from_slice(&guid_bytes(&MEDIASUBTYPE_YUY2));
     out
 }
 
@@ -200,7 +201,8 @@ fn guid_bytes(g: &GUID) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Media::MediaFoundation::{MEDIATYPE_Video, MEDIASUBTYPE_RGB32};
+    use crate::dshow::media_type::MEDIASUBTYPE_YUY2;
+    use windows::Win32::Media::MediaFoundation::MEDIATYPE_Video;
 
     /// FilterData 必须严格匹配 REGFILTER2 v2 磁盘布局（回归：缺字段会导致
     /// 设备枚举/Filter Mapper 消费方不可见）。
@@ -227,7 +229,7 @@ mod tests {
         assert_eq!(&blob[52..56], &72u32.to_le_bytes()); // dwOffsetMinor
                                                          // clsidStore
         assert_eq!(&blob[56..72], &guid_bytes(&MEDIATYPE_Video));
-        assert_eq!(&blob[72..88], &guid_bytes(&MEDIASUBTYPE_RGB32));
+        assert_eq!(&blob[72..88], &guid_bytes(&MEDIASUBTYPE_YUY2));
     }
 
     /// GUID 字节序：data1/data2/data3 小端，data4 原序。

@@ -478,8 +478,8 @@ fn video_stream_config_caps(f: &VideoFormat) -> VIDEO_STREAM_CONFIG_CAPS {
         ShrinkTapsY: 0,
         MinFrameInterval: interval,
         MaxFrameInterval: interval,
-        MinBitsPerSecond: (f.width * f.height * 32 * f.fps) as i32,
-        MaxBitsPerSecond: (f.width * f.height * 32 * f.fps) as i32,
+        MinBitsPerSecond: (f.width * f.height * 16 * f.fps) as i32,
+        MaxBitsPerSecond: (f.width * f.height * 16 * f.fps) as i32,
     }
 }
 
