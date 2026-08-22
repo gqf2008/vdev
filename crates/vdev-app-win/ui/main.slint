@@ -21,6 +21,12 @@ export global AppState {
     in-out property <bool> disp_can_uninstall: false;
     in-out property <bool> disp_can_add: false;
     in-out property <string> disp_monitors_text: "暂无虚拟显示器";
+    // 声卡
+    in-out property <string> audio_glyph: "○";
+    in-out property <string> audio_title: "虚拟声卡未安装";
+    in-out property <string> audio_detail: "点击「安装虚拟声卡」安装 PortCls 内核驱动（需管理员，先开测试签名）。";
+    in-out property <bool> audio_can_install: true;
+    in-out property <bool> audio_can_uninstall: false;
     // 共享日志
     in-out property <string> log_text: "";
 }
@@ -43,6 +49,9 @@ export component MainWindow inherits Window {
     callback display-refresh();
     callback display-add();
     callback display-remove-all();
+    callback audio-install();
+    callback audio-uninstall();
+    callback audio-refresh();
     callback drag-start();
     callback minimize();
     callback toggle-maximize();
@@ -70,6 +79,11 @@ export component MainWindow inherits Window {
                 text: "虚拟显示器";
                 background: AppState.current_tab == 1 ? PixelTheme.accent : PixelTheme.bg;
                 clicked => { AppState.current_tab = 1; }
+            }
+            PixelButton {
+                text: "虚拟声卡";
+                background: AppState.current_tab == 2 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 2; }
             }
         }
 
@@ -132,6 +146,28 @@ export component MainWindow inherits Window {
                         wrap: word-wrap;
                     }
                 }
+            }
+        }
+
+        // ============ Tab 2: 虚拟声卡 ============
+        if AppState.current_tab == 2 : VerticalLayout {
+            spacing: 8px;
+            PixelPanel {
+                title: "状态";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PixelText { text: AppState.audio_glyph; font-size: 18px; }
+                        PixelText { text: AppState.audio_title; font-weight: 700; }
+                    }
+                    PixelText { text: AppState.audio_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                }
+            }
+            HorizontalLayout { spacing: 8px;
+                PixelButton { text: "安装虚拟声卡"; enabled: AppState.audio_can_install; clicked => { audio-install(); } }
+                PixelButton { text: "卸载虚拟声卡"; enabled: AppState.audio_can_uninstall; clicked => { audio-uninstall(); } }
+                PixelButton { text: "刷新状态"; clicked => { audio-refresh(); } }
             }
         }
 
