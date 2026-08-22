@@ -5,7 +5,7 @@
 
 use std::ffi::c_void;
 
-use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, S_FALSE, S_OK};
+use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, IClassFactory, IClassFactory_Impl, COINIT_MULTITHREADED,
 };
@@ -14,16 +14,27 @@ use windows_core::{implement, Interface, Ref, GUID, HRESULT};
 pub mod registry;
 pub mod shm;
 
-/// COM 初始化守卫（RAII）：析构时自动 `CoUninitialize`。
-pub struct ComInit;
+/// COM 初始化守卫（RAII）：仅当本对象真正初始化了 COM 时才 `CoUninitialize`。
+///
+/// 兼容宿主线程已初始化 COM 的场景（如 GUI 主线程被 winit 初始化为 STA）：
+/// `CoInitializeEx` 返回 `S_FALSE`（已初始化）或 `RPC_E_CHANGED_MODE`
+/// （已用其他模式初始化）时复用现有 COM 且**不**卸载——Uninitialize 只对
+/// 本对象发起的初始化（`S_OK`）执行，避免破坏宿主线程的 COM 状态。
+pub struct ComInit {
+    owns: bool,
+}
 
 impl ComInit {
-    /// 以 MTA 模式初始化当前线程的 COM。
+    /// 以 MTA 模式初始化当前线程的 COM（兼容已初始化场景）。
     pub fn new() -> windows_core::Result<Self> {
-        // SAFETY: 传入合法参数；S_FALSE（已初始化）也算成功。
+        // SAFETY: 传入合法参数。
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if hr.is_ok() {
-            Ok(Self)
+        if hr == S_OK {
+            Ok(Self { owns: true })
+        } else if hr == S_FALSE || hr == RPC_E_CHANGED_MODE {
+            // 已初始化（S_FALSE）或已用其他模式初始化（RPC_E_CHANGED_MODE）：
+            // 复用现有 COM，不拥有卸载权。
+            Ok(Self { owns: false })
         } else {
             Err(windows_core::Error::from_hresult(hr))
         }
@@ -32,8 +43,10 @@ impl ComInit {
 
 impl Drop for ComInit {
     fn drop(&mut self) {
-        // SAFETY: 与构造时 CoInitializeEx 配对；当前线程 COM 已初始化。
-        unsafe { CoUninitialize() };
+        if self.owns {
+            // SAFETY: 仅对本次 CoInitializeEx(S_OK) 配对卸载。
+            unsafe { CoUninitialize() };
+        }
     }
 }
 

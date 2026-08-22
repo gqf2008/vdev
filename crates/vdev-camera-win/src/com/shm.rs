@@ -18,13 +18,17 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, ReleaseMutex, SetEvent, WaitForSingleObject,
+};
 use windows_core::PCWSTR;
 
 /// 命名共享内存。
 pub const SHM_NAME: &str = "Local\\vdev-camera-win-frames";
 /// 命名事件（新帧信号）。
 pub const EVENT_NAME: &str = "Local\\vdev-camera-win-frame-event";
+/// 命名互斥体（跨进程保护多生产者并发 publish）。
+pub const PUBLISH_MUTEX_NAME: &str = "Local\\vdev-camera-win-publish-lock";
 
 const MAGIC: u32 = 0x5644_4556; // "VDEV" 小端
 const BPP: u32 = 4; // BGRA
@@ -54,6 +58,9 @@ struct Header {
 pub struct SharedFrameChannel {
     mapping: HANDLE,
     event: HANDLE,
+    /// 跨进程发布锁（命名互斥体）：多个生产者（CLI push / GUI）并发 publish
+    /// 时保护双缓冲写入，避免数据竞争。
+    publish_lock: HANDLE,
     view: *mut u8,
     writer: bool,
 }
@@ -113,9 +120,23 @@ impl SharedFrameChannel {
             header.ready = AtomicU32::new(0);
         }
 
+        let mutex_name = to_wide(PUBLISH_MUTEX_NAME);
+        // SAFETY: 命名互斥体（初始无主），名称在调用期间存活。
+        let publish_lock = unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) }
+            .map_err(|e| {
+                // SAFETY: view/mapping/event 均有效，错误路径释放句柄。
+                unsafe {
+                    UnmapViewOfFile(view).ok();
+                    CloseHandle(mapping).ok();
+                    CloseHandle(event).ok();
+                }
+                io::Error::from_raw_os_error(e.code().0)
+            })?;
+
         Ok(Self {
             mapping,
             event,
+            publish_lock,
             view: view.Value.cast::<u8>(),
             writer,
         })
@@ -176,6 +197,16 @@ impl SharedFrameChannel {
             ));
         }
 
+        // 跨进程互斥：多个生产者（CLI push / GUI 推流）并发写双缓冲时必须互斥，
+        // 否则数据竞争（Rust unsafe 下为 UB，可能卡死/画面错乱）。
+        // SAFETY: publish_lock 有效；等待持锁。
+        let lock = unsafe { WaitForSingleObject(self.publish_lock, u32::MAX) };
+        if lock != WAIT_OBJECT_0 {
+            return Err(io::Error::other(format!(
+                "publish lock wait failed: {lock:?}"
+            )));
+        }
+
         let header = self.header();
         let next = header.seq.load(Ordering::Relaxed).wrapping_add(1);
         let header = self.header_mut();
@@ -191,6 +222,9 @@ impl SharedFrameChannel {
         header.ready.store(1, Ordering::Release);
         // SAFETY: event 句柄有效。
         unsafe { SetEvent(self.event) }.ok();
+
+        // SAFETY: 本线程持有该互斥体。
+        unsafe { ReleaseMutex(self.publish_lock) }.ok();
         Ok(())
     }
 
@@ -233,6 +267,7 @@ impl Drop for SharedFrameChannel {
             .ok();
             CloseHandle(self.event).ok();
             CloseHandle(self.mapping).ok();
+            CloseHandle(self.publish_lock).ok();
         }
     }
 }
