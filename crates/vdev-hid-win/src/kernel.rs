@@ -408,7 +408,7 @@ fn find_hid_path() -> Result<String> {
             SetupDiGetDeviceInterfaceDetailW(devs, &iface, None, 0, Some(&mut required), None)
         };
         let err = windows::core::Error::from_win32();
-        if err.code().0 as u32 != 0x8007_0013 && err.code().0 as u32 != 0x8007_0005 {
+        if err.code().0 as u32 != 0x8007_007A {
             continue;
         }
         // required 含 SP_DEVICE_INTERFACE_DETAIL_DATA_W 头；分配足够空间
