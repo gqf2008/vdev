@@ -63,6 +63,8 @@ export component MainWindow inherits Window {
     callback hid-uninstall();
     callback hid-refresh();
     callback hid-key(string);
+    callback hid-mouse-click(string);
+    callback hid-mouse-move(int, int);
     callback drag-start();
     callback minimize();
     callback toggle-maximize();
@@ -211,6 +213,11 @@ export component MainWindow inherits Window {
                         font-size: 14px;
                     }
                     PixelButton { text: "注入按键"; clicked => { hid-key(AppState.hid_key); } }
+                    HorizontalLayout { spacing: 8px;
+                        PixelButton { text: "鼠标左键"; clicked => { hid-mouse-click("left"); } }
+                        PixelButton { text: "鼠标右键"; clicked => { hid-mouse-click("right"); } }
+                        PixelButton { text: "鼠标右移20"; clicked => { hid-mouse-move(20, 0); } }
+                    }
                 }
             }
         }
@@ -225,4 +232,5 @@ export component MainWindow inherits Window {
         }
     }
 }
+
 

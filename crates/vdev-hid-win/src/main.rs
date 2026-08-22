@@ -101,6 +101,34 @@ enum KernelCmd {
         #[arg(long)]
         action: Option<String>,
     },
+    /// 注入鼠标（经内核 HID 驱动报告）
+    Mouse {
+        #[command(subcommand)]
+        cmd: KernelMouseCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KernelMouseCmd {
+    /// 相对移动（±127）
+    Move { dx: i32, dy: i32 },
+    /// 点击（默认左键）
+    Click {
+        #[arg(default_value = "left")]
+        button: String,
+    },
+    /// 按下（默认左键）
+    Down {
+        #[arg(default_value = "left")]
+        button: String,
+    },
+    /// 抬起（默认左键）
+    Up {
+        #[arg(default_value = "left")]
+        button: String,
+    },
+    /// 滚轮（120 的倍数）
+    Wheel { delta: i32 },
 }
 
 fn parse_button(s: &str) -> Result<MouseButton> {
@@ -168,22 +196,44 @@ fn main() -> Result<()> {
                 let action = action.as_deref().unwrap_or("tap");
                 match action {
                     "down" => {
-                        kernel::write_report(&kernel::make_report(mods, usage))?;
+                        kernel::write_report(kernel::PID_KBD, &kernel::make_report(mods, usage))?;
                         println!("已注入按键按下（{key}）");
                     }
                     "up" => {
-                        kernel::write_report(&kernel::make_report(0, None))?;
+                        kernel::write_report(kernel::PID_KBD, &kernel::make_report(0, None))?;
                         println!("已注入按键抬起（{key}）");
                     }
                     "tap" => {
-                        kernel::write_report(&kernel::make_report(mods, usage))?;
+                        kernel::write_report(kernel::PID_KBD, &kernel::make_report(mods, usage))?;
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        kernel::write_report(&kernel::make_report(0, None))?;
+                        kernel::write_report(kernel::PID_KBD, &kernel::make_report(0, None))?;
                         println!("已注入按键（{key}）");
                     }
                     other => bail!("未知动作：{other}（down/up/tap）"),
                 }
             }
+            KernelCmd::Mouse { cmd } => match cmd {
+                KernelMouseCmd::Move { dx, dy } => {
+                    kernel::mouse_move(dx, dy)?;
+                    println!("已注入鼠标相对移动（{dx},{dy}）");
+                }
+                KernelMouseCmd::Click { button } => {
+                    kernel::mouse_button(&button, "click")?;
+                    println!("已注入鼠标点击（{button}）");
+                }
+                KernelMouseCmd::Down { button } => {
+                    kernel::mouse_button(&button, "down")?;
+                    println!("已注入鼠标按下（{button}）");
+                }
+                KernelMouseCmd::Up { button } => {
+                    kernel::mouse_button(&button, "up")?;
+                    println!("已注入鼠标抬起（{button}）");
+                }
+                KernelMouseCmd::Wheel { delta } => {
+                    kernel::mouse_wheel(delta)?;
+                    println!("已注入鼠标滚轮（{delta}）");
+                }
+            },
         },
         Command::Key { key, action } => {
             let vk = keycodes::key_to_vk(&key)

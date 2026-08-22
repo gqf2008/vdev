@@ -818,6 +818,29 @@ fn toggle_push(ui: &MainWindow, logs: &Logs) {
             }
             append_log(&ui, &logs, format!("注入按键：{key}"));
             run_hid_cli(&["kernel", "key", &key], &ui, &logs);
+            {
+                let weak = ui.as_weak();
+                let logs = logs.clone();
+                ui.on_hid_mouse_click(move |button| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    let button: String = button.trim().to_string();
+                    append_log(&ui, &logs, format!("注入鼠标点击：{button}"));
+                    run_hid_cli(&["kernel", "mouse", "click", &button], &ui, &logs);
+                });
+            }
+            {
+                let weak = ui.as_weak();
+                let logs = logs.clone();
+                ui.on_hid_mouse_move(move |dx, dy| {
+                    let Some(ui) = weak.upgrade() else { return };
+                    append_log(&ui, &logs, format!("注入鼠标相对移动（{dx},{dy}）"));
+                    run_hid_cli(
+                        &["kernel", "mouse", "move", &dx.to_string(), &dy.to_string()],
+                        &ui,
+                        &logs,
+                    );
+                });
+            }
         });
     }
 }

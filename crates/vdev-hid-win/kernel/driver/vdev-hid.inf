@@ -1,5 +1,5 @@
 ;
-; vdev-hid.inf — vdev 虚拟 HID（KMDF 内核 HID minidriver）
+; vdev-hid.inf — vdev 虚拟键盘/鼠标（KMDF 内核 HID minidriver）
 ;
 
 [Version]
@@ -24,18 +24,41 @@ vdev_hid.sys  = 1,,
 %ManufacturerName%=Standard,NTamd64
 
 [Standard.NTamd64]
-%DeviceName%=vdev_hid_Install, Root\vdev-hid
+%KbdName%=vdev_hid_kbd_Install, Root\vdev-hid
+%MouseName%=vdev_hid_mouse_Install, Root\vdev-hid-mouse
 
-; ================= Install =====================
+; ================= 键盘 =====================
 
-[vdev_hid_Install.NT]
+[vdev_hid_kbd_Install.NT]
 CopyFiles=Drivers_Dir
 
 [Drivers_Dir]
 vdev_hid.sys
 
-[vdev_hid_Install.NT.Services]
+[vdev_hid_kbd_Install.NT.HW]
+AddReg = vdev_hid_kbd_HW
+
+[vdev_hid_kbd_HW]
+HKR,,Role,0x00010001,0 ; 0=键盘
+
+[vdev_hid_kbd_Install.NT.Services]
 AddService = vdev_hid, 0x00000002, vdev_hid_Service_Inst
+
+; ================= 鼠标 =====================
+
+[vdev_hid_mouse_Install.NT]
+CopyFiles=Drivers_Dir
+
+[vdev_hid_mouse_Install.NT.HW]
+AddReg = vdev_hid_mouse_HW
+
+[vdev_hid_mouse_HW]
+HKR,,Role,0x00010001,1 ; 1=鼠标
+
+[vdev_hid_mouse_Install.NT.Services]
+AddService = vdev_hid, 0x00000002, vdev_hid_Service_Inst
+
+; ================= 服务 / WDF =====================
 
 [vdev_hid_Service_Inst]
 DisplayName    = %ServiceDesc%
@@ -44,7 +67,10 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\vdev_hid.sys
 
-[vdev_hid_Install.NT.Wdf]
+[vdev_hid_kbd_Install.NT.Wdf]
+KmdfService = vdev_hid, vdev_hid_wdfsect
+
+[vdev_hid_mouse_Install.NT.Wdf]
 KmdfService = vdev_hid, vdev_hid_wdfsect
 
 [vdev_hid_wdfsect]
@@ -54,5 +80,6 @@ KmdfLibraryVersion = 1.33
 ManufacturerName="vdev"
 DriverDisplayName="vdev HID Drivers"
 DiskName="vdev HID Installation Disk"
-DeviceName="vdev 虚拟键盘"
+KbdName="vdev 虚拟键盘"
+MouseName="vdev 虚拟鼠标"
 ServiceDesc="vdev HID Service"

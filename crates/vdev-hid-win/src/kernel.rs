@@ -27,7 +27,6 @@ use windows::core::PCWSTR;
 pub const HARDWARE_ID: &str = r"Root\vdev-hid";
 /// vdev 虚拟键盘 VID/PID（与驱动一致）
 const VID: u16 = 0x5644;
-const PID: u16 = 0x4849;
 
 /// 8 字节键盘报告：1 修饰键 + 1 保留 + 6 按键
 const KEYBOARD_REPORT_SIZE: usize = 8;
@@ -379,7 +378,7 @@ pub fn status() -> Result<DeviceStatus> {
 // ---------------- 报告注入（经 HID 接口 WriteFile） ----------------
 
 /// 按 VID/PID 找到 vdev 虚拟键盘的 HID 设备路径
-fn find_hid_path() -> Result<String> {
+fn find_hid_path(pid: u16) -> Result<String> {
     let hid_guid = unsafe { HidD_GetHidGuid() };
     let devs = unsafe {
         SetupDiGetClassDevsW(
@@ -467,7 +466,7 @@ fn find_hid_path() -> Result<String> {
         };
         let ok = unsafe { HidD_GetAttributes(handle, &mut attrs) };
         unsafe { CloseHandle(handle) }.ok();
-        if ok.as_bool() && attrs.VendorID == VID && attrs.ProductID == PID {
+        if ok.as_bool() && attrs.VendorID == VID && attrs.ProductID == pid {
             result = Some(path);
             break;
         }
@@ -477,8 +476,8 @@ fn find_hid_path() -> Result<String> {
 }
 
 /// 写入一个 8 字节键盘报告（按下/抬起）
-pub fn write_report(report: &[u8; KEYBOARD_REPORT_SIZE]) -> Result<()> {
-    let path = find_hid_path()?;
+pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
+    let path = find_hid_path(pid)?;
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let handle = unsafe {
         CreateFileW(
@@ -491,15 +490,15 @@ pub fn write_report(report: &[u8; KEYBOARD_REPORT_SIZE]) -> Result<()> {
             None,
         )
     }
-    .context("打开 vdev 虚拟键盘失败")?;
+    .context("打开 vdev 虚拟 HID 设备失败")?;
     if handle == INVALID_HANDLE_VALUE {
-        bail!("打开 vdev 虚拟键盘失败（设备可能未安装或已被占用）");
+        bail!("打开 vdev 虚拟 HID 设备失败（设备可能未安装或已被占用）");
     }
     let mut written = 0u32;
-    let ok = unsafe { WriteFile(handle, Some(report.as_slice()), Some(&mut written), None) };
+    let ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) };
     unsafe { CloseHandle(handle) }.ok();
     if ok.is_err() {
-        bail!("写入键盘报告失败：{}", windows::core::Error::from_win32());
+        bail!("写入 HID 报告失败：{}", windows::core::Error::from_win32());
     }
     Ok(())
 }
@@ -614,4 +613,67 @@ pub fn make_report(mods: u8, usage: Option<u8>) -> [u8; KEYBOARD_REPORT_SIZE] {
         r[2] = u;
     }
     r
+}
+/// 键盘 HID 设备 PID（"HI"）
+pub const PID_KBD: u16 = 0x4849;
+
+/// 鼠标 HID 设备 PID（"HM"）
+pub const PID_MOUSE: u16 = 0x484D;
+/// 鼠标报告长度：1 键位 + X + Y + 滚轮
+pub const MOUSE_REPORT_SIZE: usize = 4;
+
+/// 构造 4 字节鼠标报告（键位 + 相对 X/Y + 滚轮，带符号）
+pub fn mouse_report(buttons: u8, dx: i8, dy: i8, wheel: i8) -> [u8; MOUSE_REPORT_SIZE] {
+    [buttons, dx as u8, dy as u8, wheel as u8]
+}
+
+/// 鼠标按键位（HID：bit0 左 / bit1 右 / bit2 中）
+pub fn mouse_button_bit(button: &str) -> Result<u8> {
+    match button.to_ascii_lowercase().as_str() {
+        "left" => Ok(0x01),
+        "right" => Ok(0x02),
+        "middle" => Ok(0x04),
+        _ => bail!("未知鼠标按键：{button}（left/right/middle）"),
+    }
+}
+
+/// 相对移动
+pub fn mouse_move(dx: i32, dy: i32) -> Result<()> {
+    let dx = dx.clamp(-127, 127) as i8;
+    let dy = dy.clamp(-127, 127) as i8;
+    let rep = mouse_report(0, dx, dy, 0);
+    write_report(PID_MOUSE, &rep)?;
+    Ok(())
+}
+
+/// 按键动作（down/up/click）
+pub fn mouse_button(button: &str, action: &str) -> Result<()> {
+    let bit = mouse_button_bit(button)?;
+    match action {
+        "down" => {
+            let rep = mouse_report(bit, 0, 0, 0);
+            write_report(PID_MOUSE, &rep)?;
+        }
+        "up" => {
+            let rep = mouse_report(0, 0, 0, 0);
+            write_report(PID_MOUSE, &rep)?;
+        }
+        "click" => {
+            let rep = mouse_report(bit, 0, 0, 0);
+            write_report(PID_MOUSE, &rep)?;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let up = mouse_report(0, 0, 0, 0);
+            write_report(PID_MOUSE, &up)?;
+        }
+        other => bail!("未知动作：{other}（down/up/click）"),
+    }
+    Ok(())
+}
+
+/// 滚轮（正=向上，负=向下；120 的倍数，clamp 到 ±127）
+pub fn mouse_wheel(delta: i32) -> Result<()> {
+    let wheel = (delta / 120).clamp(-127, 127) as i8;
+    let rep = mouse_report(0, 0, 0, wheel);
+    write_report(PID_MOUSE, &rep)?;
+    Ok(())
 }
