@@ -4,7 +4,7 @@
 //! 推流 / 日志），后端全部调用 `vdev-camera-win` 的安全封装（注册 / 注销 /
 //! 推流 / 设备枚举）。本文件是纯业务层，不含 unsafe。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs: Logs = Arc::new(Mutex::new(Vec::new()));
     wire_ui(&ui, &logs);
     refresh_status(&ui, &logs);
+    refresh_display_status(&ui, &logs);
 
     ui.run()?;
     // 退出时确保推流线程停止。
@@ -161,6 +162,181 @@ fn run_camera_cli(args: &[&str], ui: &MainWindow, logs: &Logs) {
     }
 }
 
+/// vdev-display-win CLI 输出 JSON 的解析结构
+#[derive(serde::Deserialize)]
+struct DisplayStatusOut {
+    device: DisplayDeviceStatus,
+    monitors: Vec<DisplayMonitor>,
+}
+#[derive(serde::Deserialize)]
+struct DisplayDeviceStatus {
+    present: bool,
+}
+#[derive(serde::Deserialize)]
+struct DisplayMonitor {
+    id: u32,
+    name: Option<String>,
+    enabled: bool,
+    modes: Vec<DisplayMode>,
+}
+#[derive(serde::Deserialize)]
+struct DisplayMode {
+    width: u32,
+    height: u32,
+    refresh_rates: Vec<u32>,
+}
+
+/// 定位 vdev-display-win CLI：环境变量 VDEV_DISPLAY_WIN_EXE 优先，其次
+/// 同目录 / 开发布局（../vdev-display-win/target/x86_64-pc-windows-msvc/release）。
+fn display_cli() -> Option<PathBuf> {
+    let mut cands = Vec::new();
+    if let Ok(p) = std::env::var("VDEV_DISPLAY_WIN_EXE") {
+        cands.push(PathBuf::from(p));
+    }
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            cands.push(dir.join("vdev-display-win.exe"));
+            cands.push(
+                dir.join("..")
+                    .join("..")
+                    .join("..")
+                    .join("vdev-display-win")
+                    .join("target")
+                    .join("x86_64-pc-windows-msvc")
+                    .join("release")
+                    .join("vdev-display-win.exe"),
+            );
+        }
+    }
+    cands.into_iter().find(|p| p.exists())
+}
+
+/// 找到包含 vdev-display.inf 的目录（安装时 --inf-dir）：开发布局 target/dist 或 CLI 同目录。
+fn display_inf_dir(cli: &Path) -> PathBuf {
+    let mut cands = Vec::new();
+    if let Some(dir) = cli.parent() {
+        cands.push(dir.join("..").join("dist"));
+        cands.push(dir.to_path_buf());
+    }
+    cands
+        .into_iter()
+        .find(|d| d.join("vdev-display.inf").exists())
+        .unwrap_or_else(|| {
+            cli.parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+}
+
+/// 委托 vdev-display-win CLI 执行安装/卸载/增删屏：CLI 内 self-elevate（UAC）。
+fn run_display_cli(args: &[&str], ui: &MainWindow, logs: &Logs) {
+    match display_cli() {
+        Some(exe) => match Command::new(&exe).args(args).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    append_log(ui, logs, format!("✅ {}", stdout.trim()));
+                } else {
+                    append_log(ui, logs, format!("❌ CLI 失败: {}", stderr.trim()));
+                }
+            }
+            Err(e) => append_log(ui, logs, format!("❌ 调用 CLI 失败: {e}")),
+        },
+        None => append_log(
+            ui,
+            logs,
+            "❌ 未找到 vdev-display-win.exe（设置 VDEV_DISPLAY_WIN_EXE 或放到 GUI 同目录）",
+        ),
+    }
+}
+
+fn set_disp_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
+    let g = ui.global::<AppState>();
+    g.set_disp_glyph(glyph.into());
+    g.set_disp_title(title.into());
+    g.set_disp_detail(detail.into());
+}
+
+/// 刷新显示器状态：跑 vdev-display-win --json status 并解析。
+fn refresh_display_status(ui: &MainWindow, logs: &Logs) {
+    append_log(ui, logs, "刷新显示器状态…");
+    let Some(exe) = display_cli() else {
+        set_disp_status(
+            ui,
+            "!",
+            "未找到 vdev-display-win",
+            "请把 vdev-display-win.exe 放到 GUI 同目录，或设置 VDEV_DISPLAY_WIN_EXE。",
+        );
+        return;
+    };
+    let out = Command::new(&exe).args(["--json", "status"]).output();
+    let Ok(out) = out else {
+        set_disp_status(
+            ui,
+            "!",
+            "状态查询失败",
+            "无法运行 vdev-display-win --json status。",
+        );
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        set_disp_status(ui, "!", "状态解析失败", "CLI 输出非 UTF-8。");
+        return;
+    };
+    let Ok(st) = serde_json::from_str::<DisplayStatusOut>(text) else {
+        set_disp_status(ui, "!", "状态解析失败", "无法解析 vdev-display-win 输出。");
+        return;
+    };
+
+    let g = ui.global::<AppState>();
+    if st.device.present {
+        set_disp_status(
+            ui,
+            "✓",
+            "已安装，虚拟显示器可用",
+            "系统已识别 vdev 虚拟显示器；点「添加 1920x1080」增加虚拟屏，然后在系统设置里扩展桌面。",
+        );
+        g.set_disp_can_install(false);
+        g.set_disp_can_uninstall(true);
+        g.set_disp_can_add(true);
+        append_log(ui, logs, "✅ 检测到 vdev 虚拟显示器设备");
+    } else {
+        set_disp_status(
+            ui,
+            "○",
+            "虚拟显示器未安装",
+            "点击「安装虚拟显示器」安装 IddCx 驱动（会请求管理员权限）。",
+        );
+        g.set_disp_can_install(true);
+        g.set_disp_can_uninstall(false);
+        g.set_disp_can_add(false);
+        append_log(ui, logs, "未检测到 vdev 虚拟显示器（先安装）");
+    }
+
+    // 显示器列表
+    if st.monitors.is_empty() {
+        g.set_disp_monitors_text("暂无虚拟显示器".into());
+    } else {
+        let mut lines = Vec::new();
+        for m in &st.monitors {
+            let state = if m.enabled { "启用" } else { "禁用" };
+            let name = m.name.as_deref().unwrap_or("");
+            lines.push(format!("显示器 {} {name} [{state}]", m.id));
+            for mode in &m.modes {
+                let rates = mode
+                    .refresh_rates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                lines.push(format!("  {}x{}@{}", mode.width, mode.height, rates));
+            }
+        }
+        g.set_disp_monitors_text(lines.join("\n").into());
+    }
+}
+
 fn wire_ui(ui: &MainWindow, logs: &Logs) {
     {
         let weak = ui.as_weak();
@@ -196,6 +372,69 @@ fn wire_ui(ui: &MainWindow, logs: &Logs) {
         ui.on_push(move || {
             let Some(ui) = weak.upgrade() else { return };
             toggle_push(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_display_install(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(
+                &ui,
+                &logs,
+                "安装虚拟显示器…（委托 vdev-display-win CLI，将请求管理员权限）",
+            );
+            let cli = display_cli();
+            let inf_dir = cli.as_deref().map(display_inf_dir);
+            match (cli, inf_dir) {
+                (Some(_exe), Some(dir)) => {
+                    run_display_cli(
+                        &["install", "--inf-dir", dir.to_string_lossy().as_ref()],
+                        &ui,
+                        &logs,
+                    );
+                }
+                _ => append_log(&ui, &logs, "❌ 未找到 vdev-display-win.exe"),
+            }
+            refresh_display_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_display_uninstall(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, "卸载虚拟显示器…（将请求管理员权限）");
+            run_display_cli(&["uninstall"], &ui, &logs);
+            refresh_display_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_display_refresh(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            refresh_display_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_display_add(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, "添加 1920x1080 虚拟屏…");
+            run_display_cli(&["add", "1920x1080"], &ui, &logs);
+            refresh_display_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_display_remove_all(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, "移除全部虚拟屏…");
+            run_display_cli(&["remove-all"], &ui, &logs);
+            refresh_display_status(&ui, &logs);
         });
     }
 }
