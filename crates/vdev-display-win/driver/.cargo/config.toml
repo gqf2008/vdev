@@ -1,0 +1,11 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+rustflags = [
+    "-C", "link-arg=/NOLOGO",
+    "-C", "link-arg=/MANIFEST:NO",
+    "-C", "link-arg=/SUBSYSTEM:WINDOWS",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/OPT:REF,ICF",
+]

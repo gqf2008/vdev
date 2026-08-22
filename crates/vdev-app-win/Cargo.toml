@@ -24,5 +24,8 @@ slint-pixel = { git = "https://github.com/gqf2008/slint-pixel" }
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # 复用 Windows 虚拟摄像头的安全封装（注册/注销/推流/枚举）
 vdev-camera-win = { path = "../vdev-camera-win" }
+

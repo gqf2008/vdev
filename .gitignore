@@ -13,3 +13,5 @@ crates/vdev-camera-win/target/
 
 crates/vdev-app-win/target/
 
+crates/vdev-display-win/target/
+
