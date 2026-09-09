@@ -1,34 +1,62 @@
-# vdev — macOS 虚拟设备（Rust）
+# vdev — 用 Rust 造虚拟设备（macOS + Windows）
 
-用 Rust 在 **现代 macOS（Apple Silicon）** 上实现的虚拟设备集合：
+> 用 Rust 在 **macOS（Apple Silicon）** 与 **Windows（x64）** 上实现的虚拟设备集合——
+> 键盘/鼠标、摄像头、显示器、声卡，每个都让操作系统"相信"有一个真设备存在，
+> 可被任意 App 当真实硬件使用。**全 Rust，系统绑定全部手写**。
 
-| 设备 | 技术路线 | 状态 |
+| 虚拟设备 | macOS（Apple Silicon） | Windows（x64） |
 |---|---|---|
-| 虚拟 HID（键鼠） | `cgevents` / CGEventPost（用户态事件注入） | ✅ 注入 + 监听可用 |
-| 虚拟摄像头 | ~~CoreMediaIO DAL~~ → **CMIOExtension 100% Rust**（手写 objc2 绑定，零 Swift） | ✅ 可用（QuickTime 可见 Rust 彩条 / 真实推流） |
-| 虚拟屏幕 | 私有 API `CGVirtualDisplay` + objc2 FFI | ✅ 创建/镜像/销毁可用 |
-| 虚拟声卡 | CoreAudio HAL `AudioServerPlugIn`，**100% Rust**（输出环回输入，自研 BlackHole） | ✅ 可用（音频推流走 vdev-audio，无爆音） |
+| 虚拟键盘 / 鼠标 | CGEventPost 用户态注入（`vdev-hid`）✅ | SendInput 用户态 + **KMDF 内核 HID minidriver**（`vdev-hid-win`）🔧 |
+| 虚拟摄像头 | **CMIOExtension，100% Rust**（`vdev-camera-ext`）✅ | **DirectShow 源过滤器**（用户态 COM，免签名）（`vdev-camera-win`）✅ |
+| 虚拟显示器 | CGVirtualDisplay 私有 API（`vdev-screen`）✅ | **IddCx UMDF 间接显示驱动**（`vdev-display-win`）🔧 |
+| 虚拟声卡 | CoreAudio HAL AudioServerPlugIn，100% Rust（`vdev-audio`）✅ | **PortCls / WaveRT miniport（KMDF 内核）**（`vdev-audio-win`）🔧 |
 
-## 为什么不用 kext / DriverKit
+图例：✅ 已可用（实测）　🔧 代码已合入 main、构建与自测通过；真机安装验证进行中（Windows 驱动需签名，见下）。
 
-- kext 在 Apple Silicon 上已死（需关 SIP，Intel-only）。
-- DriverKit（dext）只支持 C++，Rust 只能做 C ABI 内核，工程成本高。
-- macOS 虚拟设备的「正统玩法」其实是**用户态插件/事件服务**：
+> **Windows 侧状态（2026-09-09）**：`vdev-camera-win` 是用户态 COM 组件、无签名门槛，可直接安装试用；
+> `vdev-display-win` / `vdev-audio-win` / `vdev-hid-win` 是驱动（UMDF/KMDF），需自签名证书或测试签名后装机验证（进行中）。
+> 详见 [Windows 侧](#windows-侧x64)。
+
+## 为什么用 Rust 写"虚拟设备"、为什么不用 kext / DriverKit
+
+先回答 macOS 侧最常见的问题：为什么不用内核驱动？
+
+- **kext 在 Apple Silicon 上已死**（需关 SIP，Intel-only）。
+- **DriverKit（dext）只支持 C++**，Rust 只能做 C ABI 内核，工程成本高。
+- macOS 虚拟设备的"正统玩法"其实是**用户态插件/事件服务**：
   - 虚拟 HID → CGEventPost / IOHID 事件注入
-  - 虚拟摄像头 → CoreMediaIO DAL 插件（bundle，无内核组件）
+  - 虚拟摄像头 → CMIOExtension（bundle，无内核组件）
   - 虚拟屏幕 → CoreGraphics 私有 API `CGVirtualDisplay`（DisplayLink 等厂商同款）
+  - 虚拟声卡 → CoreAudio HAL `AudioServerPlugIn`
 
-## 工作区结构
+Windows 侧的路线选择同理、但门槛分布不同：虚拟摄像头有用户态 DirectShow 路线（免签名），
+虚拟显示器有官方 IddCx UMDF 用户态驱动路线，只有虚拟声卡与内核 HID 没有用户态捷径、必须走内核
+（KMDF）——详见 [Windows 侧](#windows-侧x64)。
+
+## 仓库结构
 
 ```
-crates/
-  vdev-hid/     虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动
-  vdev-camera/  虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
-  vdev-screen/  虚拟屏幕：CGVirtualDisplay 私有 API 封装
-  vdev-audio/   虚拟声卡：CoreAudio HAL AudioServerPlugIn（输出环回输入，自研 BlackHole）
-  vdev-host/    宿主进程 / 统一命令行入口（二进制名 vdev）
-docs/RESEARCH.md  三条技术路线的调研笔记与参考项目
+crates/                         # 主 workspace（macOS-only；根 Cargo.toml 成员）
+  vdev-hid/        虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动（CGEventPost）
+  vdev-camera/     虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
+  vdev-screen/     虚拟屏幕：CGVirtualDisplay 私有 API 封装
+  vdev-audio/      虚拟声卡：CoreAudio HAL AudioServerPlugIn（输出环回输入，自研 BlackHole）
+  vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
+  vdev-app/        macOS 宿主 App（Rust + Slint）
+  vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
+  vdev-bridge/     远端 WebRTC 流 → 本地虚拟摄像头/声卡 桥
+crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
+  vdev-hid-win/     虚拟键盘/鼠标：SendInput 用户态 + KMDF 内核 HID minidriver（内核虚拟 HID 路线 B）
+  vdev-camera-win/  虚拟摄像头：DirectShow 源过滤器（用户态 COM，免签名）
+  vdev-display-win/ 虚拟显示器：IddCx UMDF 间接显示驱动 + CLI + driver-ipc
+  vdev-audio-win/   虚拟声卡：PortCls/WaveRT miniport（KMDF 内核）+ CLI
+  vdev-app-win/     Windows 宿主 App（Rust + Slint）
+docs/RESEARCH.md    技术路线调研笔记与参考项目
 ```
+
+---
+
+# macOS 侧（Apple Silicon）
 
 ## 快速开始
 
@@ -72,15 +100,15 @@ vdev hid listen --seconds 10
   选择器弹不出来（历史上就是这原因）。改过 entitlements 后记得 `make install-rust` 重新签名安装。
 - **视频推流彩条/视频交替（已修复）**：扩展端超过 2s 没收到新注入帧就回落到彩条。
   视频放在 ossfs/FUSE 网络挂载上时，AVAssetReader 读盘会随机停顿 1.5~2.8s+（本地文件仅
-  18~20ms），停顿超过 2s 摄像头就“彩条↔视频”反复交替。宿主端已加保活：最后发送超过 500ms
+  18~20ms），停顿超过 2s 摄像头就"彩条↔视频"反复交替。宿主端已加保活：最后发送超过 500ms
   就重发最后一帧（带新时间戳），推流真正结束才允许回落彩条。
   已知残余：网络挂载上 AVAssetReader 初始化（读 moov/索引）可能耗时 10~30s，期间显示彩条属正常。
 - **屏幕/虚拟屏推流静止后出彩条（已修复）**：CGDisplayStream 在画面静止后几乎不再回调
-  （COMPLETE/IDLE 都停），之前“收到 IDLE 才重发最后一帧”的修复在纯静态画面下失效
+  （COMPLETE/IDLE 都停），之前"收到 IDLE 才重发最后一帧"的修复在纯静态画面下失效
   （实测虚拟屏 145s 只发 20 帧）。已改为独立保活线程：无新帧超过 500ms 就重发最后一帧，
   与视频推流同款机制（实测静态虚拟屏 2fps 稳定出帧）。
-  另修复：FrameClient 连接断开后 send 失败会重置客户端，下一帧自动重连，避免“连接死了
-  永久彩条”。
+  另修复：FrameClient 连接断开后 send 失败会重置客户端，下一帧自动重连，避免"连接死了
+  永久彩条"。
 - **旧版本残留**：多次迭代留下的僵尸扩展 `[terminated waiting to uninstall on reboot]` 无害，
   重启一次自动清理。
 
@@ -184,7 +212,7 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
   - 数组属性（`pfta`/`sfma`/`nsr#`/`ctrl`/`ownd`）在 inDataSize 不足时要**截断返回**而非报错；
   - 必须实现 `bcls`/`clas`/`owne`/`ownd`/`lnam`/`lmod`/`lmak`/`ring`/`cstb`/`clkd` 等属性。
 
-## 权限说明
+## 权限说明（macOS）
 
 - **注入按键**：`CGEventPost` 无需辅助功能权限（macOS 10.15+ 对合成事件放行）。
 - **拦截/监听**（后续功能）：需要「辅助功能」权限。
@@ -221,10 +249,157 @@ cargo run -p aerodesk-agent -- --role viewer --room vdev-demo --layer f \
 要点：`vdev screen list` 给的是 CGDisplayID（十六进制），aerodesk `--display` 要的是
 **显示器索引**（枚举顺序）；虚拟屏通常是第 2 个 → 索引 1。
 
-## 路线图
+---
 
-- [x] 调研三条技术路线（见 docs/RESEARCH.md）
-- [x] vdev-hid：键码/文本/鼠标注入 CLI 可用
-- [x] vdev-screen：创建/列出/销毁虚拟显示器
-- [x] vdev-camera：Rust 帧核心 + CMIOExtension 全链路，QuickTime 可见
-- [x] 组合玩法：虚拟屏幕 + 摄像头串流（配合 aerodesk SFU，端到端实测）
+# Windows 侧（x64）
+
+Windows **没有**用户态虚拟显示器/声卡的官方 API，四条路线里三条要碰驱动，只有摄像头有用户态捷径。
+按"签名门槛从低到高"排：
+
+| 设备 | 路线 | 驱动类型 | 签名要求 |
+|---|---|---|---|
+| 虚拟摄像头 | DirectShow 源过滤器（`vdev-camera-win`） | 用户态 COM | **免签名**（regsvr32/自注册） |
+| 虚拟显示器 | IddCx 间接显示（`vdev-display-win`） | **UMDF 用户态驱动** | 驱动包签名（自签名证书装 TrustedPublisher+Root 通常即可） |
+| 虚拟声卡 | PortCls/WaveRT miniport（`vdev-audio-win`） | **KMDF 内核驱动** | 测试签名或正式签名 |
+| 虚拟键盘/鼠标 | KMDF HID minidriver（`vdev-hid-win`） | **KMDF 内核驱动** | 测试签名或正式签名 |
+
+> 状态：`vdev-camera-win` 已可用（用户态，可直接安装）；`vdev-display-win` / `vdev-audio-win` /
+> `vdev-hid-win` 代码已合入 main、构建与单测通过，真机安装验证进行中（需先按下方"签名"节准备）。
+
+## vdev-camera-win — DirectShow 虚拟摄像头（✅ 用户态，免签名）
+
+一个 **DirectShow 源过滤器**（用户态 COM 组件，无内核驱动、无签名门槛），把跨进程推送的
+BGRA 帧变成系统里的一个"视频捕获源"，任意 App（ffmpeg / OBS / Zoom / Teams / 微信）都能当摄像头选。
+
+- 架构（**安全封装优先**）：所有系统 API 先收敛到带 `SAFETY` 注释的安全封装模块
+  （`com/`：COM 初始化/类工厂/注册表 RAII/无锁共享帧通道；`dshow/`：媒体类型/过滤器/Pin），
+  业务层零 `unsafe`。用微软官方 `windows` crate 0.62 + `implement` 宏，100% Rust。
+- 推流与取流是**两个独立进程**，经命名共享内存（双缓冲 + 序号，无锁）通信；
+  无新帧回退棋盘格；尺寸不一致自动最近邻缩放。
+- 固定输出 **YUY2**，3 档分辨率（1080p / 720p / 640x480）@30fps。
+- CLI：`install / uninstall / list / push / selftest`；支持 64 位 + 32 位双视图注册。
+- 自测：进程内 DirectShow 图（源 → NullRenderer）3s 交付约 80 帧；`cargo test`（SHM 往返 + FilterData 布局）。
+- 关键踩坑（详见 `docs/windows-virtual-camera.md`）：Instance 键必须带 `FriendlyName`（否则枚举不到但
+  CoCreateInstance 能成功）；输出 pin 必须实现 `IKsPropertySet` 返回 `PIN_CATEGORY_CAPTURE`（否则 ffmpeg
+  报 Could not find output pin）；推源必须自建并 `Commit` 内存分配器；不要 `SetTime` 样本时间戳（否则
+  下游按参考时钟等待、帧率掉到 ~0）；用 **YUY2** 别用 RGB32（VLC 无法提取 fourcc）；`biHeight` 用正数
+  （VLC 负数会溢出成黑屏）；样本必须有时间戳（VLC 用其做 PTS）。
+
+```powershell
+cd crates\vdev-camera-win
+cargo build --release
+.\target\release\vdev-camera-win.exe install     # 优先 HKLM，失败回退 HKCU（免管理员）
+ffmpeg -f dshow -list_devices true -i dummy      # 应看到 "vdev-camera" (video)
+.\target\release\vdev-camera-win.exe push --width 640 --height 360 --fps 30 --seconds 120
+ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
+```
+
+## vdev-display-win — IddCx UMDF 虚拟显示器（🔧 装机验证中）
+
+Windows 官方 **Indirect Display Driver（IddCx）**，**UMDF 用户态驱动**：系统识别为第二块显示器，
+可扩展/镜像桌面、设置分辨率与刷新率。驱动以 DLL 被 WUDFHost 进程加载，崩溃不影响内核。
+
+- 组成：`driver`（`vdev_display.dll`，IddCx UMDF + 命名管道 IPC）、`cli`（`vdev-display-win.exe`：
+  install/uninstall/status + 显示器增删改查）、`wdf-umdf-sys` + `wdf-umdf`（来自 MIT 项目
+  virtual-display-rs 的绑定与安全封装）、`driver-ipc`（named pipe + serde_json）、`driver-logger`
+  （事件日志）。第三方来源见 `crates/vdev-display-win/THIRD_PARTY.md`。
+- 绑定：手写 `wdf-umdf-sys`（UMDF + IddCx），业务层经安全封装调用。
+- CLI 示例：
+
+```powershell
+vdev-display-win.exe add 1920x1080          # 添加一块虚拟屏
+vdev-display-win.exe add 3840x2160@120 1280x720@60/120 --name "vdev-4k"
+vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0 / persist
+vdev-display-win.exe install --inf-dir target\dist
+```
+
+- 与 macOS 版语义对照：macOS `screen create` ↔ Windows `add`；`screen list` ↔ `list`；
+  macOS 由宿主向虚拟屏推内容，Windows 由 OS 直接渲染进虚拟屏（远程推流场景可扩展 swap chain 注入）。
+
+## vdev-audio-win — PortCls/WaveRT 虚拟声卡（🔧 构建绿，实测待测试签名）
+
+**KMDF 内核驱动**（虚拟设备无用户态捷径），PortCls 端口类加载手写 WaveRT miniport + Topology：
+虚拟扬声器（render）把系统播放写入环形缓冲，虚拟麦克风（capture）从同一缓冲读出 → **输出环回输入**
+（AudioMirror 语义，等价 macOS 侧自研 BlackHole）；宿主可从用户态向环形缓冲注入/采集音频。
+
+- 组成：`driver`（`vdev_audio.sys`：AdapterCommon + WaveRT miniport + Topology + RingBuffer +
+  手写 WDM/PortCls/KS 绑定）、`cli`（install/uninstall/status/注入/采集）、INF + 签名脚本。
+- 参考：Microsoft sysvad（官方 C++）、AudioMirror（MIT WaveRT 环回）。
+- 构建与门禁全绿（fmt/clippy/test）；实测需开测试签名（见下）。
+
+## vdev-hid-win — KMDF 内核 HID 键盘/鼠标（🔧 构建绿，实测待测试签名）
+
+用户态 SendInput 之外的内核路线（路线 B）：**KMDF HID minidriver** 注册到 HIDCLASS，
+设备管理器 HID 类出现「vdev 虚拟键盘」（`Root\vdev-hid`）与「vdev 虚拟鼠标」（`Root\vdev-hid-mouse`）。
+
+- 报告描述符含厂商输出管道：用户态 `WriteFile` 即注入——键盘 8 字节报告（1 修饰键 + 6 按键）、
+  鼠标 4 字节报告（键位 + X/Y + 滚轮，相对值）；经 manual 队列投递给 hidclass 作为真实 HID 消费。
+- 手写 `wdk-sys`（WDF/GPIO/SPB/USB…）内核绑定（vendor 目录，随仓）。
+- CLI：`vdev-hid-win kernel install/status/uninstall` + `key/mouse` 注入命令。
+- 构建 + 报告格式单测通过（键→HID usage/修饰位/鼠标报告布局）；实测需开测试签名。
+
+## Windows 通用：构建 / 签名 / 安装
+
+各 `*-win` crate 是**独立 workspace**（不与 macOS 主 workspace 混构）。构建前置：
+Visual Studio 2022（C++ 桌面负载）+ **WDK 10.0.26100**（`winget install Microsoft.WindowsWDK.10.0.26100`）
++ LLVM（bindgen 用 libclang）+ Rust stable（MSVC target）。
+
+```powershell
+# 驱动签名：自签名代码签名证书（一次性）→ 签名 DLL/SYS + 生成 .cat
+New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=vdev Driver" `
+  -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
+  -KeySpec Signature -KeyUsage DigitalSignature `
+  -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+# 把证书装进 TrustedPublisher + Root（管理员）
+certutil -addstore -f TrustedPublisher vdev-cert.cer
+certutil -addstore -f Root vdev-cert.cer
+
+# 若加载仍被签名策略拦：开测试签名（管理员，需重启）
+bcdedit /set testsigning on
+```
+
+- 虚拟显示器是 UMDF，自签名证书通常即可、无需测试签名；虚拟声卡 / 内核 HID 需测试签名或正式签名。
+- 虚拟摄像头是用户态 COM，**完全免签名**，`install` 即可。
+
+## Windows 侧当前状态与待办
+
+- [x] `vdev-camera-win`：DirectShow 源过滤器（代码 + 自测 + ffmpeg 生态踩坑已修），可用
+- [x] `vdev-display-win`：IddCx UMDF 驱动（含 CLI/UAC 提权），构建/单测通过
+- [x] `vdev-audio-win`：PortCls WaveRT 驱动，构建/门禁全绿
+- [x] `vdev-hid-win`：KMDF HID minidriver，构建/报告单测通过
+- [ ] 装机验证（display/audio/hid）：开测试签名/装证书后真机安装、枚举、端到端实测
+- [ ] `vdev-app-win` 宿主 GUI 集成页完善（虚拟显示器页；声卡页已有）
+
+---
+
+# 文档导航
+
+| 文档 | 内容 |
+|---|---|
+| `docs/RESEARCH.md` | 三条技术路线的调研笔记与参考项目 |
+| `docs/windows-virtual-camera.md` | Windows 虚拟摄像头（DirectShow）设计与踩坑 |
+| `docs/windows-virtual-display-audio.md` | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 |
+| `docs/remote-camera-bridge.md` | 远端摄像头桥（WebRTC 流 → 本地虚拟摄像头/声卡） |
+| `docs/Windows驱动开发有意思方向.md` | Windows 侧"值得写"的内容线索 |
+| `docs/macOS驱动开发有意思方向.md` | macOS 侧"值得写"的内容线索 |
+| `crates/vdev-display-win/README.md` | 虚拟显示器驱动（构建/签名/CLI/验收） |
+| `crates/vdev-hid-win/kernel/driver/README.md` | 内核 HID 驱动（构建/注入） |
+
+# 路线图
+
+- [x] 调研三条技术路线（macOS：见 `docs/RESEARCH.md`）
+- [x] macOS：vdev-hid / vdev-screen / vdev-camera（CMIOExtension 全链路）/ vdev-audio 可用
+- [x] macOS：组合玩法（虚拟屏 + 摄像头串流 + SFU 端到端）+ 滤镜（美颜/背景替换）+ 远端摄像头桥
+- [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
+- [x] Windows：IddCx UMDF 虚拟显示器 / PortCls WaveRT 虚拟声卡 / KMDF 内核 HID —— 代码与门禁就绪
+- [ ] Windows：三驱动真机安装验证（测试签名）+ GUI 集成收尾
+- [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
+
+# 内容与授权
+
+- 本仓库**代码**遵循 MIT 协议（见各 crate `LICENSE` / `THIRD_PARTY.md`；部分绑定层来自 MIT 第三方项目，保留版权声明）。
+- 作者在写 **《用 Rust 写驱动》/「老高写代码」驱动开发系列** 内容（公众号 / 知乎），以本仓库双栈实现为素材——
+  如果你打算基于本仓库写文章、教程或课程，欢迎先通过 GitHub Issue / Discussions 联系作者，
+  可提供内容审阅与协作，避免内容冲突。
+- 作者另在写《用 Rust 手写 RTOS 内核》书稿（基于 [Xtask](https://github.com/gqf2008/Xtask)），
+  以及开源多模态 AI 输入法 [verba-ime](https://github.com/gqf2008/verba-ime)。
