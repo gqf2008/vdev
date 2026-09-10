@@ -2,6 +2,7 @@
 //! 手写 CMIOExtension ObjC 绑定（cmio.rs），帧管线用 CoreVideo/CoreMedia C FFI。
 
 mod cmio;
+mod filters;
 mod frame_channel;
 
 use cmio::{
@@ -476,7 +477,14 @@ fn frame_loop() {
                 // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
                 let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
                 if let Some((data, w, h, stride, pts)) = injected {
-                    send_bgra(stream, fmt, &data, w, h, stride, pts);
+                    // 设备侧滤镜（美颜/背景替换）；没配滤镜就走原来的直通
+                    if filters::enabled() {
+                        let mut buf = filters::repack(&data, w, h, stride);
+                        filters::apply(&mut buf, w, h);
+                        send_bgra(stream, fmt, &buf, w, h, w * 4, pts);
+                    } else {
+                        send_bgra(stream, fmt, &data, w, h, stride, pts);
+                    }
                 } else {
                     let rc = vdev_camera::cabi::vdev_camera_render_bgra32(
                         0,
@@ -630,8 +638,11 @@ fn main() {
     unsafe {
         let _: () = msg_send![provider_cls, startServiceWithProvider: &*provider];
     }
-    // 启动真实帧推流通道（宿主 App 连 127.0.0.1:27890 推帧）
+    // 启动真实帧推流通道（宿主 App / 外部桥连 127.0.0.1:27890 推帧）
     frame_channel::start();
+    if let Some(desc) = filters::describe() {
+        eprintln!("vdev-camera-ext: 设备侧滤镜已启用（{desc}）");
+    }
     eprintln!("vdev-camera-ext: 服务已启动，进入 runloop");
     elog("startService 完成，进入 runloop");
     unsafe { CFRunLoopRun() };

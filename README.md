@@ -44,8 +44,6 @@ crates/                         # 主 workspace（macOS-only；根 Cargo.toml �
   vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
   vdev-app/        macOS 宿主 App（Rust + Slint）
   vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
-crates/vdev-bridge/ # 演示/验证：远端 WebRTC 流 → 本地虚拟摄像头/声卡；自带独立 workspace，
-                    # 依赖兄弟仓库 aerodesk，故意不并入主 workspace（保证主仓库可独立构建）
 crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
   vdev-hid-win/     虚拟键盘/鼠标：SendInput 用户态 + KMDF 内核 HID minidriver（内核虚拟 HID 路线 B）
   vdev-camera-win/  虚拟摄像头：DirectShow 源过滤器（用户态 COM，免签名）
@@ -171,6 +169,22 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
 
 帧协议：36 字节小端头（magic "VDFR" / version / width / height / stride / ptsNs / payloadLen）
 + `stride*height` 字节 BGRA32（见 `crates/vdev-camera-ext/src/frame_channel.rs`）。
+
+#### 设备侧滤镜（美颜 / 背景替换）
+
+滤镜在**设备侧**做——虚拟摄像头对推来的帧自己成像，所以任何推帧方（宿主 App、
+`push_frames.swift`、外部桥）都得到同一套处理，推流方不必各自实现。
+参数配在**扩展进程的环境**里（见 `crates/vdev-camera-ext/src/filters.rs`）：
+
+```bash
+VDEV_FILTER="brightness,contrast,saturation,green,sharpen,beauty,whiten"
+VDEV_BG=blur        # 开启背景模糊（Vision 人像分割）
+
+# brightness -1..1（0=不变） / contrast 0..2（1=不变） / saturation 0..2（1=不变）
+# green ≥0（0=关；绿幕抠像阈值） / sharpen 0..2 / beauty,whiten 0..1（0=关）
+```
+
+没配任何滤镜时整段跳过，走原样直通路径（零额外开销）。
 
 ### 踩坑记录（已沉淀）
 
@@ -380,7 +394,6 @@ bcdedit /set testsigning on
 | `docs/RESEARCH.md` | 三条技术路线的调研笔记与参考项目 |
 | `docs/windows-virtual-camera.md` | Windows 虚拟摄像头（DirectShow）设计与踩坑 |
 | `docs/windows-virtual-display-audio.md` | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 |
-| `docs/remote-camera-bridge.md` | 远端摄像头桥（WebRTC 流 → 本地虚拟摄像头/声卡） |
 | `docs/Windows驱动开发有意思方向.md` | Windows 侧"值得写"的内容线索 |
 | `docs/macOS驱动开发有意思方向.md` | macOS 侧"值得写"的内容线索 |
 | `crates/vdev-display-win/README.md` | 虚拟显示器驱动（构建/签名/CLI/验收） |
@@ -390,7 +403,8 @@ bcdedit /set testsigning on
 
 - [x] 调研三条技术路线（macOS：见 `docs/RESEARCH.md`）
 - [x] macOS：vdev-hid / vdev-screen / vdev-camera（CMIOExtension 全链路）/ vdev-audio 可用
-- [x] macOS：组合玩法（虚拟屏 + 摄像头串流 + SFU 端到端）+ 滤镜（美颜/背景替换）+ 远端摄像头桥
+- [x] macOS：组合玩法（虚拟屏 + 摄像头串流 + SFU 端到端）+ 设备侧滤镜（美颜/背景替换）
+- [x] 远端桥（WebRTC 流 → 虚拟摄像头/声卡）已迁至 aerodesk 仓库（`aerodesk-vdev-bridge`）
 - [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
 - [x] Windows：IddCx UMDF 虚拟显示器 / PortCls WaveRT 虚拟声卡 / KMDF 内核 HID —— 代码与门禁就绪
 - [ ] Windows：三驱动真机安装验证（测试签名）+ GUI 集成收尾

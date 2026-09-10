@@ -5440,6 +5440,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-foundation 0.3.2",
  "vdev-camera",
+ "vdev-filter",
 ]
 
 [[package]]

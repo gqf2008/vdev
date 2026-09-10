@@ -14,6 +14,9 @@ path = "src/host.rs"
 
 [dependencies]
 vdev-camera = { path = "../vdev-camera" }
+# 设备侧滤镜（美颜 / 背景替换）：虚拟摄像头自身成像的一部分，
+# 不再由推流方各自实现（vision = macOS Vision 人像分割）。
+vdev-filter = { path = "../vdev-filter", features = ["vision"] }
 anyhow = "1.0.104"
 objc2 = { version = "0.6.4", features = ["exception"] }
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSet", "NSDictionary", "NSUUID", "NSValue"] }
