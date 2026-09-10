@@ -49,8 +49,8 @@
 ```bash
 # 1. 起 aerodesk SFU + signal（aerodesk 仓库）
 # 2. 发布端推流
-# 3. 本机运行桥
-vdev-bridge <signal_server> <room> [auth]
+# 3. 本机运行桥（vdev-bridge 是独立 workspace，需同级检出的 aerodesk 仓库）
+cd crates/vdev-bridge && cargo run -- <signal_server> <room> [auth]
 # 环境变量：
 #   VDEV_FILTER="brightness,contrast,saturation,green,sharpen"
 #   VDEV_WIDTH / VDEV_HEIGHT（默认 1920x1080）

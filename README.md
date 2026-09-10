@@ -36,7 +36,7 @@ Windows 侧的路线选择同理、但门槛分布不同：虚拟摄像头有用
 ## 仓库结构
 
 ```
-crates/                         # 主 workspace（macOS-only；根 Cargo.toml 成员）
+crates/                         # 主 workspace（macOS-only；根 Cargo.toml 成员，零仓库外依赖）
   vdev-hid/        虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动（CGEventPost）
   vdev-camera/     虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
   vdev-screen/     虚拟屏幕：CGVirtualDisplay 私有 API 封装
@@ -44,7 +44,8 @@ crates/                         # 主 workspace（macOS-only；根 Cargo.toml �
   vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
   vdev-app/        macOS 宿主 App（Rust + Slint）
   vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
-  vdev-bridge/     远端 WebRTC 流 → 本地虚拟摄像头/声卡 桥
+crates/vdev-bridge/ # 演示/验证：远端 WebRTC 流 → 本地虚拟摄像头/声卡；自带独立 workspace，
+                    # 依赖兄弟仓库 aerodesk，故意不并入主 workspace（保证主仓库可独立构建）
 crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
   vdev-hid-win/     虚拟键盘/鼠标：SendInput 用户态 + KMDF 内核 HID minidriver（内核虚拟 HID 路线 B）
   vdev-camera-win/  虚拟摄像头：DirectShow 源过滤器（用户态 COM，免签名）

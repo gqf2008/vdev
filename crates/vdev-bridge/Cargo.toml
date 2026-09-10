@@ -1,8 +1,17 @@
+[workspace]
+# vdev-bridge 独立 workspace（同 vdev-*-win 范式）：
+# 它是「远端 WebRTC 流 → 本地虚拟摄像头/声卡」的演示/验证工具，
+# 依赖兄弟仓库 aerodesk（path）+ 其 str0m fork——不应把 aerodesk 拖进
+# vdev 的设备驱动层主 workspace（否则主仓库没有 aerodesk 就编不过）。
+resolver = "2"
+members = ["."]
+
 [package]
 name = "vdev-bridge"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "演示/验证：aerodesk SFU 的 WebRTC 流 → vdev 虚拟摄像头/声卡"
 
 [[bin]]
 name = "vdev-bridge"
@@ -11,8 +20,7 @@ path = "src/main.rs"
 [dependencies]
 # 复用 aerodesk 的 WebRTC 收流（str0m + SFU 连接）与 FFmpeg 解码
 aerodesk-core = { path = "../../../aerodesk/crates/aerodesk-core" }
-aerodesk-codec = { path = "../../../aerodesk/crates/aerodesk-codec" }
-str0m = { git = "https://github.com/aerodesk-labs/str0m.git", rev = "f5b4fd6e79d23f8bc368873603f453c05314b4e2", default-features = false, features = ["rust-crypto"] }
-ffmpeg-next = "8"
+str0m = { git = "https://github.com/aerodesk-labs/str0m.git", rev = "3a35419ba94e6a381643baef5463b1649c6c8434", default-features = false, features = ["rust-crypto"] }
+ffmpeg-next = "9"
 vdev-filter = { path = "../vdev-filter", features = ["vision"] }
 anyhow = "1.0.104"
