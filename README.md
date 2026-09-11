@@ -44,6 +44,7 @@ crates/                         # 主 workspace（macOS-only；根 Cargo.toml �
   vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
   vdev-app/        macOS 宿主 App（Rust + Slint）
   vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
+  vdev-mic-agent/  AI 虚拟麦克风端侧链路：物理麦克风 → 降噪 → 注入 vdev 麦克风（用户态）
 crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
   vdev-hid-win/     虚拟键盘/鼠标：SendInput 用户态 + KMDF 内核 HID minidriver（内核虚拟 HID 路线 B）
   vdev-camera-win/  虚拟摄像头：DirectShow 源过滤器（用户态 COM，免签名）
