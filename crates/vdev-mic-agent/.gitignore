@@ -1,0 +1,5 @@
+# the denoise backend is fetched, never committed (see README)
+/third_party/
+*.dll
+*.dylib
+*.so
