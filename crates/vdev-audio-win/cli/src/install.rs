@@ -6,11 +6,12 @@ use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIIRFLAG_FORCE_INF, DiInstallDriverW,
-    GUID_DEVCLASS_MEDIA, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
+    GUID_DEVCLASS_MEDIA, HDEVINFO, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
     SP_DEVINFO_DATA, SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
     SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiGetINFClassW, SetupDiOpenDeviceInfoW, SetupDiSetDeviceRegistryPropertyW,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+    SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDeviceInfoW,
+    SetupDiSetDeviceRegistryPropertyW,
 };
 
 pub const HARDWARE_ID: &str = r"Root\vdev-audio";
@@ -47,11 +48,11 @@ fn read_multi_sz(
         }
         buf.resize(required as usize, 0);
     }
-    let mut wide = Vec::with_capacity(buf.len() / 2);
-    for chunk in buf.chunks_exact(2) {
-        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    wide
+    buf.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&chunk| u16::from_le_bytes(chunk))
+        .collect::<Vec<u16>>()
 }
 
 fn wide_contains(haystack: &[u16], needle: &str) -> bool {
@@ -61,8 +62,64 @@ fn wide_contains(haystack: &[u16], needle: &str) -> bool {
         .any(|w| w == needle.as_slice())
 }
 
-/// 在 Media 类设备里按硬件 ID 找 vdev-audio（含非 present）
-fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
+/// 读取设备信息元素的设备实例 ID（如 `ROOT\MEDIA\0000`）。
+fn get_instance_id(devs: HDEVINFO, info: &SP_DEVINFO_DATA) -> Result<String> {
+    let mut required: u32 = 0;
+    let mut buf: Vec<u16> = Vec::new();
+    loop {
+        // SAFETY: devs 为调用方传入的有效 HDEVINFO、info 指向其中有效元素；
+        // 缓冲区切片与所需大小出参均按 SetupAPI 语义传入（过小时按
+        // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) 扩容重试）
+        let ok = unsafe {
+            SetupDiGetDeviceInstanceIdW(devs, info, Some(buf.as_mut_slice()), Some(&mut required))
+        };
+        if ok.is_ok() {
+            break;
+        }
+        // 缓冲区太小：required 给出所需大小
+        // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+        let err = windows::core::Error::from_win32();
+        if err.code().0 as u32 != 0x8007_007A || required == 0 {
+            return Err(err).context("SetupDiGetDeviceInstanceIdW failed");
+        }
+        buf.resize(required as usize, 0);
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// 在调用方自己的设备信息集合上按实例 ID 重新打开设备，
+/// 返回配对该集合的 [`SP_DEVINFO_DATA`]（元素必须属于传入的集合，SetupAPI 契约）。
+fn open_device(devs: HDEVINFO, instance_id: &str) -> Result<SP_DEVINFO_DATA> {
+    let id_wide: Vec<u16> = instance_id
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut info = SP_DEVINFO_DATA {
+        cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: devs 为调用方传入的有效 HDEVINFO；id_wide 以 NUL 结尾且在
+    // 本调用期间存活；info.cbSize 已按结构体大小初始化（SetupAPI 要求）
+    unsafe {
+        SetupDiOpenDeviceInfoW(
+            devs,
+            windows::core::PCWSTR(id_wide.as_ptr()),
+            None,
+            0,
+            Some(&mut info),
+        )
+    }
+    .with_context(|| format!("SetupDiOpenDeviceInfoW({instance_id}) failed"))?;
+    Ok(info)
+}
+
+/// 在 Media 类设备里按硬件 ID 找 vdev-audio（含非 present），返回其设备实例 ID。
+///
+/// 返回实例 ID 而非 [`SP_DEVINFO_DATA`]：元素只属于枚举它的那个设备信息集合，
+/// 集合销毁后配到别的集合上用违反 SetupAPI 契约（元素属于传入集合）；
+/// 调用方应建立自己的集合并用 [`open_device`] 重新打开。
+fn find_device() -> Result<Option<String>> {
     let devs = unsafe {
         SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_MEDIA),
@@ -72,25 +129,28 @@ fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
         )
     }
     .context("SetupDiGetClassDevsW failed")?;
-    let mut found = None;
-    let mut index = 0u32;
-    loop {
-        let mut info = SP_DEVINFO_DATA {
-            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        if unsafe { SetupDiEnumDeviceInfo(devs, index, &mut info) }.is_err() {
-            break;
+    let found = (|| -> Result<Option<String>> {
+        let mut found = None;
+        let mut index = 0u32;
+        loop {
+            let mut info = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if unsafe { SetupDiEnumDeviceInfo(devs, index, &mut info) }.is_err() {
+                break;
+            }
+            index += 1;
+            let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
+            if wide_contains(&hwids, HARDWARE_ID) {
+                found = Some(get_instance_id(devs, &info)?);
+                break;
+            }
         }
-        index += 1;
-        let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-        if wide_contains(&hwids, HARDWARE_ID) {
-            found = Some(info);
-            break;
-        }
-    }
+        Ok(found)
+    })();
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(found)
+    found
 }
 
 /// 移除所有 vdev-audio 设备节点
@@ -261,12 +321,15 @@ pub fn install(inf_dir: &Path) -> Result<()> {
     result
 }
 
-/// 卸载
+/// 卸载：移除 Root\vdev-audio 设备节点。返回是否找到并移除。
 pub fn uninstall() -> Result<bool> {
-    let Some(dev_info) = find_device()? else {
+    let Some(instance_id) = find_device()? else {
         println!("未找到 vdev 虚拟声卡设备");
         return Ok(false);
     };
+
+    // 与 find_device 同域（flags=0，含非 present 残留），保证找到的实例一定能在此
+    // 集合里重新打开；Windows 运行时行为（SetupAPI + DIF_REMOVE），无法在 macOS 交叉环境单测
     let devs = unsafe {
         SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_MEDIA),
@@ -276,29 +339,37 @@ pub fn uninstall() -> Result<bool> {
         )
     }
     .context("SetupDiGetClassDevsW failed")?;
-    let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-        ClassInstallHeader:
-            windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<
-                    windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
-                >() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-        Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
-        HwProfile: 0,
-    };
-    unsafe {
-        windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
-            devs,
-            Some(&dev_info),
-            (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
-        )
-    }
-    .context("SetupDiSetDeviceInstallParamsW failed")?;
-    unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(&dev_info)) }
-        .with_context(|| "DIF_REMOVE failed")?;
+
+    let result = (|| -> Result<()> {
+        let dev_info = open_device(devs, &instance_id)?;
+
+        let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
+            ClassInstallHeader:
+                windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
+                    cbSize: std::mem::size_of::<
+                        windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
+                    >() as u32,
+                    InstallFunction: DIF_REMOVE,
+                },
+            Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
+            HwProfile: 0,
+        };
+        unsafe {
+            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
+                devs,
+                Some(&dev_info),
+                (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
+                    .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
+            )
+        }
+        .context("SetupDiSetDeviceInstallParamsW failed")?;
+        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(&dev_info)) }
+            .with_context(|| "DIF_REMOVE failed")?;
+        Ok(())
+    })();
+
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+    result?;
     println!("已移除 vdev 虚拟声卡设备");
     Ok(true)
 }
@@ -313,13 +384,16 @@ pub struct DeviceStatus {
 
 /// 查询设备状态
 pub fn status() -> Result<DeviceStatus> {
-    let Some(dev_info) = find_device()? else {
+    let Some(instance_id) = find_device()? else {
         return Ok(DeviceStatus {
             present: false,
             driver: None,
             friendly_name: None,
         });
     };
+
+    // 与 find_device 同域（flags=0），在自己集合上按实例 ID 重新打开后再读属性；
+    // Windows 运行时行为（SetupAPI 注册表属性读取），无法在 macOS 交叉环境单测
     let devs = unsafe {
         SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_MEDIA),
@@ -329,34 +403,40 @@ pub fn status() -> Result<DeviceStatus> {
         )
     }
     .context("SetupDiGetClassDevsW failed")?;
-    let driver = {
-        let buf = read_multi_sz(devs, &dev_info, SPDRP_DRIVER);
-        if buf.is_empty() {
-            None
-        } else {
-            Some(
-                String::from_utf16_lossy(&buf)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
-        }
-    };
-    let friendly_name = {
-        let buf = read_multi_sz(devs, &dev_info, SPDRP_FRIENDLYNAME);
-        if buf.is_empty() {
-            None
-        } else {
-            Some(
-                String::from_utf16_lossy(&buf)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
-        }
-    };
+
+    let result = (|| -> Result<DeviceStatus> {
+        let dev_info = open_device(devs, &instance_id)?;
+        let driver = {
+            let buf = read_multi_sz(devs, &dev_info, SPDRP_DRIVER);
+            if buf.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf16_lossy(&buf)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            }
+        };
+        let friendly_name = {
+            let buf = read_multi_sz(devs, &dev_info, SPDRP_FRIENDLYNAME);
+            if buf.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf16_lossy(&buf)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            }
+        };
+        Ok(DeviceStatus {
+            present: true,
+            driver,
+            friendly_name,
+        })
+    })();
+
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(DeviceStatus {
-        present: true,
-        driver,
-        friendly_name,
-    })
+    result
 }

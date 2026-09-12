@@ -9,11 +9,14 @@ workspace = true
 [features]
 default = []
 kernel = []
+# 内核调试日志（隐含 kernel）；未启用时 kdbg! 展开为空
+kernel-log = ["kernel"]
 
 [lib]
 name = "vdev_audio"
 crate-type = ["cdylib"]
 
-
-[build-dependencies]
+# winreg 仅在 Windows 宿主参与 build script 编译（build-dependencies 的
+# target cfg 按宿主匹配）；非 Windows 宿主交叉构建无需该依赖
+[target.'cfg(windows)'.build-dependencies]
 winreg = "0.52.0"

@@ -33,10 +33,17 @@
 #[cfg(feature = "kernel")]
 pub mod adapter;
 pub mod com;
+/// 端点子设备注册名/物理连接 pin 常量：无条件编译以支持宿主 #[test]
+///（消费方 adapter.rs 被 kernel feature 门控）
+pub mod endpoint_names;
 #[cfg(feature = "kernel")]
 pub mod miniport;
+/// B4 纯数学（时间→字节、环跨度切分）：无条件编译以支持宿主 #[test]
+pub mod position;
 pub mod ringbuffer;
 pub mod sys;
+/// Topology 小端口（IMiniportTopology + SPEAKER/MICIN 描述符表）：无条件编译以支持宿主 #[test]
+pub mod topology;
 
 #[cfg(feature = "kernel")]
 use adapter::install_virtual_cable;
@@ -48,14 +55,28 @@ use sys::types::{
     STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS,
 };
 
+/// 子设备对象数上限，即 `PcAddAdapterDevice` 的 `MaxObjects` 参数。
+///
+/// 微软文档（PcAddAdapterDevice — MaxObjects）："Specifies the maximum number
+/// of subdevice objects that the port driver will create for this device"，
+/// 必须覆盖端口驱动将创建的**全部**子设备，槽位耗尽后 `PcRegisterSubdevice`
+/// 会失败。本适配器注册 4 个子设备：WaveCapture / WaveRender（WaveRT 端点，
+/// adapter.rs `install_endpoint`）+ TopologyCapture / TopologyRender（拓扑
+/// 端点，adapter.rs `install_topology_endpoint`），见 `install_virtual_cable`。
+#[cfg(feature = "kernel")]
+const MAX_SUBDEVICES: u32 = 4;
+
 /// 设备添加回调：PcAddAdapterDevice 注册 StartDevice
 ///
 /// # Safety
 /// 由内核 `PnP` 子系统调用，`driver`/`pdo` 必须为有效指针。
 #[cfg(feature = "kernel")]
 unsafe extern "system" fn add_device(driver: PDRIVER_OBJECT, pdo: PDEVICE_OBJECT) -> NTSTATUS {
-    // SAFETY: PortCls 为设备创建 FDO 并绑定 StartDevice 回调
-    unsafe { PcAddAdapterDevice(driver, pdo, Some(start_device), 64, core::ptr::null_mut()) }
+    // SAFETY: PortCls 为设备创建 FDO 并绑定 StartDevice 回调。
+    // M1：签名对照 portcls.h 为 5 参（DriverObject, PhysicalDeviceObject,
+    // StartDevice, MaxObjects, DeviceExtensionSize）；DeviceExtensionSize=0，
+    // 适配器状态由驱动自己的单例 AdapterCommon 持有。
+    unsafe { PcAddAdapterDevice(driver, pdo, Some(start_device), MAX_SUBDEVICES, 0) }
 }
 
 /// StartDevice：创建设备启动时的适配器与虚拟声卡
@@ -114,6 +135,8 @@ pub unsafe extern "system" fn driver_entry(
     driver_object: PDRIVER_OBJECT,
     registry_path: PUNICODE_STRING,
 ) -> NTSTATUS {
+    // 内核调试日志（minor i）：默认静默，--features kernel-log 时输出
+    crate::kdbg!("DriverEntry\n");
     // SAFETY: PortCls 初始化驱动（注册 AddDevice 回调）
     unsafe { PcInitializeAdapterDriver(driver_object, registry_path, Some(add_device)) }
 }

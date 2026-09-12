@@ -10,6 +10,7 @@ use crate::ringbuffer::RingBuffer;
 use crate::sys::mem::{ExAllocatePool2_np, ExFreePoolWithTag_np};
 use crate::sys::portcls::*;
 use crate::sys::types::*;
+use crate::topology::MiniportTopology;
 
 pub const TAG: u32 = u32::from_le_bytes(*b"vdev");
 
@@ -62,11 +63,23 @@ pub struct AdapterCommon {
     pub refcount: u32,
     pub device_object: PDEVICE_OBJECT,
     pub physical_device_object: PDEVICE_OBJECT,
+    /// 环形缓冲对象（B1：与 ring_pool 同属一块池分配，ring 指向池基址）
     pub ring: *mut RingBuffer,
+    /// B1：环形缓冲的唯一池指针（RingBuffer 头 + 数据区一次分配），释放时只 free 它
+    pub ring_pool: *mut c_void,
     pub mic: *mut MiniportWaveRT,
     pub speaker: *mut MiniportWaveRT,
     pub mic_port: PVOID,
     pub speaker_port: PVOID,
+    /// topology 小端口（音频端点拓扑；驱动侧引用，随适配器释放）
+    pub topo_mic: *mut MiniportTopology,
+    pub topo_speaker: *mut MiniportTopology,
+    /// topology 子设备的 port 对象（PortCls 持有；teardown 注销用）
+    pub topo_mic_port: PVOID,
+    pub topo_speaker_port: PVOID,
+    /// 物理（wave↔topology）连接是否已注册——teardown 按此注销
+    pub phys_render_connected: bool,
+    pub phys_capture_connected: bool,
 }
 
 // 单例：一次只允许一个适配器
@@ -84,8 +97,9 @@ unsafe extern "system" fn adapter_qi(
         interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
         STATUS_SUCCESS
     } else {
+        // minor e：COM 约定 E_NOINTERFACE（不是 STATUS_INVALID_PARAMETER）
         *obj = core::ptr::null_mut();
-        STATUS_INVALID_PARAMETER
+        E_NOINTERFACE
     }
 }
 
@@ -100,15 +114,24 @@ unsafe extern "system" fn adapter_release(this: PVOID) -> u32 {
     // SAFETY: 引用计数保护
     let rc = unsafe { interlocked_decrement(core::ptr::addr_of_mut!((*this).refcount)) };
     if rc == 0 {
-        // SAFETY: 释放环形缓冲与子对象
-        if !(*this).ring.is_null() {
-            ExFreePoolWithTag_np((*this).ring.cast(), TAG);
+        // SAFETY: 释放环形缓冲（B1：单块池 = RingBuffer 头 + 数据区，free 唯一池指针）
+        // 与子对象
+        if !(*this).ring_pool.is_null() {
+            ExFreePoolWithTag_np((*this).ring_pool, TAG);
         }
         if !(*this).mic.is_null() {
             crate::miniport::miniport_release((*this).mic.cast());
         }
         if !(*this).speaker.is_null() {
             crate::miniport::miniport_release((*this).speaker.cast());
+        }
+        if !(*this).topo_mic.is_null() {
+            // SAFETY: topology 小端口头部即 vtable 指针，release_unknown 调其 Release
+            crate::com::release_unknown((*this).topo_mic.cast());
+        }
+        if !(*this).topo_speaker.is_null() {
+            // SAFETY: 同上
+            crate::com::release_unknown((*this).topo_speaker.cast());
         }
         ExFreePoolWithTag_np(this.cast(), TAG);
         INSTANCES = 0;
@@ -142,16 +165,25 @@ unsafe extern "system" fn adapter_init(
         return st;
     }
     (*this).physical_device_object = pdo;
-    // 分配共享环形缓冲（1 MB）
+    // 分配共享环形缓冲（1 MB）——B1：单块池分配（RingBuffer 头 + 数据区），
+    // 结构体 ptr::write 到池基址。旧实现在栈上构造 RingBuffer 后存其地址，
+    // init 返回即悬垂，首次使用必蓝屏。
     const RING_SIZE: usize = 1024 * 1024;
-    let ring_mem = ExAllocatePool2_np(0x40, RING_SIZE as u64, TAG);
-    if ring_mem.is_null() {
+    let pool = ExAllocatePool2_np(0x40, (size_of::<RingBuffer>() + RING_SIZE) as u64, TAG);
+    if pool.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    // SAFETY: ring_mem 有效
-    let ring = RingBuffer::new(ring_mem.cast(), RING_SIZE);
-    // ring 无 Drop（丢弃为 no-op），内存生命周期 = 适配器，由 adapter_release 释放
-    (*this).ring = &ring as *const RingBuffer as *mut RingBuffer;
+    let header = pool.cast::<RingBuffer>();
+    // SAFETY: pool 有效且容量 = size_of::<RingBuffer>() + RING_SIZE
+    let data = unsafe { (pool as *mut u8).add(size_of::<RingBuffer>()) };
+    // SAFETY: data 指向紧跟其后的 RING_SIZE 字节有效非分页内存
+    unsafe { core::ptr::write(header, RingBuffer::new(data, RING_SIZE)) };
+    // RingBuffer 无 Drop；内存生命周期 = 适配器，由 adapter_release 释放 ring_pool
+    // SAFETY: 单线程初始化
+    unsafe {
+        (*this).ring = header;
+        (*this).ring_pool = pool;
+    }
     STATUS_SUCCESS
 }
 
@@ -189,6 +221,12 @@ unsafe extern "system" fn adapter_cleanup(this: PVOID) {
     (*this).speaker = core::ptr::null_mut();
     (*this).mic_port = core::ptr::null_mut();
     (*this).speaker_port = core::ptr::null_mut();
+    (*this).topo_mic = core::ptr::null_mut();
+    (*this).topo_speaker = core::ptr::null_mut();
+    (*this).topo_mic_port = core::ptr::null_mut();
+    (*this).topo_speaker_port = core::ptr::null_mut();
+    (*this).phys_render_connected = false;
+    (*this).phys_capture_connected = false;
 }
 
 /// 创建适配器（单例）
@@ -215,10 +253,17 @@ pub unsafe fn create(device: PDEVICE_OBJECT) -> *mut AdapterCommon {
             device_object: core::ptr::null_mut(),
             physical_device_object: core::ptr::null_mut(),
             ring: core::ptr::null_mut(),
+            ring_pool: core::ptr::null_mut(),
             mic: core::ptr::null_mut(),
             speaker: core::ptr::null_mut(),
             mic_port: core::ptr::null_mut(),
             speaker_port: core::ptr::null_mut(),
+            topo_mic: core::ptr::null_mut(),
+            topo_speaker: core::ptr::null_mut(),
+            topo_mic_port: core::ptr::null_mut(),
+            topo_speaker_port: core::ptr::null_mut(),
+            phys_render_connected: false,
+            phys_capture_connected: false,
         },
     );
     let this = ptr as *mut AdapterCommon;
@@ -231,6 +276,13 @@ pub unsafe fn create(device: PDEVICE_OBJECT) -> *mut AdapterCommon {
     }
     this
 }
+
+// 子设备注册名与物理连接 pin 常量在 endpoint_names 模块（无条件编译，
+// 宿主 #[test] 可校验其与 INF 模板/pin 布局的一致性）
+use crate::endpoint_names::{
+    TOPO_CAPTURE_TO_WAVE_PIN, TOPO_RENDER_FROM_WAVE_PIN, TOPOLOGY_CAPTURE_NAME,
+    TOPOLOGY_RENDER_NAME, WAVE_CAPTURE_NAME, WAVE_PIN, WAVE_RENDER_NAME,
+};
 
 /// 安装一个端点（port + miniport + PcRegisterSubdevice）
 ///
@@ -255,9 +307,10 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
         crate::com::release_unknown(port);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    // 驱动保留自己的 miniport 引用（供 cleanup/release 使用；port->Init 会另加引用）
-    // SAFETY: miniport 有效
-    crate::miniport::miniport_addref(miniport.cast());
+    // 所有权（M4）：MiniportWaveRT::create 返回 refcount=1 的引用，归适配器持有；
+    // port->Init 成功时 PortCls 的 port 对象另持一份（内部 AddRef→2）。此处不再
+    // 额外 AddRef——多加的那份谁也不释放，adapter_release 永远减不到 0（永久泄漏）。
+    // 驱动侧引用由 adapter_cleanup 释放；PortCls 侧随 port 对象销毁释放。
     // 3) port->Init(DeviceObject, Irp, miniport, adapter, ResourceList)
     let init_fn = port_iport_init(port);
     let st = init_fn(
@@ -279,13 +332,9 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
     (*miniport).set_ring(ring);
     // 5) PcRegisterSubdevice(DeviceObject, name, port)
     let name_wide: &[u16] = if capture {
-        &[
-            0x57, 0x61, 0x76, 0x65, 0x43, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x30, 0x00,
-        ] // "WaveCapture-0"
+        WAVE_CAPTURE_NAME
     } else {
-        &[
-            0x57, 0x61, 0x76, 0x65, 0x52, 0x65, 0x6e, 0x64, 0x65, 0x72, 0x2d, 0x30, 0x00,
-        ] // "WaveRender-0"
+        WAVE_RENDER_NAME
     };
     let st = PcRegisterSubdevice(adapter.device_object, name_wide.as_ptr(), port);
     if st < 0 {
@@ -297,24 +346,6 @@ unsafe fn install_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS 
     // PcRegisterSubdevice 成功后 PortCls 持有 port 引用；释放驱动那份 PcNewPort 引用
     // SAFETY: port 仍有效（PortCls 持有）
     crate::com::release_unknown(port);
-    // 注册 KSCATEGORY_AUDIO 设备接口（控制面板音频端点可见）
-    // SAFETY: pdo 有效；reference 为局部宽字符串，符号链接输出可丢弃
-    let pdo = adapter.physical_device_object;
-    let mut symbolic = UNICODE_STRING {
-        Length: 0,
-        MaximumLength: 0,
-        Buffer: core::ptr::null_mut(),
-    };
-    let mut ref_us = UNICODE_STRING {
-        Length: (name_wide.len().saturating_sub(1) * 2) as u16,
-        MaximumLength: (name_wide.len() * 2) as u16,
-        Buffer: name_wide.as_ptr() as PWSTR,
-    };
-    let st = IoRegisterDeviceInterface(pdo, &KSCATEGORY_AUDIO, &mut ref_us, &mut symbolic);
-    if st >= 0 && !symbolic.Buffer.is_null() {
-        // SAFETY: 释放内核分配的符号链接缓冲
-        RtlFreeUnicodeString(&mut symbolic);
-    }
     if capture {
         adapter.mic = miniport;
         adapter.mic_port = port;
@@ -337,18 +368,168 @@ pub unsafe fn port_iport_init(
     (*vtbl).init
 }
 
-/// 安装虚拟声卡（扬声器 + 麦克风 + 配对环回）
+/// 安装一个 topology 端点（PortTopology + MiniportTopology + PcRegisterSubdevice）
+///
+/// 顺序对照 sysvad common.cpp InstallEndpointFilters：PcNewPort → 创建小端口 →
+/// port->Init(DeviceObject, Irp, miniport, adapter, ResourceList) →
+/// PcRegisterSubdevice。IPortTopology 与 IPortWaveRT 共享同一 IPort::Init
+/// 槽位（vtable 第 4 项），故复用 port_iport_init。
+///
+/// # Safety
+/// this 必须有效。
+unsafe fn install_topology_endpoint(this: *mut AdapterCommon, capture: bool) -> NTSTATUS {
+    let adapter = &mut *this;
+    // 1) PcNewPort 创建 PortTopology
+    let mut port: PVOID = core::ptr::null_mut();
+    let st = PcNewPort(&mut port, &CLSID_PortTopology);
+    if st < 0 {
+        return st;
+    }
+    // 2) 创建 MiniportTopology（refcount=1，引用归驱动持有）
+    let miniport = MiniportTopology::create(capture);
+    if miniport.is_null() {
+        // SAFETY: 释放驱动持有的 port 引用
+        crate::com::release_unknown(port);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    // 3) port->Init 成功时 PortCls 的 port 对象另持一份 miniport 引用（同 wave 路径）
+    let init_fn = port_iport_init(port);
+    let st = init_fn(
+        port,
+        adapter.device_object,
+        core::ptr::null_mut(),
+        miniport.cast(),
+        adapter as *mut AdapterCommon as PVOID,
+        core::ptr::null_mut(),
+    );
+    if st < 0 {
+        // SAFETY: Init 失败则 port 未接管 miniport；释放驱动持有的两份引用
+        crate::com::release_unknown(port);
+        crate::com::release_unknown(miniport.cast());
+        return st;
+    }
+    // 4) PcRegisterSubdevice(DeviceObject, name, port)
+    let name_wide: &[u16] = if capture {
+        TOPOLOGY_CAPTURE_NAME
+    } else {
+        TOPOLOGY_RENDER_NAME
+    };
+    let st = PcRegisterSubdevice(adapter.device_object, name_wide.as_ptr(), port);
+    if st < 0 {
+        // SAFETY: PcRegisterSubdevice 失败则 port 未接管；释放两份驱动引用
+        crate::com::release_unknown(port);
+        crate::com::release_unknown(miniport.cast());
+        return st;
+    }
+    // PcRegisterSubdevice 成功后 PortCls 持有 port 引用；释放驱动那份 PcNewPort 引用
+    // SAFETY: port 仍有效（PortCls 持有）
+    crate::com::release_unknown(port);
+    if capture {
+        adapter.topo_mic = miniport;
+        adapter.topo_mic_port = port;
+    } else {
+        adapter.topo_speaker = miniport;
+        adapter.topo_speaker_port = port;
+    }
+    STATUS_SUCCESS
+}
+
+/// M8：安装失败路径的端点注销——先经 IUnregisterPhysicalConnection 解除
+/// wave↔topology 物理连接（sysvad DisconnectTopologies 先于子设备注销，且
+/// 参数须与注册时完全一致），再经 IUnregisterSubdevice 解除 PortCls 持有的
+/// 子设备引用（port 对象随之销毁，其对 miniport 的引用一并解除），随后
+/// start_device 再 release 适配器；否则子设备链里的 port/miniport 反向引用
+/// 已释放的适配器内存，后续访问即 UAF。
+///
+/// # Safety
+/// this 必须有效；仅应在 install_virtual_cable 失败路径调用（成功路径的
+/// 生命周期由 PortCls/适配器析构顺序管理）。
+unsafe fn teardown_endpoints(this: *mut AdapterCommon) {
+    // SAFETY: 调用方保证 this 有效
+    let adapter = &mut *this;
+    // 1) 注销物理连接（best-effort，失败继续）
+    if adapter.phys_render_connected {
+        // SAFETY: 两端为已注册子设备的有效 port 对象
+        unsafe {
+            pc_unregister_physical_connection(
+                adapter.device_object,
+                adapter.speaker_port,
+                WAVE_PIN,
+                adapter.topo_speaker_port,
+                TOPO_RENDER_FROM_WAVE_PIN,
+            )
+        };
+        adapter.phys_render_connected = false;
+    }
+    if adapter.phys_capture_connected {
+        // SAFETY: 同上
+        unsafe {
+            pc_unregister_physical_connection(
+                adapter.device_object,
+                adapter.topo_mic_port,
+                TOPO_CAPTURE_TO_WAVE_PIN,
+                adapter.mic_port,
+                WAVE_PIN,
+            )
+        };
+        adapter.phys_capture_connected = false;
+    }
+    // 2) 注销子设备
+    if !adapter.topo_mic_port.is_null() {
+        // SAFETY: port 为尚未注销的有效子设备 COM 对象
+        unsafe { pc_unregister_subdevice(adapter.device_object, adapter.topo_mic_port) };
+        adapter.topo_mic_port = core::ptr::null_mut();
+    }
+    if !adapter.topo_speaker_port.is_null() {
+        // SAFETY: 同上
+        unsafe { pc_unregister_subdevice(adapter.device_object, adapter.topo_speaker_port) };
+        adapter.topo_speaker_port = core::ptr::null_mut();
+    }
+    if !adapter.mic_port.is_null() {
+        // SAFETY: port 为尚未注销的有效子设备 COM 对象
+        unsafe { pc_unregister_subdevice(adapter.device_object, adapter.mic_port) };
+        adapter.mic_port = core::ptr::null_mut();
+    }
+    if !adapter.speaker_port.is_null() {
+        // SAFETY: 同上
+        unsafe { pc_unregister_subdevice(adapter.device_object, adapter.speaker_port) };
+        adapter.speaker_port = core::ptr::null_mut();
+    }
+}
+
+/// 安装虚拟声卡（扬声器 + 麦克风 + 配对环回 + 端点拓扑 + wave↔topology 连接）
+///
+/// 顺序对照 sysvad CAdapterCommon::InstallDevice：先注册全部子设备
+///（wave capture/render，topology capture/render），再 ConnectTopologies 注册
+/// 两条物理连接；任一步失败沿注册逆序 teardown。
 ///
 /// # Safety
 /// this 必须有效。
 pub unsafe fn install_virtual_cable(this: *mut AdapterCommon) -> NTSTATUS {
-    let st_mic = install_endpoint(this, true);
+    // SAFETY: 调用方保证 this 有效
+    let st_mic = unsafe { install_endpoint(this, true) };
     if st_mic < 0 {
         return st_mic;
     }
-    let st_spk = install_endpoint(this, false);
+    // SAFETY: 调用方保证 this 有效
+    let st_spk = unsafe { install_endpoint(this, false) };
     if st_spk < 0 {
+        // M8：第二端点安装失败——先注销已注册的麦克风子设备再返回
+        unsafe { teardown_endpoints(this) };
         return st_spk;
+    }
+    // topology 端点（播放/录音设备的音频端点拓扑）
+    // SAFETY: 调用方保证 this 有效
+    let st_topo_cap = unsafe { install_topology_endpoint(this, true) };
+    if st_topo_cap < 0 {
+        unsafe { teardown_endpoints(this) };
+        return st_topo_cap;
+    }
+    // SAFETY: 调用方保证 this 有效
+    let st_topo_ren = unsafe { install_topology_endpoint(this, false) };
+    if st_topo_ren < 0 {
+        unsafe { teardown_endpoints(this) };
+        return st_topo_ren;
     }
     // 配对：麦克风小端口持有扬声器小端口（环回写入）
     // SAFETY: 两者已创建
@@ -356,5 +537,38 @@ pub unsafe fn install_virtual_cable(this: *mut AdapterCommon) -> NTSTATUS {
     let spk = (*this).speaker;
     (*mic).set_paired(spk);
     (*spk).set_paired(mic);
+    // wave↔topology 物理（filter 间）连接——对照 sysvad ConnectTopologies
+    //（common.cpp:2023-2052）：CONNECTIONTYPE_WAVE_OUTPUT 为 render 路径
+    //（wave → topology），CONNECTIONTYPE_TOPOLOGY_OUTPUT 为 capture 路径
+    //（topology → wave）；PcRegisterPhysicalConnection 参数顺序为
+    //(DeviceObject, From, FromPin, To, ToPin)（portcls.h:3888）。
+    // Windows 运行时行为（PortCls filter 图构建、端点枚举）无法宿主单测，
+    // 仅交叉编译 + 真机验证。
+    // SAFETY: 调用方保证 this 有效，四个 port 均已注册
+    let st = PcRegisterPhysicalConnection(
+        (*this).device_object,
+        (*this).speaker_port,
+        WAVE_PIN,
+        (*this).topo_speaker_port,
+        TOPO_RENDER_FROM_WAVE_PIN,
+    );
+    if st < 0 {
+        unsafe { teardown_endpoints(this) };
+        return st;
+    }
+    (*this).phys_render_connected = true;
+    // SAFETY: 同上
+    let st = PcRegisterPhysicalConnection(
+        (*this).device_object,
+        (*this).topo_mic_port,
+        TOPO_CAPTURE_TO_WAVE_PIN,
+        (*this).mic_port,
+        WAVE_PIN,
+    );
+    if st < 0 {
+        unsafe { teardown_endpoints(this) };
+        return st;
+    }
+    (*this).phys_capture_connected = true;
     STATUS_SUCCESS
 }

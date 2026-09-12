@@ -1,3 +1,4 @@
+# 交叉目标由命令行 --target x86_64-pc-windows-msvc 显式给出，
+# 不在此固定（宿主 cargo test/clippy 需要按宿主目标跑）
 [build]
-target = "x86_64-pc-windows-msvc"
 rustflags = []
