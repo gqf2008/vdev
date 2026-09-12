@@ -179,6 +179,9 @@ impl AdaptiveMixer {
 /// samples that do not fill a whole `channels`-wide frame -- is dropped, the
 /// same rule WASAPI's own frame accounting uses. Mono input (`channels == 1`)
 /// is an exact copy, so the denoise path never resamples a mono mic.
+// Consumed by the Windows backend (`platform/windows.rs`); on every other
+// target only the unit tests below call it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels == 0 {
         return Vec::new();
