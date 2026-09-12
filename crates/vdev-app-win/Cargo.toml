@@ -26,6 +26,12 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Windows 专用依赖按 cfg(windows) 门控：bin（main.rs）在 Windows 上链接它；
+# 门控后 macOS 宿主只需构建无 Windows 依赖的 lib 目标（src/lib.rs 纯逻辑），
+# `cargo test --lib` 才能真正跑通（bin 本就只能在 Windows 侧构建）。
+[target.'cfg(windows)'.dependencies]
 # 复用 Windows 虚拟摄像头的安全封装（注册/注销/推流/枚举）
 vdev-camera-win = { path = "../vdev-camera-win" }
+
 

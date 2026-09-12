@@ -1,5 +1,5 @@
 // vdev (Windows) — vdev 虚拟设备宿主（Rust + Slint + slint-pixel）
-// Tab 0：虚拟摄像头；Tab 1：虚拟显示器
+// Tab 0：虚拟摄像头；Tab 1：虚拟显示器；Tab 2：虚拟声卡；Tab 3：虚拟键盘
 import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme } from "@slint_pixel";
 import { ScrollView } from "std-widgets.slint";
 
@@ -97,6 +97,13 @@ export component MainWindow inherits Window {
                 text: "虚拟声卡";
                 background: AppState.current_tab == 2 ? PixelTheme.accent : PixelTheme.bg;
                 clicked => { AppState.current_tab = 2; }
+            }
+            // M3：第 4 个 tab 按钮——current_tab == 3 的面板（虚拟键盘）此前
+            // 没有任何入口，永远不可达。
+            PixelButton {
+                text: "虚拟键盘";
+                background: AppState.current_tab == 3 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 3; }
             }
         }
 

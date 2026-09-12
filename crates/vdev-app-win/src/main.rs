@@ -4,11 +4,16 @@
 //! 推流 / 日志），后端全部调用 `vdev-camera-win` 的安全封装（注册 / 注销 /
 //! 推流 / 设备枚举）。本文件是纯业务层，不含 unsafe。
 
+// release 构建隐藏控制台黑窗（GUI 程序）；debug 保留控制台便于看日志/panic。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+use vdev_app_win::{next_push_action, PushAction};
 
 slint::include_modules!();
 slint_pixel::impl_title_bar_ui!(MainWindow);
@@ -702,78 +707,10 @@ fn wire_ui(ui: &MainWindow, logs: &Logs) {
             refresh_audio_status(&ui, &logs);
         });
     }
-}
-
-/// 推流开关：点击「开始推流 / 停止推流」切换。
-fn toggle_push(ui: &MainWindow, logs: &Logs) {
-    // 先尝试占用：已占用说明正在推流 → 停止。
-    if PUSH_RUNNING.swap(true, Ordering::SeqCst) {
-        // 主线程立即复位按钮（不依赖推流线程退出；线程可能卡在 SHM 写入）。
-        ui.global::<AppState>().set_push_btn_text("开始推流".into());
-        PUSH_RUNNING.store(false, Ordering::SeqCst);
-        if let Some(h) = PUSH_THREAD.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        append_log(ui, logs, "推流已停止");
-        return;
-    }
-    match vdev_camera_win::CameraServer::open() {
-        Ok(server) => {
-            // 切换按钮为「停止推流」（再点一次即停止）。
-            ui.global::<AppState>().set_push_btn_text("停止推流".into());
-            append_log(
-                ui,
-                logs,
-                format!("推流开始（棋盘格 {PUSH_WIDTH}x{PUSH_HEIGHT}@{PUSH_FPS}fps）…"),
-            );
-            let weak = ui.as_weak();
-            let logs2 = logs.clone();
-            let handle = std::thread::Builder::new()
-                .name("vdev-app-win-push".into())
-                .spawn(move || {
-                    let format = vdev_camera_win::VideoFormat {
-                        width: PUSH_WIDTH,
-                        height: PUSH_HEIGHT,
-                        fps: PUSH_FPS,
-                    };
-                    let mut buf = Vec::new();
-                    let mut t = 0.0f64;
-                    let interval = std::time::Duration::from_secs_f64(1.0 / PUSH_FPS as f64);
-                    let start = std::time::Instant::now();
-                    let mut count: u64 = 0;
-                    while PUSH_RUNNING.load(Ordering::SeqCst) {
-                        vdev_camera_win::dshow::streaming::render_pattern(
-                            &mut buf, &format, &mut t,
-                        );
-                        if let Err(e) = server.push_frame(PUSH_WIDTH, PUSH_HEIGHT, &buf) {
-                            if let Some(ui) = weak.upgrade() {
-                                append_log(&ui, &logs2, format!("推流失败: {e:#}"));
-                            }
-                            break;
-                        }
-                        count += 1;
-                        let next = start + interval * (count as u32);
-                        if let Some(remain) = next.checked_duration_since(std::time::Instant::now())
-                        {
-                            std::thread::sleep(remain);
-                        }
-                    }
-                    PUSH_RUNNING.store(false, Ordering::SeqCst);
-                    // UI 更新必须回到主线程事件循环执行（Slint 跨线程 setter 不可靠）。
-                    let weak2 = weak.clone();
-                    let logs3 = logs2.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak2.upgrade() {
-                            append_log(&ui, &logs3, format!("推流线程结束，共 {count} 帧"));
-                            ui.global::<AppState>().set_push_btn_text("开始推流".into());
-                        }
-                    });
-                })
-                .expect("spawn push thread");
-            *PUSH_THREAD.lock().unwrap() = Some(handle);
-        }
-        Err(e) => append_log(ui, logs, format!("打开推流通道失败: {e:#}")),
-    }
+    // M1：HID 回调注册必须在 wire_ui 一次性完成——此前写在 toggle_push 里，
+    // 每点一次推流就重复注册一份（旧回调不注销 → 重复日志/重复刷新）；且
+    // 鼠标回调原本嵌在 key 回调闭包内，首次注入按键前甚至未注册。这些回调
+    // 均由 UI 事件循环线程触发，不涉及跨线程（推流线程才是 M2 的问题点）。
     {
         let weak = ui.as_weak();
         let logs = logs.clone();
@@ -818,29 +755,131 @@ fn toggle_push(ui: &MainWindow, logs: &Logs) {
             }
             append_log(&ui, &logs, format!("注入按键：{key}"));
             run_hid_cli(&["kernel", "key", &key], &ui, &logs);
-            {
-                let weak = ui.as_weak();
-                let logs = logs.clone();
-                ui.on_hid_mouse_click(move |button| {
-                    let Some(ui) = weak.upgrade() else { return };
-                    let button: String = button.trim().to_string();
-                    append_log(&ui, &logs, format!("注入鼠标点击：{button}"));
-                    run_hid_cli(&["kernel", "mouse", "click", &button], &ui, &logs);
-                });
-            }
-            {
-                let weak = ui.as_weak();
-                let logs = logs.clone();
-                ui.on_hid_mouse_move(move |dx, dy| {
-                    let Some(ui) = weak.upgrade() else { return };
-                    append_log(&ui, &logs, format!("注入鼠标相对移动（{dx},{dy}）"));
-                    run_hid_cli(
-                        &["kernel", "mouse", "move", &dx.to_string(), &dy.to_string()],
-                        &ui,
-                        &logs,
-                    );
-                });
-            }
         });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_mouse_click(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            let button: String = button.trim().to_string();
+            append_log(&ui, &logs, format!("注入鼠标点击：{button}"));
+            run_hid_cli(&["kernel", "mouse", "click", &button], &ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_hid_mouse_move(move |dx, dy| {
+            let Some(ui) = weak.upgrade() else { return };
+            append_log(&ui, &logs, format!("注入鼠标相对移动（{dx},{dy}）"));
+            run_hid_cli(
+                &["kernel", "mouse", "move", &dx.to_string(), &dy.to_string()],
+                &ui,
+                &logs,
+            );
+        });
+    }
+}
+
+/// 推流开关：点击「开始推流 / 停止推流」切换。
+///
+/// 本函数只做启停（M1：HID 等回调注册一律放在 wire_ui 一次性完成，
+/// 此前写在这里导致每点一次推流就重复注册一份回调）。状态转移决策在
+/// `next_push_action`（lib.rs，宿主可测）；所有错误路径必须复位
+/// PUSH_RUNNING（M4），否则按钮卡在「停止推流」态且无法再次启动。
+fn toggle_push(ui: &MainWindow, logs: &Logs) {
+    // swap(true)：原子占用——原值 true 说明正在推流 → 停止；false → 开始。
+    match next_push_action(PUSH_RUNNING.swap(true, Ordering::SeqCst)) {
+        PushAction::Stop => {
+            // 停止即复位标志（主线程立即复位按钮，不依赖推流线程退出；
+            // 线程可能卡在 SHM 写入，join 放在复位之后）。
+            PUSH_RUNNING.store(false, Ordering::SeqCst);
+            ui.global::<AppState>().set_push_btn_text("开始推流".into());
+            if let Some(h) = PUSH_THREAD.lock().unwrap().take() {
+                let _ = h.join();
+            }
+            append_log(ui, logs, "推流已停止");
+        }
+        PushAction::Start => match vdev_camera_win::CameraServer::open() {
+            Ok(server) => {
+                // 切换按钮为「停止推流」（再点一次即停止）。
+                ui.global::<AppState>().set_push_btn_text("停止推流".into());
+                append_log(
+                    ui,
+                    logs,
+                    format!("推流开始（棋盘格 {PUSH_WIDTH}x{PUSH_HEIGHT}@{PUSH_FPS}fps）…"),
+                );
+                let weak = ui.as_weak();
+                let logs2 = logs.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("vdev-app-win-push".into())
+                    .spawn(move || {
+                        let format = vdev_camera_win::VideoFormat {
+                            width: PUSH_WIDTH,
+                            height: PUSH_HEIGHT,
+                            fps: PUSH_FPS,
+                        };
+                        let mut buf = Vec::new();
+                        let mut t = 0.0f64;
+                        let interval = std::time::Duration::from_secs_f64(1.0 / PUSH_FPS as f64);
+                        let start = std::time::Instant::now();
+                        let mut count: u64 = 0;
+                        while PUSH_RUNNING.load(Ordering::SeqCst) {
+                            vdev_camera_win::dshow::streaming::render_pattern(
+                                &mut buf, &format, &mut t,
+                            );
+                            if let Err(e) = server.push_frame(PUSH_WIDTH, PUSH_HEIGHT, &buf) {
+                                // M2：不得在推流线程直接 upgrade()/调 Slint setter——
+                                // Weak::upgrade() 在非创建线程恒返回 None（日志静默
+                                // 丢失），跨线程直接改 UI 状态本身也是 UB。统一投递回
+                                // 事件循环执行；闭包只捕获 Send 的 Weak 与
+                                // Arc<Mutex<_>>，upgrade 在 UI 线程内完成。
+                                let err = format!("{e:#}");
+                                let weak2 = weak.clone();
+                                let logs3 = logs2.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = weak2.upgrade() {
+                                        append_log(&ui, &logs3, format!("推流失败: {err}"));
+                                    }
+                                });
+                                break;
+                            }
+                            count += 1;
+                            let next = start + interval * (count as u32);
+                            if let Some(remain) =
+                                next.checked_duration_since(std::time::Instant::now())
+                            {
+                                std::thread::sleep(remain);
+                            }
+                        }
+                        PUSH_RUNNING.store(false, Ordering::SeqCst);
+                        // UI 更新必须回到主线程事件循环执行（Slint 跨线程 setter 不可靠）。
+                        let weak2 = weak.clone();
+                        let logs3 = logs2.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak2.upgrade() {
+                                append_log(&ui, &logs3, format!("推流线程结束，共 {count} 帧"));
+                                ui.global::<AppState>().set_push_btn_text("开始推流".into());
+                            }
+                        });
+                    });
+                match spawned {
+                    Ok(handle) => *PUSH_THREAD.lock().unwrap() = Some(handle),
+                    Err(e) => {
+                        // M4：线程创建失败也是启动失败——复位标志并还原按钮，
+                        // 否则按钮卡在「停止推流」态且无法再次启动。
+                        PUSH_RUNNING.store(false, Ordering::SeqCst);
+                        ui.global::<AppState>().set_push_btn_text("开始推流".into());
+                        append_log(ui, logs, format!("创建推流线程失败: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                // M4：启动失败必须复位标志，否则下次点击走停止分支，无法再次启动。
+                PUSH_RUNNING.store(false, Ordering::SeqCst);
+                append_log(ui, logs, format!("打开推流通道失败: {e:#}"));
+            }
+        },
     }
 }
