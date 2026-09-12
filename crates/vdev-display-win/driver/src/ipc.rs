@@ -186,7 +186,12 @@ pub fn startup() {
             let mut first_instance = true;
 
             loop {
-                let mut options = ServerOptions::new()
+                // tokio ServerOptions 是 &mut self -> &mut Self 的链式 builder，
+                // 从临时值 ServerOptions::new() 直接链起会得到指向临时值的引用
+                // （E0716：temporary value dropped while borrowed）——先落局部
+                // 变量再链式调用
+                let mut options = ServerOptions::new();
+                options
                     .access_inbound(true)
                     .access_outbound(true)
                     .reject_remote_clients(true)

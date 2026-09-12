@@ -260,7 +260,9 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             $crate::WdfObjectGetTypedContextWorker(handle, [<_WDF_ $context_type _TYPE_INFO>].cell.get())?
                         } as *mut ::std::mem::MaybeUninit<[<WdfObject $context_type>]>;
 
-                        let context = &mut *context;
+                        // SAFETY: Worker 成功返回的指针即该对象已注册类型的上下文
+                        // 空间，从未写入过，建立可变引用合法
+                        let context = unsafe { &mut *context };
 
                         // Write to the memory location, making the data in it init
                         context.write(
@@ -288,13 +290,16 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             $crate::WdfObjectGetTypedContextWorker(handle, [<_WDF_ $context_type _TYPE_INFO>].cell.get())?
                         } as *mut ::std::mem::MaybeUninit<[<WdfObject $context_type>]>;
 
-                        let context = &mut *context;
+                        // SAFETY: 同 init——Worker 成功返回的指针即该对象上下文空间
+                        let context = unsafe { &mut *context };
 
                         let from_context = unsafe {
                             $crate::WdfObjectGetTypedContextWorker(self.device as *mut _, [<_WDF_ $context_type _TYPE_INFO>].cell.get())?
                         } as *mut [<WdfObject $context_type>];
 
-                        let from_context = match &(*from_context).0 {
+                        // SAFETY: from_context 指向源对象已 init 的上下文；此处仅读
+                        // discriminant 并克隆 Arc/Weak（共享读，不改原上下文）
+                        let from_context = match unsafe { &(*from_context).0 } {
                             // M4：零初始化（未 init）的源上下文没有可克隆的数据
                             ArcPointer::Uninit => return Err($crate::WdfError::NotInitialized),
                             ArcPointer::Strong(a) => a.clone(),
@@ -327,13 +332,19 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                     $sv unsafe fn drop(
                         handle: $crate::wdf_umdf_sys::WDFOBJECT,
                     ) -> ::std::result::Result<(), $crate::WdfError> {
-                        let context = $crate::WdfObjectGetTypedContextWorker(
-                            handle,
-                            [<_WDF_ $context_type _TYPE_INFO>].cell.get(),
-                        )? as *mut [<WdfObject $context_type>];
+                        // SAFETY: handle 的上下文类型已注册，Worker 成功返回合法
+                        // 上下文指针
+                        let context = unsafe {
+                            $crate::WdfObjectGetTypedContextWorker(
+                                handle,
+                                [<_WDF_ $context_type _TYPE_INFO>].cell.get(),
+                            )?
+                        } as *mut [<WdfObject $context_type>];
 
                         // drop the memory（Uninit 变体无资源，drop_in_place 为 no-op）
-                        ::std::ptr::drop_in_place(context);
+                        // SAFETY: 依函数 SAFETY 约定，上下文要么已 init 要么为框架
+                        // 零初始化的 Uninit，两种情况就地析构均合法
+                        unsafe { ::std::ptr::drop_in_place(context) };
 
                         Ok(())
                     }
@@ -359,7 +370,9 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             )?
                         } as *mut [<WdfObject $context_type>];
 
-                        let context = &*context;
+                        // SAFETY: Worker 成功返回的指针即该对象上下文空间，此处仅
+                        // 按其建立共享引用（读）
+                        let context = unsafe { &*context };
 
                         let context = match &context.0 {
                             // M4：零初始化（未 init）的上下文不可访问
@@ -398,7 +411,9 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             )?
                         } as *mut [<WdfObject $context_type>];
 
-                        let context = &*context;
+                        // SAFETY: Worker 成功返回的指针即该对象上下文空间，此处仅
+                        // 按其建立共享引用（读）
+                        let context = unsafe { &*context };
 
                         let context = match &context.0 {
                             // M4：零初始化（未 init）的上下文不可访问
@@ -437,7 +452,9 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             )?
                         } as *mut [<WdfObject $context_type>];
 
-                        let context = &*context;
+                        // SAFETY: Worker 成功返回的指针即该对象上下文空间，此处仅
+                        // 按其建立共享引用（读）
+                        let context = unsafe { &*context };
 
                         let context = match &context.0 {
                             // M4：零初始化（未 init）的上下文不可访问
@@ -476,7 +493,9 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             )?
                         } as *mut [<WdfObject $context_type>];
 
-                        let context = &*context;
+                        // SAFETY: Worker 成功返回的指针即该对象上下文空间，此处仅
+                        // 按其建立共享引用（读）
+                        let context = unsafe { &*context };
 
                         let context = match &context.0 {
                             // M4：零初始化（未 init）的上下文不可访问
