@@ -35,7 +35,10 @@ env:
 jobs:
   macos:
     name: macOS 主 workspace
-    runs-on: macos-14
+    # macos-14 镜像的 SDK 缺 CGEventField 滚轮相关键（cgevents 0.10.1 的 Swift 桥
+    # 编译期 switch 直接引用，无可用性守卫）→ build.rs panic。本机 macOS 26.5 SDK
+    # 有这些键（kCGScrollWheelEventMomentumOptionPhase=173 等），对齐 macos-26。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
