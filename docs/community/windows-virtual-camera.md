@@ -1,6 +1,6 @@
 # 用纯 Rust 写一个 Windows 虚拟摄像头：DirectShow 源过滤器全解析
 
-> 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡与 Windows 摄像头/显示器/声卡/HID 六篇。
+> 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
 
 虚拟摄像头是虚拟设备里最"平易近人"的一种：它不要求理解内核电源管理，也不要求签发驱动包，却覆盖了从 COM、跨进程共享内存到多媒体框架协商的完整知识面。本文以 vdev 仓库中的 `vdev-camera-win`（约 3100 行 Rust，含注释与测试）为例，讲清楚一条完整的实现路径：如何用纯 Rust 写一个 DirectShow 源过滤器（Source Filter），把它注册成系统摄像头，并把另一个进程推送的帧安全地送到任意 App 的摄像头画面里。
 

@@ -1,6 +1,6 @@
 # 用 Rust 写 Windows 内核虚拟键鼠：KMDF HID minidriver 从报告描述符到注入链路
 
-> 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡与 Windows 摄像头/显示器/声卡/HID 六篇。
+> 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
 
 ## 1. 为什么要"软件造一套键盘鼠标"
 

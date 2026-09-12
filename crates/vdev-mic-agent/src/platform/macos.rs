@@ -1501,7 +1501,7 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     } else {
         10.0
     };
-    let out_ring = Arc::new(SpscRing::new(48_000)); // 1 s of slack
+    let out_ring = Arc::new(SpscRing::new(48_000)); // ~1.4 s of slack (rounded up to 64 Ki samples)
     let pending: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
     let probe_mode = cfg.probe;
     let is_probe = probe_mode.is_some();

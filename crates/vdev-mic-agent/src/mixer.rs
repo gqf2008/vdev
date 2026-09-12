@@ -15,7 +15,8 @@
 //!
 //! From those, a long-term SNR. The gain follows it through a hysteresis gate:
 //! a mic that is 30+ dB above its own noise floor is left alone (`min_wet`),
-//! anything below ~20 dB gets the full model (`max_wet`).
+//! anything below ~15 dB (`gate_db` − `ramp_db` = 25 − 10) gets the full
+//! model (`max_wet`).
 //!
 //! Everything is deliberately slow (hundreds of ms). A per-frame SNR would flip
 //! the gain on every 10 ms boundary and pump audibly; what we want is "is this

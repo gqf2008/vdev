@@ -28,7 +28,7 @@ proposal, and produces **numerically identical audio** (100 % of samples within
 ## Build & run
 
 ```bash
-cargo test -p vdev-mic-agent          # 27 unit tests (metrics, mixer, ring, frames, latency)
+cargo test -p vdev-mic-agent          # 35 unit tests (metrics, mixer, ring, frames, latency, stats, wavio)
 
 # D3-D4 lives behind CoreAudio; this only type-checks the macOS backend
 cargo check -p vdev-mic-agent --target x86_64-apple-darwin
