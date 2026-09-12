@@ -19,6 +19,8 @@ pub enum WdfError {
     CallFailed(NTSTATUS),
     #[error("Failed to upgrade Arc pointer")]
     UpgradeFailed,
+    #[error("Object context was never initialized")]
+    NotInitialized,
     #[error("Failed to lock")]
     LockFailed,
     #[error("Unknown")]
@@ -48,6 +50,7 @@ impl From<WdfError> for NTSTATUS {
             WdfFunctionNotAvailable(_) => Self::STATUS_NOT_FOUND,
             CallFailed(status) => status,
             UpgradeFailed => Self::STATUS_INVALID_HANDLE,
+            NotInitialized => Self::STATUS_DRIVER_INTERNAL_ERROR,
             LockFailed => Self::STATUS_WAS_LOCKED,
             Unknown => Self::STATUS_DRIVER_INTERNAL_ERROR,
             _Success => 0.into(),
@@ -180,9 +183,63 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
 
                 /// Allows us to keep ONE main Arc allocation while handing out weak pointers to the rest of the clones.
                 /// In this way, we can drop the allocation by dropping 1 arc, while letting others still access it
+                ///
+                /// M4：显式 `Uninit` 变体让「从未被 init/clone_into 写过的上下文」有合法表示。
+                /// WDF 框架为对象分配上下文空间时保证零初始化
+                /// （learn.microsoft.com "Framework Object Context Space"：
+                ///  "When the framework allocates context space for an object, it also
+                ///   zero-initializes the context space."）。
+                /// `repr(C)` 保证 discriminant 位于偏移 0、首变体 tag 为 0，因此全零字节
+                /// 恰好解码为 `Uninit`；对 `Uninit` drop_in_place 是 no-op。
+                /// 这样即使 init 从未执行（如 IddCxDeviceInitialize 失败后框架触发
+                /// EvtCleanupCallback），对零初始化槽位做 drop 也不再是对垃圾 ArcPointer
+                /// 析构的 UB。
+                #[repr(C)]
                 enum ArcPointer<T> {
+                    Uninit,
                     Strong(::std::sync::Arc<T>),
-                    Weak(::std::sync::Weak<T>)
+                    Weak(::std::sync::Weak<T>),
+                }
+
+                /// M4 布局不变量的回归固化：上面安全论证依赖
+                /// 「`repr(C)` 枚举 discriminant 位于偏移 0、首变体 tag 为 0，
+                /// 因此 WDF 零初始化上下文（全零字节）必解码为 `Uninit`」。
+                /// 随展开处的 `cargo test`（Windows 主机）运行；macOS 宿主的
+                /// 等价镜像验证见 scripts/state-tests-host.sh（镜像局限已披露）。
+                #[cfg(test)]
+                mod arc_pointer_layout_tests {
+                    use super::{ArcPointer, $context_type};
+
+                    #[test]
+                    fn zeroed_slot_decodes_as_uninit() {
+                        type Slot = ArcPointer<::std::sync::RwLock<$context_type>>;
+
+                        // 布局尺寸：tag + 裸指针 = 2 * usize（64 位下 16 字节）
+                        assert_eq!(
+                            ::std::mem::size_of::<Slot>(),
+                            2 * ::std::mem::size_of::<usize>()
+                        );
+
+                        let zeroed = [0u8; ::std::mem::size_of::<Slot>()];
+                        // SAFETY: `zeroed` 与 `Slot` 等长；读出的值仅经 matches! 检视
+                        // discriminant，且以 ManuallyDrop 包裹永不 drop —— 即使未来
+                        // 布局被改坏（全零解码为 Strong/Weak），也不会析构无效指针
+                        let slot = ::std::mem::ManuallyDrop::new(unsafe {
+                            ::std::mem::transmute_copy::<
+                                [u8; ::std::mem::size_of::<Slot>()],
+                                Slot,
+                            >(&zeroed)
+                        });
+                        // 全零字节解码为 Uninit ⇔ discriminant 在偏移 0 且首变体 tag 为 0
+                        assert!(matches!(&*slot, ArcPointer::Uninit));
+
+                        // 显式固化：合法 Uninit 值偏移 0 处的 tag 字节为 0
+                        let uninit = Slot::Uninit;
+                        // SAFETY: 读取已初始化合法值（Uninit）首字节的 1 字节 tag
+                        let tag0 =
+                            unsafe { ::std::ptr::addr_of!(uninit).cast::<u8>().read() };
+                        assert_eq!(tag0, 0);
+                    }
                 }
 
                 #[repr(transparent)]
@@ -238,6 +295,8 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                         } as *mut [<WdfObject $context_type>];
 
                         let from_context = match &(*from_context).0 {
+                            // M4：零初始化（未 init）的源上下文没有可克隆的数据
+                            ArcPointer::Uninit => return Err($crate::WdfError::NotInitialized),
                             ArcPointer::Strong(a) => a.clone(),
                             ArcPointer::Weak(a) => a.upgrade().ok_or($crate::WdfError::UpgradeFailed)?.clone(),
                         };
@@ -256,8 +315,12 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                     ///       That instance can be obtained through the original handle you created it through
                     ///
                     /// SAFETY:
-                    /// - Data in context is assumed to already be init and a valid T
+                    /// - Data in context is assumed to already be init and a valid T,
+                    ///   OR to be the framework's zero-initialized context space (see
+                    ///   the `ArcPointer::Uninit` invariant above): dropping `Uninit` is a no-op,
+                    ///   which makes cleanup callbacks on never-initialized objects (M4) safe.
                     /// - Therefore, init for the context must already have been done on this handle
+                    ///   for the drop to release resources
                     /// - No other mutable/non-mutable refs can exist to data when this is called, or it will alias
                     ///
                     /// This may overwrite data in the handle's context memory, it is UB to read it after drop (e.g. get*)
@@ -269,7 +332,7 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                             [<_WDF_ $context_type _TYPE_INFO>].cell.get(),
                         )? as *mut [<WdfObject $context_type>];
 
-                        // drop the memory
+                        // drop the memory（Uninit 变体无资源，drop_in_place 为 no-op）
                         ::std::ptr::drop_in_place(context);
 
                         Ok(())
@@ -299,6 +362,10 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                         let context = &*context;
 
                         let context = match &context.0 {
+                            // M4：零初始化（未 init）的上下文不可访问
+                            ArcPointer::Uninit => {
+                                return Err($crate::WdfError::NotInitialized)
+                            }
                             ArcPointer::Strong(a) => a.clone(),
                             ArcPointer::Weak(a) => a.upgrade().ok_or($crate::WdfError::UpgradeFailed)?.clone(),
                         };
@@ -334,6 +401,10 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                         let context = &*context;
 
                         let context = match &context.0 {
+                            // M4：零初始化（未 init）的上下文不可访问
+                            ArcPointer::Uninit => {
+                                return Err($crate::WdfError::NotInitialized)
+                            }
                             ArcPointer::Strong(a) => a.clone(),
                             ArcPointer::Weak(a) => a.upgrade().ok_or($crate::WdfError::UpgradeFailed)?.clone(),
                         };
@@ -369,6 +440,10 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                         let context = &*context;
 
                         let context = match &context.0 {
+                            // M4：零初始化（未 init）的上下文不可访问
+                            ArcPointer::Uninit => {
+                                return Err($crate::WdfError::NotInitialized)
+                            }
                             ArcPointer::Strong(a) => a.clone(),
                             ArcPointer::Weak(a) => a.upgrade().ok_or($crate::WdfError::UpgradeFailed)?.clone(),
                         };
@@ -404,6 +479,10 @@ macro_rules! WDF_DECLARE_CONTEXT_TYPE {
                         let context = &*context;
 
                         let context = match &context.0 {
+                            // M4：零初始化（未 init）的上下文不可访问
+                            ArcPointer::Uninit => {
+                                return Err($crate::WdfError::NotInitialized)
+                            }
                             ArcPointer::Strong(a) => a.clone(),
                             ArcPointer::Weak(a) => a.upgrade().ok_or($crate::WdfError::UpgradeFailed)?.clone(),
                         };
@@ -584,4 +663,24 @@ pub unsafe fn WdfMemoryGetBuffer(
             BufferSize.map_or(std::ptr::null_mut(), std::ptr::from_mut)
         )
     }
+}
+
+#[cfg(test)]
+mod arc_pointer_layout_tests {
+    // 测试构建内展开一次 WDF_DECLARE_CONTEXT_TYPE!，固化宏内 ArcPointer 的
+    // 布局不变量（M4，断言本体见宏内 arc_pointer_layout_tests）。
+    // wdf-umdf-sys 只能在 Windows 主机构建（bindgen 需要 WDK），故本测试随
+    // Windows `cargo test` 运行；macOS 宿主等价镜像见 scripts/state-tests-host.sh。
+    pub struct ArcPointerLayoutProbe {
+        // 宏生成的 clone_into 硬编码引用 self.device（字段必须存在）
+        #[allow(dead_code)]
+        device: crate::wdf_umdf_sys::WDFOBJECT,
+    }
+
+    // SAFETY: probe 不持有任何 WDF 资源（仅测试构建存在、从不 init），
+    // 仅为满足宏生成 static 的 Sync 要求
+    unsafe impl Send for ArcPointerLayoutProbe {}
+    unsafe impl Sync for ArcPointerLayoutProbe {}
+
+    crate::WDF_DECLARE_CONTEXT_TYPE!(pub ArcPointerLayoutProbe);
 }

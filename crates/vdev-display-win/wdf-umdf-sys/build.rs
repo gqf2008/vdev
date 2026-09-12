@@ -1,9 +1,20 @@
+// 非 Windows 宿主（macOS 交叉编译）上，下方整套 WDK 探测/bindgen 机制从 main()
+// 不可达（generate() 仅在 Windows 宿主被调用），统一豁免 dead_code 告警。
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::env;
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 
 use bindgen::Abi;
+
+// minor(f)：winreg 只用于「Windows 宿主」的 WDK 注册表探测（build 脚本编译且
+// 运行于宿主，此处的 cfg(windows) 即宿主判定）。依赖已移入
+// [target.'cfg(windows)'.build-dependencies]（按宿主解析），macOS 宿主不再编译
+// winreg。CARGO_CFG_WINDOWS（env）表达的是「目标平台」，无法阻止依赖编译，故不用。
+#[cfg(windows)]
 use winreg::enums::HKEY_LOCAL_MACHINE;
+#[cfg(windows)]
 use winreg::RegKey;
 
 const UMDF_V: &str = "2.31";
@@ -22,12 +33,20 @@ enum Error {
 ///
 /// # Errors
 /// Returns IO error if failed
+#[cfg(windows)]
 fn get_windows_kits_dir() -> Result<PathBuf, Error> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key = r"SOFTWARE\Microsoft\Windows Kits\Installed Roots";
     let dir: String = hklm.open_subkey(key)?.get_value("KitsRoot10")?;
 
     Ok(dir.into())
+}
+
+/// 非 Windows 宿主的编译占位实现：generate()（bindgen 生成）只在 Windows 宿主被
+/// main() 调用（WDK 头文件/库只在 Windows 主机存在），此分支永不执行。
+#[cfg(not(windows))]
+fn get_windows_kits_dir() -> Result<PathBuf, Error> {
+    Err(Error::DirectoryNotFound)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -265,5 +284,17 @@ fn generate() {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // build 脚本编译并运行于「宿主」。bindgen 需要 WDK 头文件/库（只在 Windows
+    // 主机存在），因此 generate() 仅在 Windows 宿主执行；非 Windows 宿主（如
+    // macOS 交叉编译 Windows 目标）跳过生成并给出提示——后续 wdf-umdf-sys 库
+    // 编译因缺少 OUT_DIR/umdf.rs 而失败属预期（本包只能在 Windows 主机构建），
+    // 不会伪装成功。
+    #[cfg(windows)]
     generate();
+
+    #[cfg(not(windows))]
+    println!(
+        "cargo:warning=wdf-umdf-sys: non-Windows host: skipping WDK bindgen; \
+         bindings can only be generated on a Windows host (WDK required)"
+    );
 }

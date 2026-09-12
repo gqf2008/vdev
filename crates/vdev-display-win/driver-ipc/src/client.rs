@@ -167,38 +167,6 @@ impl Client {
             _ => None,
         })
     }
-
-    /// Write `monitors` to the registry for current user.
-    ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
-    pub fn persist(monitors: &[Monitor]) -> Result<(), error::PersistError> {
-        use winreg::*;
-
-        let hklm = RegKey::predef(enums::HKEY_CURRENT_USER);
-        let key = r"SOFTWARE\vdev-display";
-
-        let mut reg_key = hklm.open_subkey_with_flags(key, enums::KEY_WRITE);
-
-        // if open failed, try to create key and subkey
-        if reg_key.is_err() {
-            reg_key = hklm.create_subkey(key).map(|(key, _)| key);
-
-            if let Err(e) = reg_key {
-                return Err(error::PersistError::Open(e));
-            }
-        }
-
-        let reg_key = reg_key.unwrap();
-
-        let data = serde_json::to_string(monitors)?;
-
-        reg_key
-            .set_value("data", &data)
-            .map_err(error::PersistError::Set)?;
-
-        Ok(())
-    }
 }
 
 impl Clone for Client {
@@ -360,17 +328,6 @@ pub mod error {
     #[derive(Debug, Error, Clone)]
     #[error("Failed to receive event: {0}")]
     pub struct ReceiveError(#[from] pub Arc<io::Error>);
-
-    /// Error returned from [Client::persist].
-    #[derive(Debug, Error)]
-    pub enum PersistError {
-        #[error("Failed to open registry key: {0}")]
-        Open(io::Error),
-        #[error("Failed to set registry value: {0}")]
-        Set(io::Error),
-        #[error("Failed to serialize monitors: {0}")]
-        Serialize(#[from] serde_json::Error),
-    }
 
     impl From<SendCommandError> for SendError {
         fn from(e: SendCommandError) -> Self {

@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use tokio::{sync::watch, task};
 use tokio_stream::{Stream, StreamExt};
 
@@ -9,9 +7,8 @@ use crate::*;
 ///
 /// It manages its own state. Changing this state does not affect the driver
 /// directly. You must call [DriverClient::notify] to send changes to the
-/// driver. To make your changes persistent across reboots, call
-/// [DriverClient::persist]. To synchronize this object with the driver, you
-/// must call [DriverClient::refresh_state]. The state will not be updated
+/// driver. To synchronize this object with the driver, you must call
+/// [DriverClient::refresh_state]. The state will not be updated
 /// automatically.
 #[derive(Debug)]
 pub struct DriverClient {
@@ -132,7 +129,7 @@ impl DriverClient {
     /// Note: This does not affect the driver. Manually call
     /// [DriverClient::notify] to send these changes to the driver.
     pub fn set_monitors(&mut self, monitors: &[Monitor]) -> Result<(), error::DuplicateError> {
-        mons_have_duplicates(monitors)?;
+        state::mons_have_duplicates(monitors)?;
 
         self.state = monitors.to_owned();
         Ok(())
@@ -182,23 +179,42 @@ impl DriverClient {
         self.find_monitor(id)
     }
 
-    /// TODO: may leave client in an invalid state
-    ///
     /// Find a monitor by ID and call `cb` with a mutable reference to it.
+    ///
+    /// Returns `Ok(None)` if the monitor does not exist. Returns
+    /// `Err(DuplicateError)` if the callback made the state contain duplicate
+    /// IDs / modes / refresh rates; in that case the state is rolled back to
+    /// its previous value.
     ///
     /// Note: Any changes do not affect the driver. Manually call
     /// [DriverClient::notify] to send these changes to the driver.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,
     /// manually call [DriverClient::refresh_state].
-    pub fn find_monitor_mut<R>(&mut self, id: Id, cb: impl FnOnce(&mut Monitor) -> R) -> Option<R> {
-        let monitor = self.state.iter_mut().find(|monitor| monitor.id == id)?;
+    pub fn find_monitor_mut<R>(
+        &mut self,
+        id: Id,
+        cb: impl FnOnce(&mut Monitor) -> R,
+    ) -> Result<Option<R>, error::DuplicateError> {
+        if !self.state.iter().any(|monitor| monitor.id == id) {
+            return Ok(None);
+        }
 
-        let r = cb(monitor);
+        // 在克隆上修改：cb 引入重复或 panic 时原状态不受影响（回滚 / panic 安全）
+        let mut new_state = self.state.clone();
+        let r = {
+            let monitor = new_state
+                .iter_mut()
+                .find(|monitor| monitor.id == id)
+                .expect("monitor existence checked above");
+            cb(monitor)
+        };
 
-        mons_have_duplicates(&self.state).ok()?;
+        // 查重失败时原状态未被替换，自动即回滚
+        state::mons_have_duplicates(&new_state)?;
+        self.state = new_state;
 
-        Some(r)
+        Ok(Some(r))
     }
 
     /// Find a monitor by ID and return a mutable reference to it.
@@ -220,6 +236,10 @@ impl DriverClient {
     /// Find the monitor matched by the given query and call `cb` with a mutable
     /// reference to it.
     ///
+    /// Returns `Ok(None)` if no monitor matches. Returns `Err(DuplicateError)`
+    /// if the callback made the state contain duplicates (state is rolled back
+    /// in that case).
+    ///
     /// Note: Any changes do not affect the driver. Manually call
     /// [DriverClient::notify] to send these changes to the driver.
     ///
@@ -229,8 +249,10 @@ impl DriverClient {
         &mut self,
         query: &str,
         cb: impl FnOnce(&mut Monitor) -> R,
-    ) -> Option<R> {
-        let id = self.find_id(query)?;
+    ) -> Result<Option<R>, error::DuplicateError> {
+        let Some(id) = self.find_id(query) else {
+            return Ok(None);
+        };
         self.find_monitor_mut(id, cb)
     }
 
@@ -251,15 +273,11 @@ impl DriverClient {
         self.find_monitor_mut_unchecked(id)
     }
 
-    /// Write client state to the registry for current user.
+    /// Get a free ID, preferring the given `preferred_id`.
     ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
-    pub fn persist(&self) -> Result<(), error::PersistError> {
-        Client::persist(&self.state)
-    }
-
-    /// Get the closest available free ID.
+    /// - `preferred_id` free → returns it;
+    /// - otherwise → the first free ID counting from 0;
+    /// - all IDs taken → `None`.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,
     /// manually call [DriverClient::refresh_state].
@@ -267,25 +285,7 @@ impl DriverClient {
     /// Note: Duplicate monitors are ignored when send to the Driver using
     /// [DriverClient::notify].
     pub fn new_id(&self, preferred_id: Option<Id>) -> Option<Id> {
-        let existing_ids = self
-            .state
-            .iter()
-            .map(|monitor| monitor.id)
-            .collect::<HashSet<_>>();
-
-        if let Some(id) = preferred_id {
-            if !existing_ids.contains(&id) {
-                return None;
-            }
-
-            Some(id)
-        } else {
-            #[allow(clippy::maybe_infinite_iter)]
-            let new_id = (0..)
-                .find(|id| !existing_ids.contains(id))
-                .expect("failed to get a new ID");
-            Some(new_id)
-        }
+        state::new_id(&self.state, preferred_id)
     }
 
     /// Remove monitors by id.
@@ -351,7 +351,7 @@ impl DriverClient {
         if self.state.iter().any(|mon| mon.id == monitor.id) {
             return Err(error::DuplicateError::Monitor(monitor.id));
         }
-        mon_has_duplicates(&monitor)?;
+        state::mon_has_duplicates(&monitor)?;
 
         self.state.push(monitor);
 
@@ -416,42 +416,7 @@ impl DriverClient {
     /// Note: Client state might be stale. To synchronize with the driver,
     /// manually call [DriverClient::refresh_state].
     pub fn add_mode(&mut self, id: Id, mode: Mode) -> Result<(), error::AddModeError> {
-        let Some(mon) = self.state.iter_mut().find(|mon| mon.id == id) else {
-            return Err(error::AddModeError::MonNotFound(id));
-        };
-
-        match mode_has_duplicates(&mode, id) {
-            Ok(_) => Ok(()),
-            Err(error::DuplicateError::RefreshRate(rr, w, h, id)) => {
-                Err(error::AddModeError::DupRefreshRate(rr, w, h, id))
-            }
-            Err(_) => unreachable!(),
-        }?;
-
-        if mon
-            .modes
-            .iter()
-            .any(|_mode| _mode.height == mode.height && _mode.width == mode.width)
-        {
-            return Err(error::AddModeError::DupMode(mode.width, mode.height, id));
-        }
-
-        let iter = mode.refresh_rates.iter().copied();
-
-        for (i, &rr) in mode.refresh_rates.iter().enumerate() {
-            if iter.clone().skip(i).any(|_rr| _rr == rr) {
-                return Err(error::AddModeError::DupRefreshRate(
-                    rr,
-                    mode.width,
-                    mode.height,
-                    id,
-                ));
-            }
-        }
-
-        mon.modes.push(mode);
-
-        Ok(())
+        state::add_mode(&mut self.state, id, mode)
     }
 
     /// Add a mode to the a monitor matched by the given query.
@@ -556,71 +521,11 @@ impl DriverClient {
     }
 }
 
-fn mons_have_duplicates(monitors: &[Monitor]) -> Result<(), error::DuplicateError> {
-    let mut monitor_iter = monitors.iter();
-    while let Some(monitor) = monitor_iter.next() {
-        let duplicate_id = monitor_iter.clone().any(|b| monitor.id == b.id);
-        if duplicate_id {
-            return Err(error::DuplicateError::Monitor(monitor.id));
-        }
-
-        mon_has_duplicates(monitor)?;
-    }
-
-    Ok(())
-}
-
-fn mon_has_duplicates(monitor: &Monitor) -> Result<(), error::DuplicateError> {
-    let mut mode_iter = monitor.modes.iter();
-    while let Some(mode) = mode_iter.next() {
-        let duplicate_mode = mode_iter
-            .clone()
-            .any(|m| mode.height == m.height && mode.width == m.width);
-        if duplicate_mode {
-            return Err(error::DuplicateError::Mode(
-                mode.width,
-                mode.height,
-                monitor.id,
-            ));
-        }
-
-        mode_has_duplicates(mode, monitor.id)?;
-    }
-
-    Ok(())
-}
-
-fn mode_has_duplicates(mode: &Mode, id: Id) -> Result<(), error::DuplicateError> {
-    let mut refresh_iter = mode.refresh_rates.iter().copied();
-    while let Some(rr) = refresh_iter.next() {
-        let duplicate_rr = refresh_iter.clone().any(|r| rr == r);
-        if duplicate_rr {
-            return Err(error::DuplicateError::RefreshRate(
-                rr,
-                mode.width,
-                mode.height,
-                id,
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 pub mod error {
     use super::*;
     pub use crate::client::error::*;
+    pub use crate::state::error::{AddModeError, DuplicateError};
     use thiserror::Error;
-
-    #[derive(Debug, Error)]
-    pub enum DuplicateError {
-        #[error("Duplicate monitor with ID {0}")]
-        Monitor(Id),
-        #[error("Duplicate mode {1}x{2} on monitor {0}")]
-        Mode(u32, u32, Id),
-        #[error("Duplicate refresh rate {0} on mode {1}x{2} on monitor {3}")]
-        RefreshRate(u32, u32, u32, Id),
-    }
 
     #[derive(Debug, Error)]
     #[error("Query not found: {0}")]
@@ -629,17 +534,6 @@ pub mod error {
     #[derive(Debug, Error)]
     #[error("Monitor not found: {0}")]
     pub struct MonNotFound(pub Id);
-
-    /// Error returned from [DriverClient::add_mode].
-    #[derive(Debug, Error)]
-    pub enum AddModeError {
-        #[error("Monitor not found: {0}")]
-        MonNotFound(Id),
-        #[error("Duplicate mode {1}x{2} on monitor {0}")]
-        DupMode(Id, u32, u32),
-        #[error("Duplicate refresh rate {0} on mode {1}x{2} on monitor {3}")]
-        DupRefreshRate(u32, u32, u32, Id),
-    }
 
     /// Error returned from [DriverClient::add_mode_query].
     #[derive(Debug, Error)]

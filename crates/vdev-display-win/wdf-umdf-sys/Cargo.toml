@@ -14,5 +14,14 @@ thiserror = "2.0.3"
 [build-dependencies]
 bindgen = "0.72.1"
 thiserror = "2.0.3"
+
+# minor(f)：winreg 0.52 在非 Windows 宿主直接 compile_error!（其 src/lib.rs:115），
+# 且只被 build.rs 的 WDK 注册表探测使用。target 门控的 build-dependencies 按
+# 「宿主平台」解析（build 脚本编译/运行于宿主；实测 cargo tree 在 macOS 宿主 +
+# windows 目标下 winreg 不进 build 依赖图），因此 macOS 宿主交叉编译时该依赖
+# 不参与编译，build.rs 内以 #[cfg(windows)]（宿主判定）门控对应调用点。
+# 注意不能用 CARGO_CFG_WINDOWS（env，表达「目标平台」）做编译期门控——它无法
+# 阻止依赖在本机编译。
+[target.'cfg(windows)'.build-dependencies]
 winreg = "0.52.0"
 

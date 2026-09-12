@@ -10,12 +10,13 @@ use serde::Serialize;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DiInstallDriverW, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
     SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-    SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
-    SetupDiOpenDeviceInfoW, SetupDiSetDeviceInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
-    DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_PRESENT, DIIRFLAG_FORCE_INF,
-    DI_REMOVEDEVICE_GLOBAL, GUID_DEVCLASS_DISPLAY, SETUP_DI_GET_CLASS_DEVS_FLAGS,
-    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID,
-    SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W, SP_REMOVEDEVICE_PARAMS,
+    SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
+    SetupDiGetINFClassW, SetupDiOpenDeviceInfoW, SetupDiSetDeviceInstallParamsW,
+    SetupDiSetDeviceRegistryPropertyW, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE,
+    DIIRFLAG_FORCE_INF, DI_REMOVEDEVICE_GLOBAL, GUID_DEVCLASS_DISPLAY, HDEVINFO,
+    SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_FRIENDLYNAME,
+    SPDRP_HARDWAREID, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
+    SP_REMOVEDEVICE_PARAMS,
 };
 
 pub const HARDWARE_ID: &str = r"Root\vdev-display";
@@ -54,11 +55,13 @@ fn read_multi_sz(
         }
         buf.resize(required as usize, 0);
     }
-    // 以 u16 对齐读取
-    let mut wide = Vec::with_capacity(buf.len() / 2);
-    for chunk in buf.chunks_exact(2) {
-        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-    }
+    // 以 u16 对齐读取（slice::as_chunks 需 Rust 1.88+）
+    let wide = buf
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&chunk| u16::from_le_bytes(chunk))
+        .collect::<Vec<u16>>();
     wide
 }
 
@@ -69,8 +72,66 @@ fn wide_contains(haystack: &[u16], needle: &str) -> bool {
         .any(|w| w == needle.as_slice())
 }
 
-/// 在 Display 类已枚举设备里按硬件 ID 找 vdev-display
-fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
+/// 读取设备信息元素的设备实例 ID（如 `ROOT\DISPLAY\0000`）。
+fn get_instance_id(devs: HDEVINFO, info: &SP_DEVINFO_DATA) -> Result<String> {
+    let mut required: u32 = 0;
+    let mut buf: Vec<u16> = Vec::new();
+    loop {
+        // SAFETY: `devs` 是调用方传入的有效 HDEVINFO 句柄，`info` 是已初始化
+        // （cbSize 已设）且属于该集合的 SP_DEVINFO_DATA 引用；
+        // `buf.as_mut_slice()`/`&mut required` 都是本次调用内有效的合法引用，
+        // windows crate 仅在缓冲不足时返回错误并以 `required` 报告所需大小
+        let ok = unsafe {
+            SetupDiGetDeviceInstanceIdW(devs, info, Some(buf.as_mut_slice()), Some(&mut required))
+        };
+        if ok.is_ok() {
+            break;
+        }
+        // 缓冲区太小：required 给出所需大小
+        let err = windows::core::Error::from_win32();
+        if err.code().0 as u32 != 0x8007_007A || required == 0 {
+            // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+            return Err(err).context("SetupDiGetDeviceInstanceIdW failed");
+        }
+        buf.resize(required as usize, 0);
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// 在调用方自己的设备信息集合上按实例 ID 重新打开设备，
+/// 返回配对该集合的 [`SP_DEVINFO_DATA`]（元素必须属于传入的集合，SetupAPI 契约）。
+fn open_device(devs: HDEVINFO, instance_id: &str) -> Result<SP_DEVINFO_DATA> {
+    let id_wide: Vec<u16> = instance_id
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut info = SP_DEVINFO_DATA {
+        cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `devs` 是调用方传入的有效 HDEVINFO 句柄；`id_wide` 在本次调用期间
+    // 存活且以 NUL 结尾（PCWSTR 借用其指针）；`&mut info` 已初始化 cbSize，
+    // 是本次调用的合法出参
+    unsafe {
+        SetupDiOpenDeviceInfoW(
+            devs,
+            windows::core::PCWSTR(id_wide.as_ptr()),
+            None,
+            0,
+            Some(&mut info),
+        )
+    }
+    .with_context(|| format!("SetupDiOpenDeviceInfoW({instance_id}) failed"))?;
+    Ok(info)
+}
+
+/// 在 Display 类已枚举设备里按硬件 ID 找 vdev-display，返回其设备实例 ID。
+///
+/// 返回实例 ID 而非 [`SP_DEVINFO_DATA`]：元素只属于枚举它的那个设备信息集合，
+/// 集合销毁后配到别的集合上用违反 SetupAPI 契约（元素属于传入集合）；
+/// 调用方应建立自己的集合并用 [`open_device`] 重新打开。
+fn find_device() -> Result<Option<String>> {
     let devs = unsafe {
         SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_DISPLAY),
@@ -80,26 +141,28 @@ fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
         )
     }
     .context("SetupDiGetClassDevsW failed")?;
-    let mut found = None;
-    let mut index = 0u32;
-    loop {
-        let mut info = SP_DEVINFO_DATA {
-            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        let ok = unsafe { SetupDiEnumDeviceInfo(devs, index, &mut info) };
-        if ok.is_err() {
-            break;
+    let found = (|| -> Result<Option<String>> {
+        let mut found = None;
+        let mut index = 0u32;
+        loop {
+            let mut info = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if unsafe { SetupDiEnumDeviceInfo(devs, index, &mut info) }.is_err() {
+                break;
+            }
+            index += 1;
+            let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
+            if wide_contains(&hwids, HARDWARE_ID) {
+                found = Some(get_instance_id(devs, &info)?);
+                break;
+            }
         }
-        index += 1;
-        let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-        if wide_contains(&hwids, HARDWARE_ID) {
-            found = Some(info);
-            break;
-        }
-    }
+        Ok(found)
+    })();
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(found)
+    found
 }
 
 /// 安装驱动：创建设备节点 + 从 INF 装驱动。
@@ -135,7 +198,6 @@ pub fn install(inf_dir: &Path) -> Result<()> {
     if removed > 0 {
         println!("已清理 {removed} 个残留设备节点");
     }
-    let already = false;
 
     // 1. 建设备信息集
     let devs = unsafe { SetupDiCreateDeviceInfoList(Some(&class_guid), None) }
@@ -147,65 +209,44 @@ pub fn install(inf_dir: &Path) -> Result<()> {
             ..Default::default()
         };
 
-        if !already {
-            // 2. 创建设备信息：类名 + DICD_GENERATE_ID（SetupAPI 自动生成实例 ID）
-            let class_name_cstr: Vec<u16> = class_name
-                .iter()
-                .take_while(|&&c| c != 0)
-                .copied()
-                .chain(std::iter::once(0))
-                .collect();
-            let create_res = unsafe {
-                SetupDiCreateDeviceInfoW(
-                    devs,
-                    windows::core::PCWSTR(class_name_cstr.as_ptr()),
-                    &class_guid,
-                    None,
-                    None,
-                    DICD_GENERATE_ID,
-                    Some(&mut dev_info),
-                )
-            };
-            match create_res {
-                Ok(()) => {}
-                // 设备节点已存在（可能上次安装中断留下）→ 直接打开
-                Err(e) if e.code().0 as u32 == 0xE0000207 => {
-                    unsafe {
-                        SetupDiOpenDeviceInfoW(
-                            devs,
-                            windows::core::PCWSTR(class_name_cstr.as_ptr()),
-                            None,
-                            0,
-                            Some(&mut dev_info),
-                        )
-                    }
-                    .with_context(|| "SetupDiOpenDeviceInfoW failed")?;
-                }
-                Err(e) => return Err(e).context("SetupDiCreateDeviceInfoW failed"),
-            }
-
-            // 3. 设置硬件 ID（REG_MULTI_SZ，双 null 结尾）
-            let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
-            hwid.push(0);
-            hwid.push(0);
-            let bytes = hwid
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect::<Vec<u8>>();
-            unsafe {
-                SetupDiSetDeviceRegistryPropertyW(
-                    devs,
-                    &mut dev_info,
-                    SPDRP_HARDWAREID,
-                    Some(&bytes),
-                )
-            }
-            .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
-
-            // 4. 注册设备节点
-            unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
-                .with_context(|| "DIF_REGISTERDEVICE failed")?;
+        // 2. 创建设备信息：类名 + DICD_GENERATE_ID（SetupAPI 自动生成实例 ID）。
+        //    残留节点已在上面 remove_all_nodes 清理，创建失败如实报错即可
+        //    （原「已存在则 SetupDiOpenDeviceInfoW」回退把类名当实例 ID 传参，是死路径）
+        let class_name_cstr: Vec<u16> = class_name
+            .iter()
+            .take_while(|&&c| c != 0)
+            .copied()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            SetupDiCreateDeviceInfoW(
+                devs,
+                windows::core::PCWSTR(class_name_cstr.as_ptr()),
+                &class_guid,
+                None,
+                None,
+                DICD_GENERATE_ID,
+                Some(&mut dev_info),
+            )
         }
+        .context("SetupDiCreateDeviceInfoW failed")?;
+
+        // 3. 设置硬件 ID（REG_MULTI_SZ，双 null 结尾）
+        let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
+        hwid.push(0);
+        hwid.push(0);
+        let bytes = hwid
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>();
+        unsafe {
+            SetupDiSetDeviceRegistryPropertyW(devs, &mut dev_info, SPDRP_HARDWAREID, Some(&bytes))
+        }
+        .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
+
+        // 4. 注册设备节点
+        unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
+            .with_context(|| "DIF_REGISTERDEVICE failed")?;
 
         // 5. 用 DiInstallDriverW 把 INF 装入驱动存储并安装到匹配设备（neflib/nefcon 同款）
         let inf_path = std::fs::canonicalize(&inf_path).context("无法解析 INF 绝对路径")?;
@@ -293,16 +334,26 @@ fn remove_all_nodes() -> Result<usize> {
 
 /// 卸载：移除 Root\vdev-display 设备节点。返回是否找到并移除。
 pub fn uninstall() -> Result<bool> {
-    let Some(dev_info) = find_device()? else {
+    let Some(instance_id) = find_device()? else {
         println!("未找到 vdev 虚拟显示器设备");
         return Ok(false);
     };
 
-    let devs =
-        unsafe { SetupDiGetClassDevsW(Some(&GUID_DEVCLASS_DISPLAY), None, None, DIGCF_PRESENT) }
-            .context("SetupDiGetClassDevsW failed")?;
+    // 与 find_device 同域（flags=0，含非 present 残留），保证找到的实例一定能在此
+    // 集合里重新打开；Windows 运行时行为（SetupAPI + DIF_REMOVE），无法在 macOS 交叉环境单测
+    let devs = unsafe {
+        SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_DISPLAY),
+            None,
+            None,
+            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+        )
+    }
+    .context("SetupDiGetClassDevsW failed")?;
 
     let result = (|| -> Result<()> {
+        let dev_info = open_device(devs, &instance_id)?;
+
         let params = SP_REMOVEDEVICE_PARAMS {
             ClassInstallHeader: SP_CLASSINSTALL_HEADER {
                 cbSize: std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
@@ -342,7 +393,7 @@ pub struct DeviceStatus {
 
 /// 查询 vdev 虚拟显示器设备是否已安装及其驱动信息
 pub fn status() -> Result<DeviceStatus> {
-    let Some(dev_info) = find_device()? else {
+    let Some(instance_id) = find_device()? else {
         return Ok(DeviceStatus {
             present: false,
             driver: None,
@@ -350,39 +401,51 @@ pub fn status() -> Result<DeviceStatus> {
         });
     };
 
-    let devs =
-        unsafe { SetupDiGetClassDevsW(Some(&GUID_DEVCLASS_DISPLAY), None, None, DIGCF_PRESENT) }
-            .context("SetupDiGetClassDevsW failed")?;
+    // 与 find_device 同域（flags=0），在自己集合上按实例 ID 重新打开后再读属性
+    let devs = unsafe {
+        SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_DISPLAY),
+            None,
+            None,
+            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+        )
+    }
+    .context("SetupDiGetClassDevsW failed")?;
 
-    let driver = {
-        let buf = read_multi_sz(devs, &dev_info, SPDRP_DRIVER);
-        if buf.is_empty() {
-            None
-        } else {
-            Some(
-                String::from_utf16_lossy(&buf)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
-        }
-    };
-    let friendly_name = {
-        let buf = read_multi_sz(devs, &dev_info, SPDRP_FRIENDLYNAME);
-        if buf.is_empty() {
-            None
-        } else {
-            Some(
-                String::from_utf16_lossy(&buf)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
-        }
-    };
+    let result = (|| -> Result<DeviceStatus> {
+        let dev_info = open_device(devs, &instance_id)?;
+
+        let driver = {
+            let buf = read_multi_sz(devs, &dev_info, SPDRP_DRIVER);
+            if buf.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf16_lossy(&buf)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            }
+        };
+        let friendly_name = {
+            let buf = read_multi_sz(devs, &dev_info, SPDRP_FRIENDLYNAME);
+            if buf.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf16_lossy(&buf)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(DeviceStatus {
+            present: true,
+            driver,
+            friendly_name,
+        })
+    })();
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-
-    Ok(DeviceStatus {
-        present: true,
-        driver,
-        friendly_name,
-    })
+    result
 }

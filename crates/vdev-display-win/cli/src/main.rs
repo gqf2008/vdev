@@ -1,10 +1,12 @@
 //! vdev-display-win：vdev 虚拟显示器（IddCx UMDF 驱动）安装与控制 CLI。
 //!
 //! 本地操作：install / uninstall / status（SetupAPI，需管理员）。
-//! 驱动控制：list / add / remove / remove-all / set-mode / persist（经命名管道 IPC）。
+//! 驱动控制：list / add / remove / remove-all / set-mode（经命名管道 IPC）。
 
 mod install;
 mod mode;
+mod mode_check;
+mod quote;
 
 use std::path::PathBuf;
 
@@ -43,6 +45,7 @@ enum Command {
     /// 添加一个虚拟显示器
     Add {
         /// 分辨率/刷新率，如 1920x1080、3840x2160@60/120
+        #[arg(required = true)]
         mode: Vec<mode::Mode>,
         /// 手动指定 ID
         #[arg(long)]
@@ -66,10 +69,9 @@ enum Command {
         /// ID 或名称
         id: String,
         /// 新的分辨率/刷新率
+        #[arg(required = true)]
         mode: Vec<mode::Mode>,
     },
-    /// 把当前显示器配置持久化到注册表（重启后恢复）
-    Persist,
 }
 
 fn main() -> Result<()> {
@@ -149,9 +151,8 @@ fn main() -> Result<()> {
                     }
                     id
                 }
-                None => (0u32..)
-                    .find(|i| !existing.iter().any(|m| m.id == *i))
-                    .expect("不可能找不到空闲 ID"),
+                // 统一走 driver_ipc::new_id（纯逻辑实现在 state.rs，有宿主单测）
+                None => client.new_id(None).context("无法分配空闲显示器 ID")?,
             };
 
             let monitor = Monitor {
@@ -199,16 +200,17 @@ fn main() -> Result<()> {
             let found = client.find_monitor_mut_query(&id, |monitor| {
                 std::mem::swap(&mut monitor.modes, &mut modes);
             });
-            if found.is_none() {
-                bail!("找不到显示器：{id}");
+            match found {
+                Ok(Some(())) => {
+                    client.notify()?;
+                    println!("已更新显示器 {id} 的模式");
+                }
+                Ok(None) => bail!("找不到显示器：{id}"),
+                // 修复：模式重复原先误报「找不到显示器」，这里按真实错误分类
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!("更新显示器 {id} 的模式失败")))
+                }
             }
-            client.notify()?;
-            println!("已更新显示器 {id} 的模式");
-        }
-        Command::Persist => {
-            let client = connect()?;
-            client.persist()?;
-            println!("已持久化到注册表");
         }
     }
 
@@ -225,7 +227,13 @@ fn resolve_ids(client: &DriverClient, queries: &[String]) -> Result<Vec<Id>> {
     let mut ids = Vec::new();
     for q in queries {
         match q.parse::<Id>() {
-            Ok(id) => ids.push(id),
+            Ok(id) => {
+                // 修复：数字 ID 原先不查存在性，remove 不存在的 ID 也报「已移除」
+                if client.find_monitor(id).is_none() {
+                    bail!("找不到显示器：{q}");
+                }
+                ids.push(id);
+            }
             Err(_) => {
                 let id = client
                     .find_id(q)
@@ -264,7 +272,7 @@ fn print_monitors(monitors: &[Monitor], json: bool) {
     }
 }
 
-/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后退出（返回 true 表示已提权重跑）。
+/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后透传子进程退出码（不返回）。
 fn ensure_elevated() -> Result<()> {
     // SAFETY: IsUserAnAdmin 只读当前令牌
     if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
@@ -278,11 +286,25 @@ fn ensure_elevated() -> Result<()> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    // 逐参数按 MSVCRT argv 规则加引号（空格/制表符/引号/收尾反斜杠），防止拼接后
+    // 参数被切错位；见 cli/src/quote.rs 模块文档
     let args_wide: Vec<u16> = args
+        .iter()
+        .map(|arg| quote::quote_arg(arg))
+        .collect::<Vec<_>>()
         .join(" ")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    // 提权后的子进程 CWD 会变成 System32，把当前目录一并传入，相对 --inf-dir 才仍有效
+    let dir_wide: Vec<u16> = std::env::current_dir()
+        .map(|dir| {
+            dir.to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut sei = windows::Win32::UI::Shell::SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<windows::Win32::UI::Shell::SHELLEXECUTEINFOW>() as u32,
@@ -290,6 +312,11 @@ fn ensure_elevated() -> Result<()> {
         lpVerb: windows::core::w!("runas"),
         lpFile: windows::core::PCWSTR(exe_wide.as_ptr()),
         lpParameters: windows::core::PCWSTR(args_wide.as_ptr()),
+        lpDirectory: if dir_wide.is_empty() {
+            windows::core::PCWSTR::null()
+        } else {
+            windows::core::PCWSTR(dir_wide.as_ptr())
+        },
         nShow: windows::Win32::UI::WindowsAndMessaging::SW_HIDE.0,
         ..Default::default()
     };
@@ -297,10 +324,22 @@ fn ensure_elevated() -> Result<()> {
     unsafe { windows::Win32::UI::Shell::ShellExecuteExW(&mut sei) }
         .context("请求管理员权限失败（请以管理员身份重试）")?;
 
-    // 等待提权后的实例完成，再退出本进程
+    // 等待提权后的实例完成，并把它的真实退出码作为本进程退出码透传。
+    // Windows 运行时行为（真实 UAC 提权 + ShellExecute），无法在 macOS 交叉环境单测。
     if !sei.hProcess.is_invalid() {
-        unsafe {
+        // SAFETY: hProcess 由 ShellExecuteExW(SEE_MASK_NOCLOSEPROCESS) 返回，归本进程所有；
+        // WaitForSingleObject 等待退出后 GetExitCodeProcess 读取退出码，用完 CloseHandle。
+        let exit_code = unsafe {
             windows::Win32::System::Threading::WaitForSingleObject(sei.hProcess, u32::MAX);
+            let mut code = 0u32;
+            let ok = windows::Win32::System::Threading::GetExitCodeProcess(sei.hProcess, &mut code)
+                .is_ok();
+            let _ = windows::Win32::Foundation::CloseHandle(sei.hProcess);
+            ok.then_some(code)
+        };
+        if let Some(code) = exit_code {
+            #[allow(clippy::cast_possible_wrap)] // 32 位退出码按位透传（DWORD ↔ i32 同宽）
+            std::process::exit(code as i32);
         }
     }
     std::process::exit(0);

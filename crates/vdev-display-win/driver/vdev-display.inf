@@ -10,7 +10,8 @@ Class = Display
 ClassVer = 2.0
 Provider=%ManufacturerName%
 CatalogFile=vdev-display.cat
-DriverVer = 08/22/2026,0.1.0.0
+; M7：DriverVer 与 driver/Cargo.toml 的 package version（0.4.0）同步
+DriverVer = 08/22/2026,0.4.0.0
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64
@@ -44,8 +45,19 @@ UmdfService=vdev-display,vdev_display_Install
 UmdfServiceOrder=vdev-display
 UmdfKernelModeClientPolicy = AllowKernelModeClients
 
+; M7 核对结论（出处）：
+; - UmdfLibraryVersion=2.31.0 与 wdf-umdf-sys/build.rs 的 UMDF_V="2.31"
+;   （WdfDriverStubUm 链接版本；代码经 WdfFunctions_02031 函数表调用）一致。
+;   原值 2.25.0 与实际链接的 UMDF 2.31 存根不匹配。
+; - UmdfExtensions=IddCx0102 与微软官方样例 IddSampleDriver.inf
+;   （github.com/microsoft/Windows-driver-samples video/IndirectDisplay，
+;   [IddSampleDriver_Install] 节）写法一致。
+; - 关于 IddMinimumVersionRequired：微软样例 INF 中没有该 INF 指令；
+;   它是 IddCx 存根库要求客户端提供的链接期符号（本仓库
+;   wdf-umdf-sys/src/bindings.rs 以 #[no_mangle] static = 4 提供，
+;   对应 build.rs IDDCX_V="1.4"），不是 INF 指令，本 INF 无需也不应声明。
 [vdev_display_Install]
-UmdfLibraryVersion=2.25.0
+UmdfLibraryVersion=2.31.0
 ServiceBinary=%12%\UMDF\vdev_display.dll
 UmdfExtensions = IddCx0102
 

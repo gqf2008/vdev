@@ -8,6 +8,7 @@ mod entry;
 mod ipc;
 mod panic;
 mod swap_chain_processor;
+mod validate;
 
 use wdf_umdf_sys::{NTSTATUS, PUNICODE_STRING, PVOID};
 

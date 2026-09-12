@@ -4,26 +4,35 @@ use driver_logger::DriverLogger;
 use log::{error, info, Level};
 use wdf_umdf::{
     IddCxDeviceInitConfig, IddCxDeviceInitialize, WdfDeviceCreate,
-    WdfDeviceInitSetPnpPowerEventCallbacks, WdfDeviceSetFailed, WdfDriverCreate,
+    WdfDeviceInitSetPnpPowerEventCallbacks, WdfDriverCreate,
 };
 use wdf_umdf_sys::{
     _DRIVER_OBJECT, _UNICODE_STRING, IDD_CX_CLIENT_CONFIG, NTSTATUS, WDFDEVICE_INIT, WDFDRIVER__,
-    WDFOBJECT, WDF_DEVICE_FAILED_ACTION, WDF_DRIVER_CONFIG, WDF_OBJECT_ATTRIBUTES,
-    WDF_PNPPOWER_EVENT_CALLBACKS,
+    WDFOBJECT, WDF_DRIVER_CONFIG, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
 };
 
 use crate::callbacks::{
     adapter_commit_modes, adapter_init_finished, assign_swap_chain, device_d0_entry,
     monitor_get_default_modes, monitor_query_modes, parse_monitor_description, unassign_swap_chain,
 };
-use crate::{context::DeviceContext, helpers::Sendable};
+use crate::{context::DeviceContext, panic::catch_ignore, panic::catch_ntstatus};
 
 //
 // Our driver's entry point
 // See windows::Wdk::System::SystemServices::DRIVER_INITIALIZE
 //
+
+// M3：panic 不穿越 FFI 边界 —— DriverEntry 由 WDF 加载器（FxDriverEntryUm）调用，
+// panic 会沿 unwind 进入框架宿主；统一 catch_ntstatus 收敛为错误状态。
 #[no_mangle]
 extern "C-unwind" fn DriverEntry(
+    driver_object: *mut _DRIVER_OBJECT,
+    registry_path: *mut _UNICODE_STRING,
+) -> NTSTATUS {
+    catch_ntstatus(|| driver_entry(driver_object, registry_path))
+}
+
+fn driver_entry(
     driver_object: *mut _DRIVER_OBJECT,
     registry_path: *mut _UNICODE_STRING,
 ) -> NTSTATUS {
@@ -66,11 +75,7 @@ extern "C-unwind" fn DriverEntry(
 
     if !status.is_success() {
         // Okay, let's try another method then
-        let device = unsafe { Sendable::new(driver_object) };
-
         std::thread::spawn(move || {
-            #[allow(clippy::redundant_locals)]
-            let device = device;
             let time_waited = Instant::now();
             // 5 minutes
             let timeout_duration = Duration::from_mins(5);
@@ -86,13 +91,11 @@ extern "C-unwind" fn DriverEntry(
                 let timedout = time_waited.elapsed() >= timeout_duration;
                 if status.is_success() || timedout {
                     if timedout {
-                        // Service took too long to start. Unfortunately, there is no way to log this failure
-                        unsafe {
-                            _ = WdfDeviceSetFailed(
-                                device.cast(),
-                                WDF_DEVICE_FAILED_ACTION::WdfDeviceFailedNoRestart,
-                            );
-                        }
+                        // Service took too long to start. Unfortunately, there is no way to log this failure.
+                        //
+                        // M5：曾在此把 DRIVER_OBJECT 强转成 WDFDEVICE 调 WdfDeviceSetFailed ——
+                        // 句柄类型混淆（DriverEntry 阶段尚不存在任何设备对象，该句柄指向的是
+                        // DRIVER_OBJECT），调用未定义行为；已删除，仅保留超时事实，不做对象操作。
                     } else {
                         info!(
                             "Service took {} seconds to start",
@@ -125,10 +128,12 @@ extern "C-unwind" fn DriverEntry(
     .into()
 }
 
-extern "C-unwind" fn driver_add(
-    _driver: *mut WDFDRIVER__,
-    mut init: *mut WDFDEVICE_INIT,
-) -> NTSTATUS {
+// M3：同 DriverEntry，driver_add 由 WDF 在设备枚举时以 C ABI 调用
+extern "C-unwind" fn driver_add(driver: *mut WDFDRIVER__, init: *mut WDFDEVICE_INIT) -> NTSTATUS {
+    catch_ntstatus(|| driver_add_impl(driver, init))
+}
+
+fn driver_add_impl(_driver: *mut WDFDRIVER__, mut init: *mut WDFDEVICE_INIT) -> NTSTATUS {
     let mut callbacks = WDF_PNPPOWER_EVENT_CALLBACKS::init();
 
     callbacks.EvtDeviceD0Entry = Some(device_d0_entry);
@@ -171,6 +176,11 @@ extern "C-unwind" fn driver_add(
         return e.into();
     }
 
+    // M4：context.init() 仍在 IddCxDeviceInitialize 之后 —— 若 IddCxDeviceInitialize 失败，
+    // WDF 销毁设备对象并触发 event_cleanup；wdf.rs 的上下文槽已改为显式 `Uninit` 变体
+    // （WDF 分配的上下文内存保证零初始化，见 wdf.rs ArcPointer 注释），
+    // 对零值上下文 drop 是 no-op，不再有「未初始化上下文被 drop」的 UB。
+
     let status = unsafe { IddCxDeviceInitialize(device) };
     if let Err(e) = status {
         error!("Failed to init iddcx device: {e:?}");
@@ -183,5 +193,8 @@ extern "C-unwind" fn driver_add(
 }
 
 unsafe extern "C-unwind" fn event_cleanup(wdf_object: WDFOBJECT) {
-    _ = unsafe { DeviceContext::drop(wdf_object) };
+    // M3：清理回调同样不允许 panic 外溢
+    catch_ignore(move || {
+        _ = unsafe { DeviceContext::drop(wdf_object) };
+    });
 }

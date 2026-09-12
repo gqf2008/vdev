@@ -7,9 +7,8 @@ use crate::{
 ///
 /// It manages its own state. Changing this state does not affect the driver
 /// directly. You must call [DriverClient::notify] to send changes to the
-/// driver. To make your changes persistent across reboots, call
-/// [DriverClient::persist]. To synchronize this object with the driver, you
-/// must call [DriverClient::refresh_state]. The state will not be updated
+/// driver. To synchronize this object with the driver, you must call
+/// [DriverClient::refresh_state]. The state will not be updated
 /// automatically.
 #[derive(Debug)]
 pub struct DriverClient(AsyncDriverClient);
@@ -143,12 +142,21 @@ impl DriverClient {
 
     /// Find a monitor by ID and call `cb` with a mutable reference to it.
     ///
+    /// Returns `Ok(None)` if the monitor does not exist. Returns
+    /// `Err(DuplicateError)` if the callback made the state contain duplicate
+    /// IDs / modes / refresh rates; in that case the state is rolled back to
+    /// its previous value.
+    ///
     /// Note: Any changes do not affect the driver. Manually call
     /// [DriverClient::notify] to send these changes to the driver.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,
     /// manually call [DriverClient::refresh_state].
-    pub fn find_monitor_mut<R>(&mut self, id: Id, cb: impl FnOnce(&mut Monitor) -> R) -> Option<R> {
+    pub fn find_monitor_mut<R>(
+        &mut self,
+        id: Id,
+        cb: impl FnOnce(&mut Monitor) -> R,
+    ) -> Result<Option<R>, error::DuplicateError> {
         self.0.find_monitor_mut(id, cb)
     }
 
@@ -171,6 +179,10 @@ impl DriverClient {
     /// Find the monitor matched by the given query and call `cb` with a mutable
     /// reference to it.
     ///
+    /// Returns `Ok(None)` if no monitor matches. Returns `Err(DuplicateError)`
+    /// if the callback made the state contain duplicates (state is rolled back
+    /// in that case).
+    ///
     /// Note: Any changes do not affect the driver. Manually call
     /// [DriverClient::notify] to send these changes to the driver.
     ///
@@ -180,7 +192,7 @@ impl DriverClient {
         &mut self,
         query: &str,
         cb: impl FnOnce(&mut Monitor) -> R,
-    ) -> Option<R> {
+    ) -> Result<Option<R>, error::DuplicateError> {
         self.0.find_monitor_mut_query(query, cb)
     }
 
@@ -200,15 +212,11 @@ impl DriverClient {
         self.0.find_monitor_mut_query_unchecked(query)
     }
 
-    /// Write client state to the registry for current user.
+    /// Get a free ID, preferring the given `preferred_id`.
     ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
-    pub fn persist(&self) -> Result<(), error::PersistError> {
-        self.0.persist()
-    }
-
-    /// Get the closest available free ID.
+    /// - `preferred_id` free → returns it;
+    /// - otherwise → the first free ID counting from 0;
+    /// - all IDs taken → `None`.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,
     /// manually call [DriverClient::refresh_state].

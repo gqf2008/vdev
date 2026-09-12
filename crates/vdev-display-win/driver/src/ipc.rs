@@ -1,8 +1,9 @@
 use std::{
     mem::size_of,
-    ptr::{addr_of_mut, NonNull},
-    sync::{LazyLock, Mutex, OnceLock},
+    ptr::NonNull,
+    sync::{LazyLock, Mutex, OnceLock, PoisonError},
     thread,
+    time::Duration,
 };
 
 use driver_ipc::{
@@ -18,15 +19,15 @@ use tokio::{
 };
 use wdf_umdf::IddCxMonitorDeparture;
 use wdf_umdf_sys::{IDDCX_ADAPTER__, IDDCX_MONITOR__};
-use windows::Win32::{
-    Security::{
-        InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+use windows::{
+    core::w,
+    Win32::Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
     },
-    System::SystemServices::SECURITY_DESCRIPTOR_REVISION1,
 };
 
-use crate::context::DeviceContext;
+use crate::{context::DeviceContext, validate};
 
 pub static ADAPTER: OnceLock<AdapterObject> = OnceLock::new();
 pub static MONITOR_MODES: LazyLock<Mutex<Vec<MonitorObject>>> =
@@ -75,14 +76,18 @@ async fn process_message(
             // driver commands
             ServerCommand::Driver(cmd) => match cmd {
                 DriverCommand::Notify(monitors) => {
-                    notify(monitors.clone());
+                    // minor(c)：notify() 返回 sanitize 后的列表 —— 广播给其他客户端的
+                    // EventCommand::Changed 必须与驱动实际生效（校验后）的状态同源，
+                    // 不能广播未校验的原始输入
+                    let monitors = notify(monitors);
                     _ = tx.send((id, monitors));
                 }
 
                 DriverCommand::Remove(ids) => {
                     remove(&ids);
 
-                    let lock = MONITOR_MODES.lock().unwrap();
+                    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+                    let lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
                     let monitors = lock.iter().map(|m| m.data.clone()).collect();
                     _ = tx.send((id, monitors));
                 }
@@ -98,7 +103,8 @@ async fn process_message(
             // request commands
             ServerCommand::Request(RequestCommand::State) => {
                 let mut data = {
-                    let lock = MONITOR_MODES.lock().unwrap();
+                    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+                    let lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
                     let monitors = lock.iter().map(|m| m.data.clone()).collect();
                     let command = ReplyCommand::State(monitors);
 
@@ -129,32 +135,40 @@ async fn process_message(
 #[allow(clippy::too_many_lines)]
 pub fn startup() {
     thread::spawn(move || {
-        // These security attributes will allow anyone access, so local account does not need admin privileges to use it
+        // M1：管道安全 —— 不再使用 NULL DACL（任何本地进程都能连上管道注入
+        // Notify/Remove 命令）。改用 SDDL 限定描述符：
+        //   D:P            DACL 存在且受保护（SE_DACL_PROTECTED，不被继承 ACL 穿透）
+        //   (A;;GA;;;BA)   允许 BUILTIN\Administrators 完全访问
+        //   (A;;GA;;;SY)   允许 LOCAL SYSTEM 完全访问
+        // 出处：Win32 "Security Descriptor String Format"（learn.microsoft.com
+        // secauthz/security-descriptor-string-format）与 "ACE Strings"（GA=GENERIC_ALL、
+        // BA=BUILTIN\Administrators、SY=LOCAL SYSTEM）。客户端（vdev-display cli）
+        // 因此须以管理员身份运行。
+        let sddl = w!("D:P(A;;GA;;;BA)(A;;GA;;;SY)");
 
-        let mut sd = SECURITY_DESCRIPTOR::default();
+        // 一次性转换出的自相对 SD 由 listener 线程持有、驱动进程生命周期内持续使用；
+        // listener 线程永不退出，故不做 LocalFree（进程退出时由系统回收）。
+        let mut psd = PSECURITY_DESCRIPTOR::default();
 
-        unsafe {
-            InitializeSecurityDescriptor(
-                PSECURITY_DESCRIPTOR(addr_of_mut!(sd).cast()),
-                SECURITY_DESCRIPTOR_REVISION1,
-            )
-            .unwrap();
-        }
-
-        unsafe {
-            SetSecurityDescriptorDacl(
-                PSECURITY_DESCRIPTOR(addr_of_mut!(sd).cast()),
-                true,
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl,
+                SDDL_REVISION_1,
+                &mut psd,
                 None,
-                false,
             )
-            .unwrap();
+        };
+
+        if let Err(e) = converted {
+            // 无法生成安全描述符时不能退回无保护管道，直接放弃启动 listener
+            error!("Failed to convert SDDL to security descriptor: {e:?}");
+            return;
         }
 
         let mut sa = SECURITY_ATTRIBUTES {
             #[allow(clippy::cast_possible_truncation)]
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: addr_of_mut!(sd).cast(),
+            lpSecurityDescriptor: psd.0,
             bInheritHandle: false.into(),
         };
 
@@ -163,21 +177,41 @@ pub fn startup() {
             let (tx, _rx) = broadcast::channel(1);
 
             let mut id = 0usize;
+            // M1：FILE_FLAG_FIRST_PIPE_INSTANCE 只能加在第一个实例上 ——
+            // MS 文档（CreateNamedPipe dwOpenMode）明确：“creation of the first
+            // instance succeeds, but creation of the next instance fails with
+            // ERROR_ACCESS_DENIED”。它用于防止管道抢占（squatting）：恶意进程
+            // 先建同名管道时我们的首个实例创建失败，而不是静默让客户端连到
+            // 攻击者的管道上。
+            let mut first_instance = true;
 
             loop {
-                let mut server = unsafe {
-                    ServerOptions::new()
-                        .access_inbound(true)
-                        .access_outbound(true)
-                        .reject_remote_clients(true)
-                        .in_buffer_size(BUFFER_SIZE)
-                        .out_buffer_size(BUFFER_SIZE)
-                        // default is unlimited instances
-                        .create_with_security_attributes_raw(
-                            r"\\.\pipe\vdev-display",
-                            std::ptr::from_mut::<SECURITY_ATTRIBUTES>(&mut sa).cast(),
-                        )
-                        .unwrap()
+                let mut options = ServerOptions::new()
+                    .access_inbound(true)
+                    .access_outbound(true)
+                    .reject_remote_clients(true)
+                    .in_buffer_size(BUFFER_SIZE)
+                    .out_buffer_size(BUFFER_SIZE)
+                    // default is unlimited instances
+                    .first_pipe_instance(first_instance);
+
+                // M1：创建失败不再 unwrap panic（原实现在抢占场景必然 panic 炸掉
+                // listener 线程），改为记日志 + 退避重试
+                let mut server = match unsafe {
+                    options.create_with_security_attributes_raw(
+                        r"\\.\pipe\vdev-display",
+                        std::ptr::from_mut::<SECURITY_ATTRIBUTES>(&mut sa).cast(),
+                    )
+                } {
+                    Ok(server) => {
+                        first_instance = false;
+                        server
+                    }
+                    Err(e) => {
+                        error!("Failed to create named pipe instance: {e:?}");
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
                 };
 
                 if server.connect().await.is_err() {
@@ -201,6 +235,19 @@ pub fn startup() {
                                     Ok(0) | Err(_) => break,
 
                                     Ok(size) => msg_buf.extend(&buf[..size]),
+                                }
+
+                                // M2(a)：单消息字节上限。EOF 边界之前积累的字节
+                                // 超过上限说明对端在无边界地灌数据（或消息远超
+                                // 合法规模），丢弃已积累 buffer，防止无界内存增长。
+                                // 512 KiB 足以容纳 M2(b) 上限下的最坏合法 Notify
+                                //（见 validate::MAX_MSG_BYTES 注释的推算）。
+                                if validate::msg_over_limit(msg_buf.len()) {
+                                    warn!(
+                                        "IPC: buffered input exceeded {} bytes; dropping it",
+                                        validate::MAX_MSG_BYTES
+                                    );
+                                    msg_buf.clear();
                                 }
 
                                 // get all eof boundary positions
@@ -307,6 +354,74 @@ fn has_duplicates(monitors: &[Monitor]) -> bool {
     false
 }
 
+/// M2(b)：对客户端发来的显示器列表做输入校验（上限/范围），越界部分拒收并记日志。
+/// 决策逻辑在纯函数模块 [`crate::validate`]（可宿主单测），这里只做 Vec 搬运。
+fn sanitize_monitors(mut monitors: Vec<Monitor>) -> Vec<Monitor> {
+    let capped_len = validate::enforce_monitor_cap(monitors.len());
+    if monitors.len() > capped_len {
+        warn!(
+            "IPC: {} monitors exceed cap {}; dropping the rest",
+            monitors.len(),
+            validate::MAX_MONITORS
+        );
+        monitors.truncate(capped_len);
+    }
+
+    monitors.retain_mut(|monitor| {
+        if monitor.modes.len() > validate::MAX_MODES_PER_MONITOR {
+            warn!(
+                "IPC: monitor {} has {} modes, capped at {}",
+                monitor.id,
+                monitor.modes.len(),
+                validate::MAX_MODES_PER_MONITOR
+            );
+            monitor.modes.truncate(validate::MAX_MODES_PER_MONITOR);
+        }
+
+        monitor.modes.retain_mut(|mode| {
+            match validate::validate_mode(mode.width, mode.height, &mode.refresh_rates) {
+                Ok(rates) => {
+                    let dropped = mode.refresh_rates.len() - rates.len();
+                    if dropped > 0 {
+                        warn!(
+                            "IPC: monitor {} mode {}x{}: dropped {} refresh rate(s) \
+                             (out-of-range or over per-mode cap {})",
+                            monitor.id,
+                            mode.width,
+                            mode.height,
+                            dropped,
+                            validate::MAX_RATES_PER_MODE
+                        );
+                    }
+                    mode.refresh_rates = rates;
+                    true
+                }
+                Err(reason) => {
+                    warn!(
+                        "IPC: monitor {} rejected mode {}x{}: {reason}",
+                        monitor.id, mode.width, mode.height
+                    );
+                    false
+                }
+            }
+        });
+
+        // 启用中的显示器一个合法模式都不剩 => 整个显示器拒收；
+        // 禁用中的显示器保留条目（它的删除语义依赖状态留存）
+        if monitor.enabled && monitor.modes.is_empty() {
+            warn!(
+                "IPC: enabled monitor {} has no valid modes left; rejected",
+                monitor.id
+            );
+            return false;
+        }
+
+        true
+    });
+
+    monitors
+}
+
 /// Notifies driver of new system monitor state
 ///
 /// Adds, updates, or removes monitors as needed
@@ -315,17 +430,28 @@ fn has_duplicates(monitors: &[Monitor]) -> bool {
 ///
 /// Only detaches/reattaches if required
 /// e.g. only a monitor name update would not detach/arrive a monitor
-fn notify(monitors: Vec<Monitor>) {
+fn notify(monitors: Vec<Monitor>) -> Vec<Monitor> {
+    // M2(b)：先做输入校验（数量/分辨率/刷新率上限与范围）；返回校验后的列表，
+    // 供 process_message 广播（minor(c)），使广播与驱动实际生效状态同源
+    let monitors = sanitize_monitors(monitors);
+
     // Duplicated id's will not cause any issue, however duplicated resolutions/refresh rates are possible
     // They should all be unique anyways. So warn + noop if the sender sent incorrect data
     if has_duplicates(&monitors) {
         warn!("notify(): Duplicate data was detected; update aborted");
-        return;
+        return monitors;
     }
 
-    let adapter = ADAPTER.get().unwrap().0.as_ptr();
+    // M3：adapter 未就绪（IddCxAdapterInitFinished 尚未回调）时收敛为记日志并忽略，
+    // 不再 unwrap panic。listener 在 adapter 就绪后才启动，正常路径不会走到这里。
+    let Some(adapter) = ADAPTER.get() else {
+        error!("notify(): adapter is not initialized yet; ignoring notify");
+        return monitors;
+    };
+    let adapter = adapter.0.as_ptr();
 
-    let mut lock = MONITOR_MODES.lock().unwrap();
+    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+    let mut lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
 
     // Remove monitors from internal list which are missing from the provided list
 
@@ -347,6 +473,9 @@ fn notify(monitors: Vec<Monitor>) {
 
         found
     });
+
+    // minor(c)：广播列表取 sanitize 后的快照（消费前克隆，与驱动实际生效状态同源）
+    let broadcast = monitors.clone();
 
     let should_arrive = monitors
         .into_iter()
@@ -410,13 +539,17 @@ fn notify(monitors: Vec<Monitor>) {
         }
     };
 
-    unsafe {
-        DeviceContext::get_mut(adapter.cast(), cb).unwrap();
+    // M3：取设备上下文失败（含未初始化/锁失败）收敛为记日志，不再 unwrap panic
+    if let Err(e) = unsafe { DeviceContext::get_mut(adapter.cast(), cb) } {
+        error!("notify(): failed to access device context: {e:?}");
     }
+
+    broadcast
 }
 
 fn remove_all() {
-    let mut lock = MONITOR_MODES.lock().unwrap();
+    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+    let mut lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
 
     for monitor in lock.drain(..) {
         if let Some(mut monitor_object) = monitor.object {
@@ -429,7 +562,8 @@ fn remove_all() {
 }
 
 fn remove(ids: &[u32]) {
-    let mut lock = MONITOR_MODES.lock().unwrap();
+    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+    let mut lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
 
     for &id in ids {
         lock.retain_mut(|monitor| {

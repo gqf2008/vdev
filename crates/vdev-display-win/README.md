@@ -65,7 +65,6 @@ vdev-display-win.exe list            # 列出当前虚拟屏
 vdev-display-win.exe set-mode 0 2560x1440@144
 vdev-display-win.exe remove 0        # 移除
 vdev-display-win.exe remove-all
-vdev-display-win.exe persist         # 把配置写入注册表（HKCU\SOFTWARE\vdev-display）
 vdev-display-win.exe uninstall       # 卸载驱动（管理员）
 ```
 

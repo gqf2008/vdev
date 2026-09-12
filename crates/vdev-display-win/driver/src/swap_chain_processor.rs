@@ -57,12 +57,19 @@ impl SwapChainProcessor {
         let join_handle = thread::spawn(move || {
             // It is very important to prioritize this thread by making use of the Multimedia Scheduler Service.
             // It will intelligently prioritize the thread for improved throughput in high CPU-load scenarios.
+            //
+            // minor(b)：MMCSS 失败不再提前 return —— 原实现在此直接返回，会跳过
+            // run_core 之后的 WdfObjectDelete(swap_chain)，泄漏 swap chain 对象。
+            // 降级为普通线程优先级继续处理，收尾清理照常执行。
             let mut av_task = 0u32;
             let res =
                 unsafe { AvSetMmThreadCharacteristicsW(w!("Distribution"), &raw mut av_task) };
-            let Ok(av_handle) = res else {
-                error!("Failed to prioritize thread: {res:?}");
-                return;
+            let av_handle = match res {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    error!("Failed to prioritize thread: {e:?}");
+                    None
+                }
             };
 
             Self::run_core(*swap_chain, &device, *available_buffer_event, &terminate);
@@ -70,13 +77,14 @@ impl SwapChainProcessor {
             let res = unsafe { WdfObjectDelete(*swap_chain as WDFOBJECT) };
             if let Err(e) = res {
                 error!("Failed to delete wdf object: {e:?}");
-                return;
             }
 
             // Revert the thread to normal once it's done
-            let res = unsafe { AvRevertMmThreadCharacteristics(av_handle) };
-            if let Err(e) = res {
-                error!("Failed to revert prioritize thread: {e:?}");
+            if let Some(av_handle) = av_handle {
+                let res = unsafe { AvRevertMmThreadCharacteristics(av_handle) };
+                if let Err(e) = res {
+                    error!("Failed to revert prioritize thread: {e:?}");
+                }
             }
         });
 

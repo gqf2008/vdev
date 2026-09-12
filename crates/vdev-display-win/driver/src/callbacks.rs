@@ -3,6 +3,7 @@ use std::{
     ptr::NonNull,
 };
 
+use driver_ipc::Mode;
 use log::error;
 use wdf_umdf_sys::{
     __BindgenBitfieldUnit, DISPLAYCONFIG_VIDEO_SIGNAL_INFO__bindgen_ty_1,
@@ -20,9 +21,21 @@ use crate::{
     context::{DeviceContext, MonitorContext},
     edid::Edid,
     ipc::{AdapterObject, FlattenModes, ADAPTER, MONITOR_MODES},
+    panic::catch_ntstatus,
 };
 
+// M3：以下所有 `extern "C-unwind"` 回调均为 WDF/IddCx 框架的调用入口。
+// 实现体抽为 `*_impl`，入口统一 `catch_ntstatus` 兜底 —— panic 不得穿越
+// FFI 边界进入框架宿主，而是以 STATUS_DRIVER_INTERNAL_ERROR 返回。
+
 pub extern "C-unwind" fn adapter_init_finished(
+    adapter_object: *mut IDDCX_ADAPTER__,
+    p_in_args: *const IDARG_IN_ADAPTER_INIT_FINISHED,
+) -> NTSTATUS {
+    catch_ntstatus(|| adapter_init_finished_impl(adapter_object, p_in_args))
+}
+
+fn adapter_init_finished_impl(
     adapter_object: *mut IDDCX_ADAPTER__,
     _p_in_args: *const IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
@@ -44,8 +57,12 @@ pub extern "C-unwind" fn adapter_init_finished(
 
 pub extern "C-unwind" fn device_d0_entry(
     device: WDFDEVICE,
-    _previous_state: WDF_POWER_DEVICE_STATE,
+    p_previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
+    catch_ntstatus(|| device_d0_entry_impl(device, p_previous_state))
+}
+
+fn device_d0_entry_impl(device: WDFDEVICE, _previous_state: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
     let status: NTSTATUS = unsafe {
         DeviceContext::get_mut(device.cast(), |context| {
             if let Err(e) = context.init_adapter() {
@@ -63,17 +80,32 @@ pub extern "C-unwind" fn device_d0_entry(
 }
 
 fn display_info(width: u32, height: u32, refresh_rate: u32) -> DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    let clock_rate = refresh_rate * (height + 4) * (height + 4) + 1000;
+    // M3：clock_rate 改在 u64 域 checked 计算 —— 原 u32 域在大分辨率高刷新率下
+    // 乘法回绕（release）/直接 panic（debug）。任何一步溢出则钳制到 u64::MAX。
+    let height_total = u64::from(height) + 4;
+    let clock_rate = u64::from(refresh_rate)
+        .checked_mul(height_total)
+        .and_then(|v| v.checked_mul(height_total))
+        .and_then(|v| v.checked_add(1000))
+        .unwrap_or(u64::MAX);
+
+    // DISPLAYCONFIG_RATIONAL 的 Numerator/Denominator 是 u32：M2 输入校验
+    // （refresh [1,1000]、height [64,16384]）内仍有组合会击穿 u32::MAX ≈ 4.295e9，
+    // 例如 2160p（总高 2164）@ 1000Hz ≈ 4.68e9（≥918Hz 即击穿）、高度 ≥2069 @
+    // 1000Hz —— 故钳制到 u32::MAX，而非「常规组合达不到钳制」。
+    let clock_rate_u32 = u32::try_from(clock_rate).unwrap_or(u32::MAX);
+    let height_total_u32 = u32::try_from(height_total).unwrap_or(u32::MAX);
+    let height_total_sq_u32 = u32::try_from(height_total * height_total).unwrap_or(u32::MAX);
 
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-        pixelRate: u64::from(clock_rate),
+        pixelRate: clock_rate,
         hSyncFreq: DISPLAYCONFIG_RATIONAL {
-            Numerator: clock_rate,
-            Denominator: height + 4,
+            Numerator: clock_rate_u32,
+            Denominator: height_total_u32,
         },
         vSyncFreq: DISPLAYCONFIG_RATIONAL {
-            Numerator: clock_rate,
-            Denominator: (height + 4) * (height + 4),
+            Numerator: clock_rate_u32,
+            Denominator: height_total_sq_u32,
         },
         activeSize: DISPLAYCONFIG_2DREGION {
             cx: width,
@@ -101,6 +133,13 @@ fn display_info(width: u32, height: u32, refresh_rate: u32) -> DISPLAYCONFIG_VID
 }
 
 pub extern "C-unwind" fn parse_monitor_description(
+    p_in_args: *const IDARG_IN_PARSEMONITORDESCRIPTION,
+    p_out_args: *mut IDARG_OUT_PARSEMONITORDESCRIPTION,
+) -> NTSTATUS {
+    catch_ntstatus(|| parse_monitor_description_impl(p_in_args, p_out_args))
+}
+
+fn parse_monitor_description_impl(
     p_in_args: *const IDARG_IN_PARSEMONITORDESCRIPTION,
     p_out_args: *mut IDARG_OUT_PARSEMONITORDESCRIPTION,
 ) -> NTSTATUS {
@@ -133,12 +172,11 @@ pub extern "C-unwind" fn parse_monitor_description(
         return NTSTATUS::STATUS_DRIVER_INTERNAL_ERROR;
     };
 
-    let number_of_modes: u32 = monitor
-        .data
-        .modes
-        .iter()
-        .map(|m| u32::try_from(m.refresh_rates.len()).expect("Cannot use > u32::MAX refresh rates"))
-        .sum();
+    // M3：模式计数用 checked 累加，异常时返回错误状态而非 expect panic
+    let Ok(number_of_modes) = count_modes(&monitor.data.modes) else {
+        error!("Monitor {monitor_index} has too many modes to count in u32");
+        return NTSTATUS::STATUS_DRIVER_INTERNAL_ERROR;
+    };
 
     out_args.MonitorModeBufferOutputCount = number_of_modes;
     if in_args.MonitorModeBufferInputCount < number_of_modes {
@@ -148,6 +186,14 @@ pub extern "C-unwind" fn parse_monitor_description(
         } else {
             NTSTATUS::STATUS_SUCCESS
         };
+    }
+
+    // minor(b)：无模式可写时 pMonitorModes 可能为 null，而
+    // slice::from_raw_parts_mut 要求指针非空（len == 0 亦然，形式 UB）——
+    // 先短路返回；行为与「空 slice + 空 loop」一致
+    if number_of_modes == 0 {
+        out_args.PreferredMonitorModeIdx = 0;
+        return NTSTATUS::STATUS_SUCCESS;
     }
 
     let monitor_modes = unsafe {
@@ -175,11 +221,30 @@ pub extern "C-unwind" fn parse_monitor_description(
 }
 
 pub extern "C-unwind" fn monitor_get_default_modes(
+    monitor_object: *mut IDDCX_MONITOR__,
+    p_in_args: *const IDARG_IN_GETDEFAULTDESCRIPTIONMODES,
+    p_out_args: *mut IDARG_OUT_GETDEFAULTDESCRIPTIONMODES,
+) -> NTSTATUS {
+    catch_ntstatus(|| monitor_get_default_modes_impl(monitor_object, p_in_args, p_out_args))
+}
+
+fn monitor_get_default_modes_impl(
     _monitor_object: *mut IDDCX_MONITOR__,
     _p_in_args: *const IDARG_IN_GETDEFAULTDESCRIPTIONMODES,
     _p_out_args: *mut IDARG_OUT_GETDEFAULTDESCRIPTIONMODES,
 ) -> NTSTATUS {
     NTSTATUS::STATUS_NOT_IMPLEMENTED
+}
+
+/// M3：把各模式的刷新率数量 checked 累加成 u32，溢出/越界返回 None
+fn count_modes(modes: &[Mode]) -> Result<u32, ()> {
+    modes
+        .iter()
+        .try_fold(0u32, |acc, m| {
+            let n = u32::try_from(m.refresh_rates.len()).map_err(|_| ())?;
+            acc.checked_add(n).ok_or(())
+        })
+        .map_err(|_| ())
 }
 
 pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> IDDCX_TARGET_MODE {
@@ -188,15 +253,21 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> IDDCX_TARGET_M
         cy: height,
     };
 
+    // M3：乘法全部改 saturating 域 —— 原 u64 域 `*` 在 debug 下大参数直接 panic；
+    // u32 的 hSyncFreq.Numerator 同类隐患一并收敛（M2 校验下实际不会触顶）
+    let pixel_rate = u64::from(refresh_rate)
+        .saturating_mul(u64::from(width))
+        .saturating_mul(u64::from(height));
+
     IDDCX_TARGET_MODE {
         #[allow(clippy::cast_possible_truncation)]
         Size: mem::size_of::<IDDCX_TARGET_MODE>() as u32,
 
         TargetVideoSignalInfo: DISPLAYCONFIG_TARGET_MODE {
             targetVideoSignalInfo: DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-                pixelRate: u64::from(refresh_rate) * u64::from(width) * u64::from(height),
+                pixelRate: pixel_rate,
                 hSyncFreq: DISPLAYCONFIG_RATIONAL {
-                    Numerator: refresh_rate * height,
+                    Numerator: refresh_rate.saturating_mul(height),
                     Denominator: 1,
                 },
                 vSyncFreq: DISPLAYCONFIG_RATIONAL {
@@ -228,6 +299,14 @@ pub extern "C-unwind" fn monitor_query_modes(
     p_in_args: *const IDARG_IN_QUERYTARGETMODES,
     p_out_args: *mut IDARG_OUT_QUERYTARGETMODES,
 ) -> NTSTATUS {
+    catch_ntstatus(|| monitor_query_modes_impl(monitor_object, p_in_args, p_out_args))
+}
+
+fn monitor_query_modes_impl(
+    monitor_object: *mut IDDCX_MONITOR__,
+    p_in_args: *const IDARG_IN_QUERYTARGETMODES,
+    p_out_args: *mut IDARG_OUT_QUERYTARGETMODES,
+) -> NTSTATUS {
     // find out which monitor this belongs too
 
     let Ok(monitors) = MONITOR_MODES.lock() else {
@@ -244,12 +323,11 @@ pub extern "C-unwind" fn monitor_query_modes(
         return NTSTATUS::STATUS_DRIVER_INTERNAL_ERROR;
     };
 
-    let number_of_modes = monitor
-        .data
-        .modes
-        .iter()
-        .map(|m| u32::try_from(m.refresh_rates.len()).expect("Cannot use > u32::MAX modes"))
-        .sum();
+    // M3：模式计数用 checked 累加，异常时返回错误状态而非 expect panic
+    let Ok(number_of_modes) = count_modes(&monitor.data.modes) else {
+        error!("Cached monitor has too many modes to count in u32");
+        return NTSTATUS::STATUS_DRIVER_INTERNAL_ERROR;
+    };
 
     // Create a set of modes supported for frame processing and scan-out. These are typically not based on the
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
@@ -260,32 +338,55 @@ pub extern "C-unwind" fn monitor_query_modes(
 
     let in_args = unsafe { &*p_in_args };
 
-    if in_args.TargetModeBufferInputCount >= number_of_modes {
-        let out_target_modes = unsafe {
-            std::slice::from_raw_parts_mut(
-                in_args
-                    .pTargetModes
-                    .cast::<MaybeUninit<IDDCX_TARGET_MODE>>(),
-                number_of_modes as usize,
-            )
+    // minor(d)：缓冲不足时与 parse_monitor_description 保持一致返回
+    // STATUS_BUFFER_TOO_SMALL（缓冲为 0 仍返回 SUCCESS —— 调用方只是在询问数量），
+    // 原实现静默返回 SUCCESS 会让 OS 以为目标模式已写入而读到未初始化缓冲
+    if in_args.TargetModeBufferInputCount < number_of_modes {
+        return if in_args.TargetModeBufferInputCount > 0 {
+            NTSTATUS::STATUS_BUFFER_TOO_SMALL
+        } else {
+            NTSTATUS::STATUS_SUCCESS
         };
+    }
 
-        for (mode, out_target) in monitor
-            .data
-            .modes
-            .flatten()
-            .zip(out_target_modes.iter_mut())
-        {
-            let target_mode = target_mode(mode.width, mode.height, mode.refresh_rate);
+    // minor(b)：无模式可写时 pTargetModes 可能为 null，而
+    // slice::from_raw_parts_mut 要求指针非空（len == 0 亦然，形式 UB）——
+    // 先短路返回；行为与「空 slice + 空 loop」一致
+    if number_of_modes == 0 {
+        return NTSTATUS::STATUS_SUCCESS;
+    }
 
-            out_target.write(target_mode);
-        }
+    let out_target_modes = unsafe {
+        std::slice::from_raw_parts_mut(
+            in_args
+                .pTargetModes
+                .cast::<MaybeUninit<IDDCX_TARGET_MODE>>(),
+            number_of_modes as usize,
+        )
+    };
+
+    for (mode, out_target) in monitor
+        .data
+        .modes
+        .flatten()
+        .zip(out_target_modes.iter_mut())
+    {
+        let target_mode = target_mode(mode.width, mode.height, mode.refresh_rate);
+
+        out_target.write(target_mode);
     }
 
     NTSTATUS::STATUS_SUCCESS
 }
 
 pub extern "C-unwind" fn adapter_commit_modes(
+    adapter_object: *mut IDDCX_ADAPTER__,
+    p_in_args: *const IDARG_IN_COMMITMODES,
+) -> NTSTATUS {
+    catch_ntstatus(|| adapter_commit_modes_impl(adapter_object, p_in_args))
+}
+
+fn adapter_commit_modes_impl(
     _adapter_object: *mut IDDCX_ADAPTER__,
     _p_in_args: *const IDARG_IN_COMMITMODES,
 ) -> NTSTATUS {
@@ -293,6 +394,13 @@ pub extern "C-unwind" fn adapter_commit_modes(
 }
 
 pub extern "C-unwind" fn assign_swap_chain(
+    monitor_object: *mut IDDCX_MONITOR__,
+    p_in_args: *const IDARG_IN_SETSWAPCHAIN,
+) -> NTSTATUS {
+    catch_ntstatus(|| assign_swap_chain_impl(monitor_object, p_in_args))
+}
+
+fn assign_swap_chain_impl(
     monitor_object: *mut IDDCX_MONITOR__,
     p_in_args: *const IDARG_IN_SETSWAPCHAIN,
 ) -> NTSTATUS {
@@ -311,6 +419,10 @@ pub extern "C-unwind" fn assign_swap_chain(
 }
 
 pub extern "C-unwind" fn unassign_swap_chain(monitor_object: *mut IDDCX_MONITOR__) -> NTSTATUS {
+    catch_ntstatus(|| unassign_swap_chain_impl(monitor_object))
+}
+
+fn unassign_swap_chain_impl(monitor_object: *mut IDDCX_MONITOR__) -> NTSTATUS {
     unsafe {
         MonitorContext::get_mut(monitor_object.cast(), |context| {
             context.unassign_swap_chain();

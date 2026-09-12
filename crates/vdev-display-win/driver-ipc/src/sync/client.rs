@@ -91,14 +91,6 @@ impl Client {
     pub fn request_state(&self) -> Result<Vec<Monitor>, error::RequestError> {
         RUNTIME.block_on(self.0.request_state())
     }
-
-    /// Write `monitors` to the registry for current user.
-    ///
-    /// Next time the driver is started, it will load this state from the
-    /// registry. This might be after a reboot or a driver restart.
-    pub fn persist(monitors: &[Monitor]) -> Result<(), error::PersistError> {
-        AsyncClient::persist(monitors)
-    }
 }
 
 pub struct EventsSubscription {

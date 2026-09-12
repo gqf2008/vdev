@@ -441,17 +441,12 @@ dependencies = [
 name = "driver-ipc"
 version = "0.1.0"
 dependencies = [
- "joinery",
- "lazy_format",
  "log",
- "owo-colors",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
- "windows",
- "winreg",
 ]
 
 [[package]]
@@ -1702,12 +1697,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "joinery"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d8bde02bbf44a562cf068a8ff4a68842df387e302a03a4de4a57fcf82ec377"
-
-[[package]]
 name = "kstring"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1715,12 +1704,6 @@ checksum = "b609e7ca5ea38f093c20a4a102335b247221c9643b7a6bc3510f196f99499a9e"
 dependencies = [
  "static_assertions",
 ]
-
-[[package]]
-name = "lazy_format"
-version = "2.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e479e99b287d578ed5f6cd4c92cdf48db219088adb9c5b14f7c155b71dfba792"
 
 [[package]]
 name = "libc"
@@ -1860,12 +1843,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "owo-colors"
-version = "4.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
 name = "parking_lot"
@@ -2520,8 +2497,6 @@ dependencies = [
  "driver-ipc",
  "serde",
  "serde_json",
- "thiserror",
- "widestring",
  "windows",
 ]
 
