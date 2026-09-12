@@ -13,3 +13,21 @@ hound = "3.5"
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Windows audio path (WASAPI). Feature names verified against the vendored
+# sources (~/.cargo/registry/src/*/windows-0.58.0): `Win32_UI_Shell_Properties`
+# does not exist in 0.58 -- the property-store feature is
+# `Win32_UI_Shell_PropertiesSystem` (IPropertyStore / PROPERTYKEY live there);
+# PKEY_Device_FriendlyName lives in Win32_Devices_FunctionDiscovery, the
+# MMDeviceAPI / WASAPI interfaces in Win32_Media_Audio, COM startup in
+# Win32_System_Com. PROPVARIANT/BSTR/GUID come from windows::core and are not
+# feature-gated. The list is minimal on purpose: add a feature only with a
+# use in this crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

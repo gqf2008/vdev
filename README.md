@@ -44,7 +44,7 @@ crates/                         # 主 workspace（macOS-only；根 Cargo.toml �
   vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
   vdev-app/        macOS 宿主 App（Rust + Slint）
   vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
-  vdev-mic-agent/  AI 虚拟麦克风端侧链路：物理麦克风 → 降噪 → 注入 vdev 麦克风（用户态）
+  vdev-mic-agent/  AI 虚拟麦克风端侧链路：物理麦克风 → 降噪 → 注入 vdev 麦克风（用户态；macOS CoreAudio / Windows WASAPI 双后端）
 crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
   vdev-hid-win/     虚拟键盘/鼠标：SendInput 用户态 + KMDF 内核 HID minidriver（内核虚拟 HID 路线 B）
   vdev-camera-win/  虚拟摄像头：DirectShow 源过滤器（用户态 COM，免签名）
@@ -346,6 +346,9 @@ Topology：虚拟扬声器（render）把系统播放写入环形缓冲，虚拟
   手写 WDM/PortCls/KS 绑定）、`cli`（install/uninstall/status）、INF + 签名脚本。
 - 参考：Microsoft sysvad（官方 C++）、AudioMirror（MIT WaveRT 环回）。
 - 构建与门禁全绿（fmt/clippy/test）；实测需开测试签名（见下）。
+- 消费方：`vdev-mic-agent` 的 Windows live 通路（WASAPI 轮询）把降噪后的音频写入本驱动渲染端点，
+  内核环回到「vdev 麦克风」——AI 虚拟麦克风的 Windows 腿，驱动零改动；门禁绿、真机音频验证待做
+  （见 `crates/vdev-mic-agent/README.md` 与 `docs/community/ai-virtual-mic.md`）。
 
 ## vdev-hid-win — KMDF 内核 HID 键盘/鼠标（🔧 构建绿，实测待测试签名）
 
@@ -393,7 +396,8 @@ bcdedit /set testsigning on
 CI（`.github/workflows/ci.yml`，push main + PR 触发）：
 - **硬门禁**：macOS 主 workspace（fmt/check/test/clippy -D warnings）；Windows 用户态五个
   独立 workspace（camera-win / hid-win / app-win / audio-win / display-win 用户态包）各自的
-  fmt/check/clippy（test 按包有则跑）。
+  fmt/check/clippy（test 按包有则跑）；主 workspace 成员 `vdev-mic-agent` 也在 windows-latest
+  上原生 fmt/check/clippy/test（纯 Rust 依赖 + `cfg(windows)` 的 windows 0.58，仓库根 `-p` 选包）。
 - **顾问 job（continue-on-error，红不阻塞）**：`windows-driver-wdk`——依赖 WDK 的驱动构建
   （display-win 的 driver + wdf-umdf-sys bindgen、hid-win/kernel 的 wdk-build）。托管 runner
   上 winget 装 WDK + LLVM 的组合未实测（wdk-build 可能还需 EWDK/WDKContentRoot），替代路径为

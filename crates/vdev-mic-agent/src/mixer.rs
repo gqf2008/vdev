@@ -162,6 +162,54 @@ impl AdaptiveMixer {
     }
 }
 
+// ===========================================================================
+// Channel-layout conversion (WASAPI glue)
+//
+// WASAPI talks interleaved multi-channel; the RNNoise core (see `frames.rs`)
+// talks mono 48 kHz f32. These two pure functions are the whole bridge. They
+// live here, in the platform-independent DSP layer rather than in
+// `platform/windows.rs`, so the unit tests run on every host (the windows
+// module is `cfg(windows)` and its tests could not run on macOS or CI).
+// ===========================================================================
+
+/// Interleaved multi-channel -> mono by averaging the channels of each frame.
+///
+/// `channels` must be >= 1; with 0 the function returns an empty vec (a
+/// zero-channel stream carries no samples). A trailing partial frame --
+/// samples that do not fill a whole `channels`-wide frame -- is dropped, the
+/// same rule WASAPI's own frame accounting uses. Mono input (`channels == 1`)
+/// is an exact copy, so the denoise path never resamples a mono mic.
+pub fn to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    let frames = interleaved.len() / channels;
+    let mut out = Vec::with_capacity(frames);
+    for frame in interleaved.chunks_exact(channels).take(frames) {
+        let sum: f32 = frame.iter().sum();
+        out.push(sum / channels as f32);
+    }
+    out
+}
+
+/// Mono -> interleaved multi-channel by copying the sample to every channel.
+///
+/// `channels` must be >= 1; with 0 the function returns an empty vec. This is
+/// the render direction: the virtual device's mix format (usually stereo)
+/// gets the same mono signal on every channel, so any consumer that picks a
+/// channel -- a meeting app included -- hears the denoised signal.
+#[allow(dead_code)]
+pub fn from_mono(mono: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(mono.len() * channels);
+    for &s in mono {
+        out.extend(std::iter::repeat_n(s, channels));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +398,44 @@ mod tests {
             ss_wet,
             ss_dry
         );
+    }
+
+    #[test]
+    fn to_mono_averages_channels_per_frame() {
+        // Two stereo frames: [L0, R0, L1, R1] -> [(L0+R0)/2, (L1+R1)/2].
+        assert_eq!(to_mono(&[0.0, 1.0, 2.0, 3.0], 2), vec![0.5, 2.5]);
+    }
+
+    #[test]
+    fn to_mono_is_exact_copy_for_mono_input() {
+        let x = [0.25, -0.5, 1.0];
+        assert_eq!(to_mono(&x, 1), x.to_vec());
+    }
+
+    #[test]
+    fn to_mono_drops_trailing_partial_frame() {
+        // 5 samples at 2 channels = 2 full frames; the 5th sample is not a
+        // frame and must not turn into a bogus half-averaged sample.
+        assert_eq!(to_mono(&[0.0, 1.0, 2.0, 3.0, 99.0], 2), vec![0.5, 2.5]);
+    }
+
+    #[test]
+    fn to_mono_empty_and_zero_channels() {
+        assert!(to_mono(&[], 2).is_empty());
+        assert!(to_mono(&[1.0, 2.0], 0).is_empty());
+    }
+
+    #[test]
+    fn from_mono_copies_sample_to_every_channel() {
+        assert_eq!(from_mono(&[0.5, -0.25], 2), vec![0.5, 0.5, -0.25, -0.25]);
+        assert_eq!(from_mono(&[1.0], 4), vec![1.0, 1.0, 1.0, 1.0]);
+        assert!(from_mono(&[1.0], 0).is_empty());
+    }
+
+    #[test]
+    fn mono_survives_the_stereo_roundtrip() {
+        let mono = [0.1, -0.2, 0.3];
+        let stereo = from_mono(&mono, 2);
+        assert_eq!(to_mono(&stereo, 2), mono.to_vec());
     }
 }

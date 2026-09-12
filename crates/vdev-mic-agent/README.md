@@ -9,7 +9,8 @@ driver is involved — the agent is just another CoreAudio / WASAPI client.
 
 D1–D2 wires capture and injection to WAV files, which answers "how much CPU /
 how much algorithmic latency". D3–D4 (`live`) drives the same core from real
-callbacks and measures the buffering a WAV cannot show.
+audio devices — CoreAudio callbacks on macOS, a WASAPI polling thread on
+Windows — and measures the buffering a WAV cannot show.
 
 The proposal, the raw measurement data and the A/B audio live in the archive repo
 ([`vdev-ai-virtual-mic-2026-09`](https://github.com/gqf2008/ventures/tree/main/content/product-proposals/vdev-ai-virtual-mic-2026-09/demo-ai-mic)); upstream issue:
@@ -28,10 +29,14 @@ proposal, and produces **numerically identical audio** (100 % of samples within
 ## Build & run
 
 ```bash
-cargo test -p vdev-mic-agent          # 35 unit tests (metrics, mixer, ring, frames, latency, stats, wavio)
+cargo test -p vdev-mic-agent          # 41 unit tests on macOS (metrics, mixer, ring, frames, latency, stats, wavio)
 
 # D3-D4 lives behind CoreAudio; this only type-checks the macOS backend
 cargo check -p vdev-mic-agent --target x86_64-apple-darwin
+
+# Windows live path: same checks against the WASAPI backend (see below)
+cargo check  -p vdev-mic-agent --target x86_64-pc-windows-msvc
+cargo clippy -p vdev-mic-agent --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 
 # one file
 cargo run -p vdev-mic-agent --release -- run noisy_snr5db.wav \
@@ -47,8 +52,15 @@ cargo run -p vdev-mic-agent --release -- bench --dir <demo>/audio --out results_
 cargo run -p vdev-mic-agent --release -- diff a.wav b.wav
 ```
 
-`live` is the D3–D4 path and is macOS-only for now; on any other host it prints
-why and exits, rather than pretending to run:
+`live` is the D3–D4 path. macOS drives it from CoreAudio callbacks; Windows
+drives the same pipeline from a WASAPI polling thread (see the Windows backend
+below). On any other host it prints why and exits, rather than pretending to run:
+
+| platform | `run` / `bench` / `diff` | `live` + probes | status |
+|---|---|---|---|
+| macOS | ✅ | ✅ CoreAudio callbacks | live available |
+| Windows | ✅ | ✅ WASAPI polling + kernel loopback | new — gates green, real-machine audio pending |
+| other | ✅ | ❌ prints why and exits | — |
 
 ```bash
 # live denoise into the virtual microphone, recording both sides
@@ -89,7 +101,7 @@ package (the archive's `third_party/FETCH.md` has the exact steps).
 | `ring.rs` | lock-free SPSC sample ring | capture thread → render thread |
 | `frames.rs` | re-blocking to 480 samples, dry-path delay line | what makes a callback drive a frame model |
 | `latency.rs` | chirp marker + normalised cross-correlation | end-to-end measurement |
-| `platform/` | CoreAudio HAL: capture AU, inject IOProc, probes | the live backend |
+| `platform/` | CoreAudio HAL (macOS) / WASAPI polling (Windows): capture, inject, probes | the live backend |
 | `main.rs` | `run` / `bench` / `diff` / `live` CLI | the agent binary |
 
 Everything here is userland: `platform/macos.rs` drives `vdev-audio`'s HAL
@@ -168,7 +180,8 @@ The 0.5 LSB mean is pure float→int16 rounding: libsndfile (Python) and
 
 ## D3–D4: the live path (`live`)
 
-The same `rnnoise` + `mixer` core, driven by real CoreAudio callbacks:
+The macOS backend first — the same `rnnoise` + `mixer` core, driven by real
+CoreAudio callbacks:
 
 ```
  physical mic ──▶ AudioUnit(HALOutput) ──▶ FrameAssembler ──▶ RNNoise + gate
@@ -206,17 +219,80 @@ Four things a file-based harness could not answer, and where they live:
   the two is the capture chain, and the model's 20 ms is added to the digital
   number, not to the acoustic one.
 
-**Status: this compiles (`cargo check --target x86_64-apple-darwin`) and every
-unit test passes on Windows, but none of it has run against real hardware yet.**
-It needs a Mac with the driver installed (`make -C crates/vdev-audio install`):
-the injection side is a CoreAudio client of the HAL plugin, and both probes need
-a real device to measure.
+**Status: the macOS live path is available; the Windows backend compiles and
+every gate is green (check / `clippy -D warnings` for `x86_64-pc-windows-msvc`,
+plus the macOS-side check + 41 unit tests), but its runtime audio behavior —
+loopback data flow, padding alignment, the acoustic probe — has not been
+verified on a real Windows machine with vdev-audio-win installed (driver-side
+bring-up is on the project author).** Correctness of the Windows-side numbers
+rests on the five `cfg(windows)` unit tests (marker period/start, pending
+pairing, search-window cap, acoustic source semantics), which compile with the
+cross checks and run on a Windows host. macOS still needs the driver installed
+(`make -C crates/vdev-audio install`): the injection side is a CoreAudio client
+of the HAL plugin, and both probes need a real device to measure.
+
+### The Windows backend: one polling thread, zero driver changes
+
+`platform/windows.rs` runs the same pipeline — shared-mode capture of the
+physical mic, the unchanged `rnnoise` + `mixer` + `frames` core, and the
+result written to the *render* endpoint of the vdev-audio-win virtual device,
+whose driver loops its render pin back to its capture pin in the kernel:
+
+```
+ physical mic ──▶ WASAPI shared capture ──▶ FrameAssembler ──▶ RNNoise + gate
+                     (48 kHz mix format)                                │
+                          vdev-audio-win render endpoint ◀── SpscRing ◀─┘
+                                 │  kernel loopback: render pin → capture pin
+                                 └──▶ Zoom/微信 picks it as the microphone
+```
+
+It polls instead of using WASAPI's event mode, and that is deliberate: the
+probe's capture client is a WASAPI *loopback* capture
+(`AUDCLNT_STREAMFLAGS_LOOPBACK` on the vdev render endpoint), and loopback
+clients get no dependable buffer event — no packets while nothing renders.
+`timeBeginPeriod(1)` keeps the 2 ms poll sleep honest, and each pass tops the
+40 ms endpoint buffer up to `GetCurrentPadding`, so the queued depth (the
+injection latency) stays constant. Marker timestamps are
+`now + padding × frame time` — the estimated playback instant — with the queue
+documented in the probe report's `interpretation`.
+
+Windows-specific gates and limits:
+
+* Shared mode does **not** resample: `check_mix_format` refuses endpoints whose
+  mix format is not 48 kHz / 32-bit float, with the exact fix (set the device
+  default format to 48000 Hz in Control Panel, or pick another endpoint via
+  `--input` / `--vdev`). No SRC in v1.
+* The macOS default hint `vdev-audio-A-device` is re-mapped to the `vdev`
+  substring on Windows (the INF names its endpoints "vdev 扬声器" /
+  "vdev 麦克风"); an explicit `--vdev` is used verbatim, and a missing endpoint
+  errors with the driver-install hint plus the installed endpoint list.
+* No hot-plug / format-change recovery yet (`IMMNotificationClient`), and no
+  exclusive mode — shared + polling only; the poll thread allows allocation on
+  purpose (it is not a hard-RT callback).
+* Both probes are the same machinery as live: digital feeds the marker straight
+  into the vdev render and scans the loopback (no mic, no model); acoustic
+  plays it from the physical speaker through the room and the mic (pipeline
+  dry, mix = 0, delay line engaged) into the same loopback. A virtual device
+  other than vdev works too — any loopback sound card passed via `--vdev`
+  (e.g. VB-Cable's `CABLE Input`).
+
+```bash
+# gates (cross-checked from macOS; CI also runs them natively on windows-latest)
+cargo check  -p vdev-mic-agent --target x86_64-pc-windows-msvc
+cargo clippy -p vdev-mic-agent --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+# on a Windows host, with the vdev-audio-win driver installed (test-signed):
+target/release/vdev-mic-agent live --adaptive --seconds 20 --report /tmp/live.json
+target/release/vdev-mic-agent live --probe digital --seconds 30 --report /tmp/digital.json
+target/release/vdev-mic-agent live --probe acoustic --seconds 30 --report /tmp/acoustic.json
+```
 
 ## Not done yet
 
-* **First contact with hardware.** The expected result of
+* **Real-device probe numbers.** The expected result of
   `live --probe digital` is the device buffer plus the plugin's ring; anything
-  near that is a pass. Nothing below has been validated on a Mac.
+  near that is a pass. The Windows live path additionally needs first contact
+  with a real machine (see the status note above).
 * **AEC.** There is no loudspeaker feedback path here; real speakerphone use
   needs the far-end reference the virtual speaker can provide (二期, can reuse
   vox-seat).

@@ -6,7 +6,8 @@
 #   * macos：仓库根主 workspace（fmt / check / test / clippy -D warnings）。
 #   * windows-user 矩阵：五个 Windows 独立 workspace 的用户态门禁——
 #     vdev-camera-win / vdev-hid-win / vdev-app-win / vdev-audio-win /
-#     vdev-display-win（只测 WDK-free 的用户态包）。
+#     vdev-display-win（只测 WDK-free 的用户态包）；外加主 workspace 成员
+#     vdev-mic-agent（仓库根 -p 选包，纯 Rust 依赖，Windows 宿主直接构建）。
 #
 # - 顾问 job（continue-on-error，红不阻塞合并，但必须人工读日志跟进）：
 #   * windows-driver-wdk：依赖 WDK 的驱动构建——vdev-display-win 的 driver +
@@ -79,6 +80,14 @@ jobs:
             dir: crates/vdev-display-win
             pkgs: "-p vdev-display-win -p driver-ipc -p driver-logger"
             test_args: null
+          # vdev-mic-agent：主 workspace 成员（非独立子 workspace），依赖纯 Rust
+          # + cfg(windows) 的 windows 0.58，Windows 宿主可直接构建。从仓库根
+          # -p 选包，只构建本包及其依赖，不触达 macOS 专属兄弟包；fmt 沿用
+          # 根目录模板（纯语法检查、跨平台，与 macos job 同一口径）。
+          - name: vdev-mic-agent
+            dir: .
+            pkgs: "-p vdev-mic-agent"
+            test_args: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -93,7 +102,9 @@ jobs:
         run: cargo check ${{ matrix.pkgs }} --all-targets
         working-directory: ${{ matrix.dir }}
       - name: test
-        run: cargo test ${{ matrix.test_args }}
+        # pkgs 并入 test，与 check/clippy 的选包口径对齐：未设 pkgs 的既有条目
+        # 展开为空、命令不变；display-win 的 test_args 为 null，本步本就跳过。
+        run: cargo test ${{ matrix.pkgs }} ${{ matrix.test_args }}
         working-directory: ${{ matrix.dir }}
         if: matrix.test_args != null
       - name: clippy

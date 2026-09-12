@@ -8,7 +8,7 @@
 
 刚合入 main 的 `vdev-mic-agent` 补的就是这半条链：**物理麦克风 → 端侧降噪 → 注入虚拟麦克风端点**，全部用 Rust 写在用户态。它不新增任何驱动——agent 只是 CoreAudio 的另一个普通客户端，对系统来说和 Zoom 自己读麦克风没有区别。降噪引擎选了 RNNoise：单流 RNN 状态仅 32 688 字节，实测 0.78% 单核就能跑实时（数据见第四节）；更好的 DeepFilterNet3 约是它 9 倍的 CPU，档位分层留作产品决策。
 
-这个 crate 是同一方案 C/Python 参考实现的 Rust 孪生版：同一条 DLL、同一个帧循环、同一套预热流程，产出与参考实现**逐采样一致**的音频（100% 采样误差 ≤ 1 LSB）。换句话说，先把算法在离线口径下钉死，再把它搬进实时回调——这也是理解整个仓库结构的钥匙。
+这个 crate 是同一方案 C/Python 参考实现的 Rust 孪生版：同一条 DLL、同一个帧循环、同一套预热流程，产出与参考实现**逐采样一致**的音频（100% 采样误差 ≤ 1 LSB）。换句话说，先把算法在离线口径下钉死，再把它搬进实时回调——这也是理解整个仓库结构的钥匙。macOS 之外，同一套 DSP 核心如今还有一条 Windows 腿（见第七节）。
 
 ## 二、架构与数据流：D1–D4 四个里程碑
 
@@ -177,7 +177,7 @@ cargo run -p vdev-mic-agent --release -- bench --dir <demo>/audio --out results_
 cargo run -p vdev-mic-agent --release -- diff a.wav b.wav
 ```
 
-`live` 是 D3–D4 实时路径，当前仅 macOS 后端，其他平台会明确打印原因退出而不是假装能跑；macOS 侧需要先装好驱动（`make -C crates/vdev-audio install`）：
+`live` 是 D3–D4 实时路径，有 macOS 与 Windows 两个后端（Windows 见第七节），其他平台会明确打印原因退出而不是假装能跑；macOS 侧需要先装好驱动（`make -C crates/vdev-audio install`）：
 
 ```bash
 target/release/vdev-mic-agent live --adaptive --seconds 20 \
@@ -188,13 +188,57 @@ target/release/vdev-mic-agent live --probe acoustic --seconds 30 --report /tmp/a
 
 关于 `librnnoise`：它通过 `libloading` **运行时**加载、从不参与链接——不是为了让程序缺库也能跑（所有降噪路径缺库即报错退出，唯一例外是不需要后端的 `--probe digital`），而是打包上的取舍：现成的 MinGW 构建 `librnnoise-0.dll` 配 GNU 导入库，MSVC 链接器吃不下，让用户自己用 dlltool 重造 `.lib` 是零收益的负担。解析顺序：`--dll <path>` → 环境变量 `RNNOISE_DLL` → 可执行文件向上 5 级祖先目录中的 `third_party/` 树（workspace 构建时命中 `crates/vdev-mic-agent/third_party/native/`）→ 当前目录；候选名覆盖 `librnnoise-0.dll`/`rnnoise.dll`/`librnnoise.dll`/`librnnoise.dylib`。该目录是 git-ignored 的，库可从 [xiph/rnnoise](https://github.com/xiph/rnnoise) 自建，或直接取 MSYS2 `ucrt64` 包（archive 仓库的 `third_party/FETCH.md` 有精确步骤）。加载时会校验 `rnnoise_get_frame_size()` 必须 == 480，否则拒绝启动——platform 层的缓冲与重分帧都按 480 硬编码，错的帧长意味着越界或流失步。
 
-## 七、现状与局限
+## 七、Windows 通路：WASAPI 轮询 + 内核环回，驱动零改动
 
-如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时实跑 35 项通过），但 D3–D4 尚未在任何真实硬件上跑过。** 下一站是一台装了 `vdev-audio.driver` 的 Mac：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS-only；`cpu_seconds()` 仅 Windows 实现，macOS 的 CPU 列印 `n/a`。已知的两个"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。
+Windows 没有等价的 CoreAudio 回调模型，这条路换成 **WASAPI**：物理麦克风走 shared 模式采集，DSP 照旧，产物写入 `vdev-audio-win` 虚拟声卡的**渲染端点**——驱动的 render pin 在内核里环回给自己的 capture pin（见系列《Windows 虚拟声卡》篇），会议软件把「vdev 麦克风」选成输入，听到的就是降噪后的声音。agent 依旧只是音频 API 的一个普通客户端，对系统来说和 Zoom 自己读麦克风没有区别，驱动零改动：
 
-往前看还有四件事：真机首跑与延迟实测；AEC（本方案没有扬声器回传路径，真正的免提场景需要虚拟扬声器提供的远端参考，排二期，可复用 vox-seat）；引擎分层（DeepFilterNet3 约 9 倍 CPU 换明显更好的音质，档位是产品决策不是代码决策）；以及主观盲听 A/B——目前所有数字都是客观指标，欠听众一个裁决。
+```text
+physical mic ──▶ WASAPI shared capture ──▶ FrameAssembler ──▶ RNNoise + 自适应干湿
+                     （48 kHz mix format）      （同一 DSP 核心）        │
+                                                        [SPSC ring, 无锁]
+                                                                ▼
+           vdev-audio-win 渲染端点 ◀── WASAPI render（轮询补满）◀──┘
+                  │ 驱动内核环回：render pin → capture pin
+                  └──▶ 会议软件当麦克风选它 / WASAPI loopback capture（探针检测）
+```
 
-## 八、写在最后
+与 macOS 最大的差异是**调度模型**：CoreAudio 是 HAL 实时线程回调驱动，Windows 这里是**单线程轮询**——`timeBeginPeriod(1)` 把定时器精度抬到 1 ms，每 2 ms 醒一次，用 `GetCurrentPadding` 对齐补满 40 ms 的端点缓冲，队列深度（也就是注入延迟）因此恒定不漂。选轮询而不是事件驱动，理由写在 `platform/windows.rs` 的模块注释里：数字探针的采集端是 WASAPI **loopback capture**（`AUDCLNT_STREAMFLAGS_LOOPBACK` 挂在渲染端点上，按微软的环回契约用渲染端点的 mix format 初始化），而 loopback 流拿不到可靠的缓冲事件——没有渲染活动时缓冲里没有包、事件不触发；与其给每种流配一套事件管线，不如统一轮询一条路径覆盖 live 与双探针。轮询线程不是硬实时回调，允许分配（如 `to_mono` 每包一次），这是有意的取舍。
+
+其余差异都是这条调度模型的推论：
+
+- **Marker 时间戳**：macOS 在渲染回调里打点（队列深度为 0）；Windows 写入时记 `now + padding × 帧时长`——估算这段音频真实到达扬声器的时刻，渲染队列延迟计入探针报告的 `interpretation` 说明。
+- **pending 队列**：macOS 双回调共享、要 `Arc<Mutex>`；Windows 单线程轮询，裸 `VecDeque` 就够。
+- **`injected` 计数**：macOS 报告恒为 0（`mark_injected` 从未被调）；Windows 实际累计每个 marker 的启动数。
+- **采样率门**：macOS 由 AUHAL 把客户端格式转成 48 kHz；WASAPI shared 引擎**只混音不重采样**，mix format 采样率跟着端点默认格式走。所以 `check_mix_format` 对非 48 kHz / 非 32-bit float 的端点显式报错，并给出可行动的修复（控制面板把该设备默认格式改成 48000 Hz，或 `--input`/`--vdev` 换端点）——宁可拒绝也不塞进一个没验证过的重采样器。
+- **vdev 默认名**：macOS 默认匹配 `vdev-audio-A-device`；Windows 上 INF 的端点实名是「vdev 扬声器」/「vdev 麦克风」，该默认值自动重映射为 `vdev` 子串去匹配，显式 `--vdev` 则原样使用；端点缺失时报错附驱动安装提示与已装端点列表。
+
+探针支持矩阵（标记与检测器与 macOS 完全同款，阈值同样数字 0.60 / 声学 0.35）：
+
+| 探针 | Windows | 机制 |
+|---|---|---|
+| digital | ✅ 实现 | loopback capture 挂在 vdev 渲染端点；`MarkerEmitter` 直接驱动渲染写入，环回流经 NCC 检测；无麦克风、无模型 |
+| acoustic | ✅ 实现 | 物理扬声器 `SpeakerSource` 出 chirp → 房间 → 物理麦 → 管道（mix=0 + 延迟线顶替模型 20 ms）→ vdev 渲染 → 同一 loopback 检测 |
+
+前置依赖：`vdev-audio-win` 驱动已装机（PortCls/WaveRT 内核驱动，需测试签名或正式签名，见系列《Windows 虚拟声卡》篇与仓库根 README 的签名节）；`librnnoise` 运行时加载规则与 macOS 相同；各端点默认格式 48 kHz。不想装驱动的备选路线：任何「输出环回输入」的虚拟声卡都能顶替 vdev——`--vdev` 传它渲染端点的名字串即可（如 VB-Cable 的 `CABLE Input`，会议软件把 `CABLE Output` 当麦克风），对 agent 来说只是换了个端点名字。
+
+构建与门禁（macOS 宿主交叉检查 Windows 目标，或 Windows 宿主直接构建，CI 已有 windows-latest 原生 job）：
+
+```bash
+cargo check  -p vdev-mic-agent --target x86_64-pc-windows-msvc
+cargo clippy -p vdev-mic-agent --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+# Windows 宿主上另有 5 项 cfg(windows) 单测，仅在 Windows 编译运行：
+cargo test -p vdev-mic-agent
+```
+
+**状态如实说：编译与全部门禁已绿（fmt / check / clippy -D warnings 交叉 Windows 目标，macOS 侧 check + 41 项单测），但运行时音频行为——loopback 数据流、padding 对齐、声学探针——尚未在真实 Windows + vdev-audio-win 机器上验证；驱动侧装机由项目作者在真机验证。** Windows 侧数字正确性由那 5 项单测覆盖（marker 周期与起始、pending 配对、搜索窗口封顶、声学源语义）。
+
+## 八、现状与局限
+
+如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时 macOS 实跑 41 项通过，另有 5 项 Windows 后端单测仅随 Windows 目标编译）；macOS live 已可用，Windows live 门禁已绿、真机音频行为待验证。** macOS 侧还欠的是探针的真机数字：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；Windows 侧需要装了 `vdev-audio-win`（测试签名）的真机确认 loopback 与 padding 行为；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS + Windows 双后端（Windows 门禁绿、真机待验证，见第七节）；`cpu_seconds()` 是 Windows 实现，macOS 的 CPU 列印 `n/a`。已知的"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。Windows 侧还有三条 v1 边界：无重采样（端点默认格式非 48 kHz 直接拒绝并给出修复指引）、无设备热拔插/格式变化恢复（运行中拔设备以带上下文的错误退出）、只走 shared + 轮询（无独占模式与事件驱动，40 ms 端点缓冲是延迟与抖动免疫的折中，计入探针 `interpretation`）。
+
+往前看还有四件事：双平台探针的真机延迟实测；AEC（本方案没有扬声器回传路径，真正的免提场景需要虚拟扬声器提供的远端参考，排二期，可复用 vox-seat）；引擎分层（DeepFilterNet3 约 9 倍 CPU 换明显更好的音质，档位是产品决策不是代码决策）；以及主观盲听 A/B——目前所有数字都是客观指标，欠听众一个裁决。
+
+## 九、写在最后
 
 vdev 系列此前的每一篇都在回答"怎么用 Rust 造一个虚拟设备"；这一篇回答的是它的下一问："造出来之后，往里面喂什么。"答案是：喂一条结构上和产品形态完全一致的端侧 AI 链——离线阶段就把算法、指标、跨实现一致性钉死，实时阶段只解决文件回答不了的缓冲、调度与实时纪律。等 D3–D4 的真机数字出来，"算法 ≤ 20 ms + 缓冲 ≤ 10 ms"这行口径就会被两条探针的实测值检验或修正。
 

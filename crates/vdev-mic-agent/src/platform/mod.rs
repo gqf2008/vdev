@@ -11,12 +11,19 @@
 //! * `macos` -- CoreAudio HAL: `AudioUnit` for the physical microphone, an
 //!   `AudioDeviceIOProc` on the vdev virtual device for injection and for both
 //!   latency probes. The half that D3-D4 is about.
+//! * `windows` -- WASAPI: shared-mode capture of the physical microphone,
+//!   render-side injection into the vdev-audio-win virtual device (whose
+//!   driver loops its render pin back to its capture pin). `windows::run`
+//!   drives the same pipeline as `macos::run` on one polling thread.
 //! * everything else -- the subcommands exist but report that live audio is
 //!   unavailable, rather than pretending. The offline matrix and every unit
 //!   test still run on Windows/Linux, which is where the model work happened.
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -77,20 +84,27 @@ impl Default for LiveConfig {
     }
 }
 
-/// Run the agent against real devices. macOS only in this build.
+/// Run the agent against real devices. macOS drives the full pipeline on
+/// CoreAudio callbacks; Windows drives the same pipeline on a WASAPI polling
+/// thread (see `windows::run`).
 pub fn run_live(cfg: LiveConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         macos::run(cfg)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::run(cfg)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = cfg;
         anyhow::bail!(
-            "live capture/injection is only implemented for macOS in this build.\n\
+            "live capture/injection is implemented for macOS and Windows, not for this host.\n\
              The D1-D2 offline harness (`run`, `bench`, `diff`) is fully functional here;\n\
-             D3-D4 needs CoreAudio, so build this crate on the Mac that has vdev-audio.driver\n\
-             installed (make -C crates/vdev-audio install) and re-run `live` / `probe` there."
+             D3-D4 needs a real audio stack: build on macOS with vdev-audio.driver installed\n\
+             (make -C crates/vdev-audio install) or on Windows with vdev-audio-win installed,\n\
+             then re-run `live` / `probe` there."
         )
     }
 }
