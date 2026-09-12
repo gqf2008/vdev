@@ -258,6 +258,15 @@ fn generate() {
         .blocklist_item("NTSTATUS")
         .blocklist_item("IddMinimumVersionRequired")
         .blocklist_item("WdfMinimumVersionRequired")
+        // CRT 内存/串函数随 WDK 头混进生成结果，且被下面的 override_abi(CUnwind, ".*")
+        // 一并声明成 extern "C-unwind"——rustc 对 std 依赖的运行时符号有签名校验
+        // （必须 extern "C"），C-unwind 声明直接硬错误（CI WDK job 首跑实测）。
+        // 仓库代码不直接调用这些符号，屏蔽生成即可；memmove 一并预防。
+        .blocklist_item("memcmp")
+        .blocklist_item("memcpy")
+        .blocklist_item("memset")
+        .blocklist_item("memmove")
+        .blocklist_item("strlen")
         .clang_arg("--language=c++")
         .clang_arg("-fms-compatibility")
         .clang_arg("-fms-extensions")
