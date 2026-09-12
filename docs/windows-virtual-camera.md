@@ -103,7 +103,8 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
 ```
 
 推流与取流是**两个独立进程**，通过命名共享内存通道（`com/shm.rs`）通信：
-- 生产者（`push`）把 BGRA 帧写进 SHM，带 Release/Acquire 序号，无锁双缓冲。
+- 生产者（`push`）把 BGRA 帧写进 SHM：跨进程命名互斥体保护发布（多生产者场景），
+  缓冲对间用 Release/Acquire 序号防撕裂——读路径无锁（seqlock 风格：先读序号、拷贝、再验序号）。
 - 过滤器（消费方，在目标 App 进程内）取最新帧，无新帧时回退棋盘格图案。
 - 生产者帧尺寸与连接协商尺寸不一致时自动最近邻缩放，保证下游每帧大小一致。
 

@@ -1,6 +1,6 @@
 # vdev-audio：100% Rust 虚拟声卡（CoreAudio HAL AudioServerPlugIn）
-# 一个虚拟设备：输出流 + 输入流，输出环回输入（同 BlackHole/Soundflower）。
-# 安装后 QuickTime / 会议软件把「麦克风」选成 vdev-audio 即可。
+# 两台虚拟设备（vdev-audio A / vdev-audio B）：各自输出流 + 输入流，输出环回输入
+# （同 BlackHole/Soundflower）。安装后 QuickTime / 会议软件把「麦克风」选成 vdev-audio A 或 B 即可。
 
 REPO_ROOT := $(abspath ../..)
 BUILD := build
