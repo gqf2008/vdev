@@ -1,12 +1,12 @@
-//! SystemExtensions FFI：激活/停用摄像头扩展。
-//! 使用 objc2 的 define_class! 实现 OSSystemExtensionRequestDelegate。
+//! `SystemExtensions` FFI：激活/停用摄像头扩展。
+//! 使用 objc2 的 `define_class`! 实现 `OSSystemExtensionRequestDelegate`。
 use anyhow::{anyhow, Result};
 use dispatch2::{DispatchObject, DispatchQueue};
 use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::ClassType;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
+use objc2::ClassType;
 use objc2_foundation::{NSInteger, NSString};
 use std::ffi::{c_void, CString};
 use std::sync::{Mutex, OnceLock};
@@ -34,10 +34,12 @@ fn class(name: &str) -> Result<&'static AnyClass> {
 }
 
 fn fire(ev: SysextEvent) {
+    // 本函数在 ObjC delegate 回调里执行：锁中毒再 panic 会跨 ObjC trampoline
+    // = 进程 abort，必须中毒安全访问
     if let Some(cb) = CALLBACK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
     {
         cb(ev);
@@ -100,7 +102,9 @@ fn sysext_queue() -> *mut c_void {
 }
 
 fn ensure_delegate() -> *mut AnyObject {
-    let mut p = DELEGATE_PTR.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = DELEGATE_PTR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if *p == 0 {
         let obj: *mut AnyObject = unsafe { msg_send![SysextDelegate::class(), new] };
         *p = obj as usize;
@@ -108,12 +112,12 @@ fn ensure_delegate() -> *mut AnyObject {
     *p as *mut AnyObject
 }
 
-/// 提交激活/停用请求。bundle_id 例如 "com.vdev.camera.host.extension"。
+/// `提交激活/停用请求。bundle_id` 例如 "com.vdev.camera.host.extension"。
 pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
     *CALLBACK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap() = Some(cb);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cb);
 
     let delegate = ensure_delegate();
 
@@ -126,23 +130,26 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
     let req_cls = class("OSSystemExtensionRequest")?;
     let id = NSString::from_str(bundle_id);
     let queue = sysext_queue();
-    let req: *mut AnyObject = unsafe {
-        if activation {
-            msg_send![req_cls, activationRequestForExtension: &*id, queue: queue]
-        } else {
-            msg_send![req_cls, deactivationRequestForExtension: &*id, queue: queue]
-        }
+    let req: *mut AnyObject = if activation {
+        // SAFETY：req_cls/id/queue 均为有效 ObjC 对象
+        unsafe { msg_send![req_cls, activationRequestForExtension: &*id, queue: queue] }
+    } else {
+        unsafe { msg_send![req_cls, deactivationRequestForExtension: &*id, queue: queue] }
     };
     if req.is_null() {
         return Err(anyhow!("创建 OSSystemExtensionRequest 失败"));
     }
     // 工厂方法返回 autoreleased，先 retain 为自己持有
-    let req: *mut AnyObject = unsafe { msg_send![&*req, retain] };
-    unsafe {
-        let _: () = msg_send![&*req, setDelegate: &*delegate];
-        let _: () = msg_send![&*shared, submitRequest: &*req];
-    }
-    *REQUEST_PTR.lock().unwrap_or_else(|e| e.into_inner()) = req as usize;
+    // SAFETY：req/shared/delegate 均为有效 ObjC 对象，引用提升后再发消息
+    let req_ref: &AnyObject = unsafe { &*req };
+    let shared_ref: &AnyObject = unsafe { &*shared };
+    let delegate_ref: &AnyObject = unsafe { &*delegate };
+    let req_retained: *mut AnyObject = unsafe { msg_send![req_ref, retain] };
+    let _: () = unsafe { msg_send![req_retained, setDelegate: delegate_ref] };
+    let _: () = unsafe { msg_send![shared_ref, submitRequest: req_retained] };
+    *REQUEST_PTR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = req_retained as usize;
     Ok(())
 }
 
@@ -150,7 +157,11 @@ pub fn submit(bundle_id: &str, activation: bool, cb: Cb) -> Result<()> {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFRunLoopDefaultMode: *const c_void;
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: bool) -> i32;
+    fn CFRunLoopRunInMode(
+        mode: *const c_void,
+        seconds: f64,
+        return_after_source_handled: bool,
+    ) -> i32;
 }
 
 pub fn service_main_queue(seconds: f64) {

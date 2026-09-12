@@ -10,7 +10,9 @@ DEVID := "Developer ID Application: qingfeng gao (XFXU84HVK3)"
 
 .PHONY: all build install uninstall test clean
 
-all: install
+# 裸 make 只构建（写 build/ 目录）；安装须显式 `make install`
+#（原 all: install 会直接写系统目录并 killall coreaudiod）
+all: build
 
 # ============ 构建：cargo cdylib -> MH_BUNDLE + Info.plist + 签名 ============
 build:

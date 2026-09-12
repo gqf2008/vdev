@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 cgevents = "0.10.1"
+
+[lints]
+workspace = true

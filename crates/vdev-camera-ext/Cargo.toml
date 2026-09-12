@@ -22,3 +22,6 @@ objc2 = { version = "0.6.4", features = ["exception"] }
 objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSSet", "NSDictionary", "NSUUID", "NSValue"] }
 objc2-core-media = { version = "0.3.2", features = ["CMTime"] }
 dispatch2 = "0.3.1"
+
+[lints]
+workspace = true

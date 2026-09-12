@@ -41,12 +41,12 @@ pub fn scale_bgra(
         row_bytes: src_stride,
     };
     let mut dst_buf = VImageBuffer {
-        data: dst.as_mut_ptr() as *mut c_void,
+        data: dst.as_mut_ptr().cast::<c_void>(),
         height: dst_h,
         width: dst_w,
         row_bytes: dst_stride,
     };
-    let rc = unsafe { vImageScale_ARGB8888(&src, &mut dst_buf, std::ptr::null(), 0) };
+    let rc = unsafe { vImageScale_ARGB8888(&raw const src, &raw mut dst_buf, std::ptr::null(), 0) };
     if rc != 0 {
         return None;
     }

@@ -1,21 +1,23 @@
-//! 全 Rust CMIOExtension spike：最小虚拟摄像头（只出彩条）。
-//! 手写 CMIOExtension ObjC 绑定（cmio.rs），帧管线用 CoreVideo/CoreMedia C FFI。
+//! 全 Rust `CMIOExtension` spike：最小虚拟摄像头（只出彩条）。
+//! 手写 `CMIOExtension` `ObjC` 绑定（cmio.rs），帧管线用 `CoreVideo`/`CoreMedia` C FFI。
+
+// ObjC 方法实现必须照抄 selector 命名（connectClient:error: 等），保留原命名
+#![allow(non_snake_case)]
 
 mod cmio;
 mod filters;
 mod frame_channel;
 
 use cmio::{
-    property_set, CMIOExtensionDeviceSource, CMIOExtensionProviderSource,
-    CMIOExtensionStreamSource,
+    property_set, CMIOExtensionDeviceSource, CMIOExtensionProviderSource, CMIOExtensionStreamSource,
 };
+use dispatch2::{DispatchObject, DispatchQueue};
 use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2_foundation::NSObjectProtocol;
 use objc2::ClassType;
 use objc2_core_media::CMTime;
-use dispatch2::{DispatchObject, DispatchQueue};
+use objc2_foundation::NSObjectProtocol;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSSet, NSString, NSUUID};
 use std::ffi::c_void;
 use std::ptr;
@@ -23,32 +25,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 static LOG_BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 全局累计日志行数（含已被 `LOG_BUF` 从头丢弃的行）。`log_server` 以它计算
+/// 每连接的续读位置——此前按连接只记 sent 行数、直接 skip(sent) 于当前 buf，
+/// 连接发满 500 行后 skip 超出 buf 长度，日志流永久停滞。
+static LOG_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 计算本连接应从 `LOG_BUF` 头部跳过的行数（纯函数，供单测覆盖丢弃场景）。
+/// `sent` 为本连接已发送的全局累计行数；buf 只保留最近 `buf_len` 行，
+/// 对应全局序号 `[total-buf_len, total)`；已发序号落在已丢弃区间时从头部续发。
+fn log_skip(sent: u64, buf_len: usize, total: u64) -> usize {
+    let covered = total.saturating_sub(buf_len as u64);
+    // 目标平台 64 位 macOS，usize 与 u64 同宽，截断不可能
+    #[allow(clippy::cast_possible_truncation)]
+    let skip = sent.saturating_sub(covered) as usize;
+    skip
+}
 
 fn log_server() {
     std::thread::spawn(move || {
         let listener = match std::net::TcpListener::bind("127.0.0.1:27891") {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("log_server bind 失败: {}", e);
+                eprintln!("log_server bind 失败: {e}");
                 return;
             }
         };
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
             std::thread::spawn(move || {
-            let mut stream = stream;
-            let mut sent = 0usize;
-            loop {
-                let lines: Vec<String> = {
-                    let buf = LOG_BUF.lock().unwrap_or_else(|e| e.into_inner());
-                    buf.iter().skip(sent).cloned().collect()
-                };
-                for l in lines {
-                    let _ = std::io::Write::write_all(&mut stream, l.as_bytes());
-                    sent += 1;
+                let mut stream = stream;
+                // 本连接已发送的全局累计行数
+                let mut sent = 0u64;
+                loop {
+                    let lines: Vec<String> = {
+                        let buf = LOG_BUF
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let total = LOG_TOTAL.load(Ordering::Relaxed);
+                        buf.iter()
+                            .skip(log_skip(sent, buf.len(), total))
+                            .cloned()
+                            .collect()
+                    };
+                    for l in lines {
+                        let _ = std::io::Write::write_all(&mut stream, l.as_bytes());
+                        sent += 1;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
             });
         }
     });
@@ -56,32 +80,46 @@ fn log_server() {
 
 fn elog(msg: impl AsRef<str>) {
     use std::io::Write;
-    let line = format!("[unix={}] {}\n", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), msg.as_ref());
+    let line = format!(
+        "[unix={}] {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        msg.as_ref()
+    );
     {
-        let mut buf = LOG_BUF.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = LOG_BUF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         buf.push(line.clone());
+        // 与 buf.push 同锁递增：读侧（log_server）在锁内读到的 (buf, total) 一致
+        LOG_TOTAL.fetch_add(1, Ordering::Relaxed);
         let over = buf.len().saturating_sub(500);
-        if over > 0 { buf.drain(0..over); }
+        if over > 0 {
+            buf.drain(0..over);
+        }
     }
     let mut paths = Vec::new();
-    // App Group 共享容器（扩展有 app-group 权限，最可能可写）
-    paths.push(format!(
-        "{}/Library/Group Containers/XFXU84HVK3.com.vdev.camera/vdev-camera-ext.log",
-        std::env::var("HOME").unwrap_or_else(|_| "/Users/gqf2008".to_string())
-    ));
-    if let Ok(h) = std::env::var("HOME") {
-        paths.push(format!("{}/vdev-camera-ext.log", h));
+    // HOME 派生路径（App Group 共享容器最可能可写——扩展有 app-group 权限）：
+    // HOME 缺失时整组跳过（不硬编码用户目录），由末尾 /tmp、/var/tmp 兜底
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(format!(
+            "{home}/Library/Group Containers/XFXU84HVK3.com.vdev.camera/vdev-camera-ext.log"
+        ));
+        paths.push(format!("{home}/vdev-camera-ext.log"));
+        paths.push(format!(
+            "{home}/Library/Containers/com.vdev.camera.ext.spike/Data/vdev-camera-ext.log"
+        ));
     }
-    paths.push(format!(
-        "{}/Library/Containers/com.vdev.camera.ext.spike/Data/vdev-camera-ext.log",
-        std::env::var("USER").map(|_| "/Users/gqf2008".to_string()).unwrap_or_else(|_| String::new())
-    ));
     paths.push("/tmp/vdev-camera-ext.log".to_string());
     paths.push("/var/tmp/vdev-camera-ext.log".to_string());
     for path in paths {
-        if std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .and_then(|mut f| f.write_all(line.as_bytes())).is_ok()
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .is_ok()
         {
             break;
         }
@@ -92,7 +130,10 @@ fn elog(msg: impl AsRef<str>) {
 const WIDTH: i32 = 1920;
 const HEIGHT: i32 = 1080;
 const FPS: i64 = 60;
-const BGR_A: u32 = 0x42475241; // kCVPixelFormatType_32BGRA / kCMVideoCodecType_32BGRA
+/// cmtime 的 timescale 用（FPS 的 i32 视图；60 远小于 i32 上限，截断不可能）
+#[allow(clippy::cast_possible_truncation)]
+const FPS_TS: i32 = FPS as i32;
+const BGR_A: u32 = 0x42_47_52_41; // kCVPixelFormatType_32BGRA / kCMVideoCodecType_32BGRA
 
 // ---------------- CoreVideo / CoreMedia / CoreFoundation C FFI ----------------
 #[repr(C)]
@@ -161,13 +202,25 @@ extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    // 以下两项本文件暂未用到（spike 用阻塞 CFRunLoopRun），保留作分模式轮询备用
+    #[allow(dead_code)]
     static kCFRunLoopDefaultMode: *const c_void;
     fn CFRunLoopRun();
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: bool) -> i32;
+    #[allow(dead_code)]
+    fn CFRunLoopRunInMode(
+        mode: *const c_void,
+        seconds: f64,
+        return_after_source_handled: bool,
+    ) -> i32;
 }
 
+// 保留：动态加载框架/查符号的调试入口（本文件暂未调用，cmio.rs 另有自己的声明并使用）
+#[allow(dead_code)]
 extern "C" {
-    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
     fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut std::ffi::c_void;
 }
 
@@ -230,11 +283,11 @@ define_class!(
             _out_error: *mut *mut NSObject,
         ) -> Option<Retained<NSObject>> {
             let cls = class("CMIOExtensionProviderProperties");
-            let empty: Retained<NSDictionary<NSObject, NSObject>> =
-                NSDictionary::new();
+            let empty: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, providerPropertiesWithDictionary: &*empty];
-            let _: () = msg_send![&*p, setName: &*NSString::from_str("vdev-camera")];
-            let _: () = msg_send![&*p, setManufacturer: &*NSString::from_str("vdev")];
+            let p_ref: &NSObject = unsafe { &*p };
+            let _: () = msg_send![p_ref, setName: &*NSString::from_str("vdev-camera")];
+            let _: () = msg_send![p_ref, setManufacturer: &*NSString::from_str("vdev")];
             Some(unsafe { Retained::retain(p).unwrap() })
         }
 
@@ -276,8 +329,10 @@ define_class!(
             let cls = class("CMIOExtensionDeviceProperties");
             let empty: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, devicePropertiesWithDictionary: &*empty];
-            let _: () = msg_send![&*p, setTransportType: &*NSNumber::numberWithUnsignedInt(0x7674726e)];
-            let _: () = msg_send![&*p, setModel: &*NSString::from_str("vdev-camera")];
+            let p_ref: &NSObject = unsafe { &*p };
+            let _: () =
+                msg_send![p_ref, setTransportType: &*NSNumber::numberWithUnsignedInt(0x7674_726e)];
+            let _: () = msg_send![p_ref, setModel: &*NSString::from_str("vdev-camera")];
             Some(unsafe { Retained::retain(p).unwrap() })
         }
 
@@ -304,7 +359,10 @@ define_class!(
     unsafe impl CMIOExtensionStreamSource for StreamSource {
         #[unsafe(method_id(formats))]
         unsafe fn formats(&self) -> Retained<NSArray<NSObject>> {
-            let fmt = STREAM_FORMAT.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
+            let fmt = STREAM_FORMAT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap() as *mut NSObject;
             let obj = unsafe { Retained::retain(fmt).unwrap() };
             NSArray::from_retained_slice(&[obj])
         }
@@ -326,10 +384,18 @@ define_class!(
             let cls = class("CMIOExtensionStreamProperties");
             let empty: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
             let p: *mut NSObject = msg_send![cls, streamPropertiesWithDictionary: &*empty];
-            let _: () = msg_send![&*p, setActiveFormatIndex: &*NSNumber::numberWithInt(0)];
-            let dur = cmtime(1, FPS as i32);
-            let dict = CMTimeCopyAsDictionary(dur, ptr::null());
-            let _: () = msg_send![&*p, setFrameDuration: &*(dict as *const NSObject)];
+            let p_ref: &NSObject = unsafe { &*p };
+            let _: () = msg_send![p_ref, setActiveFormatIndex: &*NSNumber::numberWithInt(0)];
+            let dur = cmtime(1, FPS_TS);
+            let dict = unsafe { CMTimeCopyAsDictionary(dur, ptr::null()) };
+            let dur_dict: &NSObject = unsafe { &*(dict.cast::<NSObject>()) };
+            let _: () = msg_send![p_ref, setFrameDuration: dur_dict];
+            // SAFETY: CMTimeCopyAsDictionary 按 Copy 规则返回 +1 的 CFDictionary，
+            // setFrameDuration 内部已 retain，这里释放调用方自身持有，避免每次读取
+            // 流属性泄漏一个字典；dict 非空才释放（CFRelease(NULL) 会崩溃）。
+            if !dict.is_null() {
+                unsafe { CFRelease(dict.cast_const()) };
+            }
             Some(unsafe { Retained::retain(p).unwrap() })
         }
 
@@ -363,8 +429,28 @@ define_class!(
     }
 );
 
+/// 按行拷贝 BGRA：只拷每行前 `w*4` 有效字节（padded 尾部不拷），行内长度再与
+/// `min(stride, dst_stride)` 取 min——此前按整行（`src.len()==stride`）拷贝，
+/// 推流方发 padded stride 而 CV 分配 `dst_stride=w*4` 时，最后一行
+/// `row*dst_stride+stride` 越界 panic（每帧黑屏 + 日志刷屏）。
+fn copy_bgra_rows(dst: &mut [u8], src: &[u8], w: u32, h: u32, stride: u32, dst_stride: usize) {
+    let valid = w as usize * 4;
+    if valid == 0 {
+        return;
+    }
+    let row_bytes = valid.min(stride as usize).min(dst_stride);
+    for row in 0..h as usize {
+        let s = row * stride as usize;
+        let d = row * dst_stride;
+        dst[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+    }
+}
+
 // ---------------- 帧循环 ----------------
-/// 把一帧 BGRA 数据包成 CMSampleBuffer 发给流。
+/// 把一帧 BGRA 数据包成 `CMSampleBuffer` 发给流。
+// 单个 unsafe 块按流水线顺序组合一组 C FFI / ObjC 调用（创建像素缓冲 → 拷贝 →
+// 打包 → 发送 → 释放），拆成逐操作小块只会稀释安全边界语义，故整块放行。
+#[allow(clippy::multiple_unsafe_ops_per_block, clippy::cast_possible_wrap)]
 fn send_bgra(
     stream: *mut NSObject,
     fmt: CMFormatDescription,
@@ -377,44 +463,39 @@ fn send_bgra(
     unsafe {
         let iosurf_key = NSString::from_str("IOSurfaceProperties");
         let empty_dict: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
-        let attrs: Retained<NSDictionary<NSObject, NSObject>> = unsafe {
-            msg_send![
-                <NSDictionary<NSObject, NSObject>>::class(),
-                dictionaryWithObject: &*empty_dict,
-                forKey: &*iosurf_key
-            ]
-        };
+        let attrs: Retained<NSDictionary<NSObject, NSObject>> = msg_send![
+            <NSDictionary<NSObject, NSObject>>::class(),
+            dictionaryWithObject: &*empty_dict,
+            forKey: &*iosurf_key
+        ];
         let mut pb = CVPixelBuffer(ptr::null_mut());
         let st = CVPixelBufferCreate(
             ptr::null(),
             w as usize,
             h as usize,
             BGR_A,
-            &*attrs as *const _ as *const c_void,
-            &mut pb,
+            std::ptr::from_ref(&*attrs).cast::<c_void>(),
+            std::ptr::from_mut(&mut pb),
         );
         if st != 0 || pb.0.is_null() {
-            elog(format!("CVPixelBufferCreate 失败 st={} {}x{}", st, w, h));
+            elog(format!("CVPixelBufferCreate 失败 st={st} {w}x{h}"));
             return;
         }
         CVPixelBufferLockBaseAddress(pb, 0);
         let base = CVPixelBufferGetBaseAddress(pb);
         let dst_stride = CVPixelBufferGetBytesPerRow(pb);
         if !base.is_null() && data.len() >= (stride as usize) * (h as usize) {
-            let dst = std::slice::from_raw_parts_mut(base as *mut u8, dst_stride * h as usize);
+            let dst = std::slice::from_raw_parts_mut(base.cast::<u8>(), dst_stride * h as usize);
             if stride as usize == dst_stride {
                 dst[..data.len()].copy_from_slice(&data[..(stride as usize) * (h as usize)]);
             } else {
-                for row in 0..h as usize {
-                    let src = &data[row * stride as usize..(row + 1) * stride as usize];
-                    dst[row * dst_stride..row * dst_stride + src.len()].copy_from_slice(src);
-                }
+                copy_bgra_rows(dst, data, w, h, stride, dst_stride);
             }
         }
         CVPixelBufferUnlockBaseAddress(pb, 0);
 
-        let mut timing = CMSampleTimingInfo {
-            duration: cmtime(1, FPS as i32),
+        let timing = CMSampleTimingInfo {
+            duration: cmtime(1, FPS_TS),
             presentation_time_stamp: CMTime {
                 value: pts_ns as i64,
                 timescale: 1_000_000_000,
@@ -436,8 +517,8 @@ fn send_bgra(
             ptr::null(),
             ptr::null(),
             fmt,
-            &mut timing,
-            &mut sb,
+            std::ptr::from_ref(&timing),
+            std::ptr::from_mut(&mut sb),
         );
         if ss == 0 && !sb.0.is_null() {
             // ObjC 异常包住：sendSampleBuffer 抛异常时记录而不是 abort
@@ -450,30 +531,37 @@ fn send_bgra(
                 ];
             }));
             if let Err(ex) = send_res {
-                elog(format!("sendSampleBuffer 异常: {:?}", ex));
+                elog(format!("sendSampleBuffer 异常: {ex:?}"));
             }
             SENT.fetch_add(1, Ordering::SeqCst);
             let n = SENT.load(Ordering::SeqCst);
-            if n % 300 == 0 || n == 1 {
-                elog(format!("sendSampleBuffer #{}", n));
+            if n.is_multiple_of(300) || n == 1 {
+                elog(format!("sendSampleBuffer #{n}"));
             }
-            CFRelease(sb.0 as *const c_void);
+            CFRelease(sb.0.cast_const());
         } else {
-            elog(format!("CMSampleBufferCreateForImageBuffer 失败 st={}", ss));
+            elog(format!("CMSampleBufferCreateForImageBuffer 失败 st={ss}"));
         }
-        CFRelease(pb.0 as *const c_void);
+        CFRelease(pb.0.cast_const());
     }
 }
 
 fn frame_loop() {
-    let fmt = FORMAT_DESC.lock().unwrap_or_else(|e| e.into_inner()).unwrap();
-    let mut last_sent: std::time::Instant = std::time::Instant::now();
+    let fmt = FORMAT_DESC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap();
+    // 初值从不被读（循环内先赋值再用），不设初值以免 unused_assignments
+    let mut last_sent: std::time::Instant;
     // 彩条缓冲复用，避免每帧 8.3MB 分配
     let mut bars_buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
     loop {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if RUNNING.load(Ordering::SeqCst) {
-                let stream = STREAM.lock().unwrap_or_else(|e| e.into_inner()).unwrap() as *mut NSObject;
+                let stream = STREAM
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap() as *mut NSObject;
                 // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
                 let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
                 if let Some((data, w, h, stride, pts)) = injected {
@@ -486,14 +574,18 @@ fn frame_loop() {
                         send_bgra(stream, fmt, &data, w, h, stride, pts);
                     }
                 } else {
-                    let rc = vdev_camera::cabi::vdev_camera_render_bgra32(
-                        0,
-                        WIDTH as u32,
-                        HEIGHT as u32,
-                        unsafe { CFAbsoluteTimeGetCurrent() },
-                        bars_buf.as_mut_ptr(),
-                        bars_buf.len(),
-                    );
+                    let now = unsafe { CFAbsoluteTimeGetCurrent() };
+                    // SAFETY: bars_buf 长度恰为 WIDTH*HEIGHT*4，满足 C ABI 对 out 缓冲区的要求
+                    let rc = unsafe {
+                        vdev_camera::cabi::vdev_camera_render_bgra32(
+                            0,
+                            WIDTH as u32,
+                            HEIGHT as u32,
+                            now,
+                            bars_buf.as_mut_ptr(),
+                            bars_buf.len(),
+                        )
+                    };
                     if rc == 0 {
                         let pts = host_now_ns();
                         send_bgra(
@@ -513,6 +605,8 @@ fn frame_loop() {
         // 60fps 节拍
         let elapsed = last_sent.elapsed();
         let target = std::time::Duration::from_micros(16_666);
+        // 分支条件已保证 elapsed < target，减法不会下溢
+        #[allow(clippy::unchecked_time_subtraction)]
         if elapsed < target {
             std::thread::sleep(target - elapsed);
         } else {
@@ -521,26 +615,41 @@ fn frame_loop() {
     }
 }
 
+// 主机时钟秒→纳秒换算：值域远小于 f64 精度边界与 u64 上限，饱和截断足够
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn host_now_ns() -> u64 {
-    unsafe {
-        let t = CMClockGetTime(CMClockGetHostTimeClock());
-        (t.value as f64 / t.timescale as f64 * 1e9) as u64
-    }
+    let clock = unsafe { CMClockGetHostTimeClock() };
+    let t = unsafe { CMClockGetTime(clock) };
+    (t.value as f64 / f64::from(t.timescale) * 1e9) as u64
 }
 
+// spike 的初始化序列（格式描述 → 流 → 三个 source → stream/device/provider →
+// 接线 → 启动）长而线性，步骤注释按 1)~8) 编号连贯阅读，不拆函数。
+#[allow(clippy::too_many_lines)]
 fn main() {
     eprintln!("vdev-camera-ext: 启动（全 Rust spike）");
     // 日志服务器放最前：进程一启动就能读，任何提前退出都能看到
     log_server();
     elog("=== 启动 ===");
     std::panic::set_hook(Box::new(|info| {
-        elog(format!("PANIC: {}", info));
+        elog(format!("PANIC: {info}"));
     }));
 
     // 1) 创建流格式描述（1920x1080 BGRA @60）
     let mut fmt = CMFormatDescription(ptr::null_mut());
     let fst = unsafe {
-        CMVideoFormatDescriptionCreate(ptr::null(), BGR_A, WIDTH, HEIGHT, ptr::null(), &mut fmt)
+        CMVideoFormatDescriptionCreate(
+            ptr::null(),
+            BGR_A,
+            WIDTH,
+            HEIGHT,
+            ptr::null(),
+            std::ptr::from_mut(&mut fmt),
+        )
     };
     if fst != 0 || fmt.0.is_null() {
         eprintln!("vdev-camera-ext: CMVideoFormatDescriptionCreate 失败 {fst}");
@@ -548,11 +657,13 @@ fn main() {
         std::process::exit(1);
     }
     elog(format!("CMVideoFormatDescription OK fmt={:p}", fmt.0));
-    *FORMAT_DESC.lock().unwrap_or_else(|e| e.into_inner()) = Some(fmt);
+    *FORMAT_DESC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fmt);
 
     // 2) 流格式对象
     let sf_cls = class("CMIOExtensionStreamFormat");
-    let dur = cmtime(1, FPS as i32);
+    let dur = cmtime(1, FPS_TS);
     let sf: *mut NSObject = unsafe {
         msg_send![
             sf_cls,
@@ -562,16 +673,28 @@ fn main() {
             validFrameDurations: ptr::null::<objc2_foundation::NSArray<NSObject>>()
         ]
     };
-    let sf: *mut NSObject = unsafe { msg_send![&*sf, retain] };
-    *STREAM_FORMAT.lock().unwrap_or_else(|e| e.into_inner()) = Some(sf as usize);
+    let sf_ref: &NSObject = unsafe { &*sf };
+    let sf: *mut NSObject = unsafe { msg_send![sf_ref, retain] };
+    *STREAM_FORMAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sf as usize);
 
     // 3) 三个 source（进程生命周期持有）
-    let provider_source_obj: Retained<ProviderSource> = unsafe { msg_send![ProviderSource::class(), new] };
-    let device_source_obj: Retained<DeviceSource> = unsafe { msg_send![DeviceSource::class(), new] };
-    let stream_source_obj: Retained<StreamSource> = unsafe { msg_send![StreamSource::class(), new] };
-    let provider_source = &*provider_source_obj as *const ProviderSource as *mut NSObject;
-    let device_source = &*device_source_obj as *const DeviceSource as *mut NSObject;
-    let stream_source = &*stream_source_obj as *const StreamSource as *mut NSObject;
+    let provider_source_obj: Retained<ProviderSource> =
+        unsafe { msg_send![ProviderSource::class(), new] };
+    let device_source_obj: Retained<DeviceSource> =
+        unsafe { msg_send![DeviceSource::class(), new] };
+    let stream_source_obj: Retained<StreamSource> =
+        unsafe { msg_send![StreamSource::class(), new] };
+    let provider_source = std::ptr::from_ref(&*provider_source_obj)
+        .cast::<NSObject>()
+        .cast_mut();
+    let device_source = std::ptr::from_ref(&*device_source_obj)
+        .cast::<NSObject>()
+        .cast_mut();
+    let stream_source = std::ptr::from_ref(&*stream_source_obj)
+        .cast::<NSObject>()
+        .cast_mut();
     std::mem::forget(provider_source_obj);
     std::mem::forget(device_source_obj);
     std::mem::forget(stream_source_obj);
@@ -589,8 +712,11 @@ fn main() {
             source: stream_source
         ]
     };
-    let stream: *mut NSObject = unsafe { msg_send![&*stream, retain] };
-    *STREAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(stream as usize);
+    let stream_ref: &NSObject = unsafe { &*stream };
+    let stream: *mut NSObject = unsafe { msg_send![stream_ref, retain] };
+    *STREAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stream as usize);
 
     // 5) device
     let dev_cls = class("CMIOExtensionDevice");
@@ -604,14 +730,15 @@ fn main() {
             source: device_source
         ]
     };
-    let device: *mut NSObject = unsafe { msg_send![&*device, retain] };
+    let device_ref: &NSObject = unsafe { &*device };
+    let device: *mut NSObject = unsafe { msg_send![device_ref, retain] };
 
     // 6) provider（clientQueue 用真实 dispatch queue，NULL 可能注册不上 XPC）
     let provider_cls = class("CMIOExtensionProvider");
     let queue = DispatchQueue::new("com.vdev.camera.ext.spike.provider", None);
     let queue_raw = queue.as_raw().as_ptr();
     std::mem::forget(queue);
-    elog(format!("provider clientQueue={:p}", queue_raw));
+    elog(format!("provider clientQueue={queue_raw:p}"));
     let provider: *mut NSObject = unsafe {
         msg_send![
             provider_cls,
@@ -619,25 +746,26 @@ fn main() {
             clientQueue: queue_raw
         ]
     };
-    let provider: *mut NSObject = unsafe { msg_send![&*provider, retain] };
+    let provider_ref: &NSObject = unsafe { &*provider };
+    let provider: *mut NSObject = unsafe { msg_send![provider_ref, retain] };
 
     // 7) 接线：addStream 先于 addDevice（macOS 26 顺序要求）
-    let ok_add_stream: bool = unsafe { msg_send![&*device, addStream: &*stream, error: ptr::null_mut::<NSObject>()] };
-    elog(format!("addStream -> {}", ok_add_stream));
+    let ok_add_stream: bool =
+        unsafe { msg_send![device, addStream: stream, error: ptr::null_mut::<NSObject>()] };
+    elog(format!("addStream -> {ok_add_stream}"));
     if !ok_add_stream {
         eprintln!("vdev-camera-ext: addStream 失败");
     }
-    let ok_add_dev: bool = unsafe { msg_send![&*provider, addDevice: &*device, error: ptr::null_mut::<NSObject>()] };
-    elog(format!("addDevice -> {}", ok_add_dev));
+    let ok_add_dev: bool =
+        unsafe { msg_send![provider, addDevice: device, error: ptr::null_mut::<NSObject>()] };
+    elog(format!("addDevice -> {ok_add_dev}"));
     if !ok_add_dev {
         eprintln!("vdev-camera-ext: addDevice 失败");
     }
 
     // 8) 帧线程 + 启动服务
     std::thread::spawn(frame_loop);
-    unsafe {
-        let _: () = msg_send![provider_cls, startServiceWithProvider: &*provider];
-    }
+    let _: () = unsafe { msg_send![provider_cls, startServiceWithProvider: provider] };
     // 启动真实帧推流通道（宿主 App / 外部桥连 127.0.0.1:27890 推帧）
     frame_channel::start();
     if let Some(desc) = filters::describe() {
@@ -646,4 +774,84 @@ fn main() {
     eprintln!("vdev-camera-ext: 服务已启动，进入 runloop");
     elog("startService 完成，进入 runloop");
     unsafe { CFRunLoopRun() };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_bgra_rows, log_skip};
+
+    #[test]
+    fn bgra_rows_padded_src_stride_copies_only_valid_bytes() {
+        // w=2 → 每行有效 8 字节；推流方 padded stride=12（每行 4 字节 pad 不拷）
+        let src = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xAA, 0xAA, 0xAA, // row 0 + pad
+            9, 10, 11, 12, 13, 14, 15, 16, 0xBB, 0xBB, 0xBB, 0xBB, // row 1 + pad
+        ];
+        let mut dst = vec![0u8; 8 * 2];
+        copy_bgra_rows(&mut dst, &src, 2, 2, 12, 8);
+        assert_eq!(
+            dst,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn bgra_rows_dst_stride_narrower_than_src_no_panic() {
+        // 修复的 panic 场景：stride=12 > dst_stride=8，旧实现最后一行越界 panic
+        let src = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xAA, 0xAA, 0xAA, //
+            9, 10, 11, 12, 13, 14, 15, 16, 0xBB, 0xBB, 0xBB, 0xBB,
+        ];
+        let mut dst = vec![0u8; 8 * 2];
+        copy_bgra_rows(&mut dst, &src, 2, 2, 12, 8); // 只拷有效 8 字节，不越界
+        assert_eq!(dst[8..], [9, 10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn bgra_rows_dst_stride_larger_lands_rows_at_dst_stride() {
+        // CV 分配更大行距（dst_stride=16 > stride=8）：行落在 row*dst_stride，
+        // 行间 pad 保持原值不写
+        let src: Vec<u8> = (1..=16).collect(); // w=2,h=2,stride=8
+        let mut dst = vec![0u8; 16 * 2];
+        copy_bgra_rows(&mut dst, &src, 2, 2, 8, 16);
+        assert_eq!(
+            dst,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, //
+                9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn bgra_rows_equal_strides_full_copy() {
+        let src: Vec<u8> = (0..32).collect(); // w=2,h=4,stride=8
+        let mut dst = vec![0u8; 32];
+        copy_bgra_rows(&mut dst, &src, 2, 4, 8, 8);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn log_skip_current_connection_continues_after_drain() {
+        // 全局已产 600 行、buf 只留最近 500 行（对应全局 [100,600)）：
+        // 连接已发 590 行 → 从 buf[490]（全局 590）续发，不再停滞
+        assert_eq!(log_skip(590, 500, 600), 490);
+    }
+
+    #[test]
+    fn log_skip_new_connection_gets_tail_from_head() {
+        assert_eq!(log_skip(0, 500, 600), 0);
+    }
+
+    #[test]
+    fn log_skip_lagging_connection_saturates_at_buffer_head() {
+        // 已发行数落在已 drain 区间（10 < 100）：从 buf 头部续发（尽力而为）
+        assert_eq!(log_skip(10, 500, 600), 0);
+    }
+
+    #[test]
+    fn log_skip_no_drain_yet_reads_from_start() {
+        assert_eq!(log_skip(0, 10, 10), 0);
+        assert_eq!(log_skip(3, 10, 10), 3);
+    }
 }

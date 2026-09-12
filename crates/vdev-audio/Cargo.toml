@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 [[bin]]
 name = "vdev-audio-ctl"
 path = "src/bin/vdev-audio-ctl.rs"
+
+[lints]
+workspace = true

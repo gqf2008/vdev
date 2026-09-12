@@ -1,7 +1,10 @@
-//! AudioServerPlugInDriverInterface vtable —— 对照 CoreAudio.framework AudioServerPlugIn.h。
-//! 布局必须与 C 完全一致（IUNKNOWN_C_GUTS + 19 个插件方法）。
+//! `AudioServerPlugInDriverInterface` vtable —— 对照 CoreAudio.framework AudioServerPlugIn.h。
+//! 布局必须与 C `完全一致（IUNKNOWN_C_GUTS` + 19 个插件方法）。
 
+// 类型名沿用 C 头文件（AudioServerPlugIn.h / windows 风格 HRESULT/ULONG/REFIID/LPVOID），
+// 不改驼峰/全大写命名
 #![allow(non_camel_case_types)]
+#![allow(clippy::upper_case_acronyms)]
 use std::ffi::c_void;
 
 pub type OSStatus = i32;
@@ -98,18 +101,19 @@ pub struct AudioValueRange {
     pub m_maximum: f64,
 }
 
-
 #[repr(C)]
 pub struct AudioServerPlugInDriverInterface {
     // IUNKNOWN_C_GUTS
+    // C 头保留字段按原名镜像（IUNKNOWN_C_GUTS 的 `_reserved`），刻意不随 Rust 命名
+    #[allow(clippy::pub_underscore_fields, dead_code)]
     pub _reserved: *mut c_void,
-    pub query_interface:
-        Option<unsafe extern "C" fn(*mut c_void, REFIID, *mut LPVOID) -> HRESULT>,
+    pub query_interface: Option<unsafe extern "C" fn(*mut c_void, REFIID, *mut LPVOID) -> HRESULT>,
     pub add_ref: Option<unsafe extern "C" fn(*mut c_void) -> ULONG>,
     pub release: Option<unsafe extern "C" fn(*mut c_void) -> ULONG>,
     // 插件方法
-    pub initialize:
-        Option<unsafe extern "C" fn(AudioServerPlugInDriverRef, AudioServerPlugInHostRef) -> OSStatus>,
+    pub initialize: Option<
+        unsafe extern "C" fn(AudioServerPlugInDriverRef, AudioServerPlugInHostRef) -> OSStatus,
+    >,
     pub create_device: Option<
         unsafe extern "C" fn(
             AudioServerPlugInDriverRef,
@@ -135,10 +139,20 @@ pub struct AudioServerPlugInDriverInterface {
         ) -> OSStatus,
     >,
     pub perform_device_config_change: Option<
-        unsafe extern "C" fn(AudioServerPlugInDriverRef, AudioObjectID, u64, *mut c_void) -> OSStatus,
+        unsafe extern "C" fn(
+            AudioServerPlugInDriverRef,
+            AudioObjectID,
+            u64,
+            *mut c_void,
+        ) -> OSStatus,
     >,
     pub abort_device_config_change: Option<
-        unsafe extern "C" fn(AudioServerPlugInDriverRef, AudioObjectID, u64, *mut c_void) -> OSStatus,
+        unsafe extern "C" fn(
+            AudioServerPlugInDriverRef,
+            AudioObjectID,
+            u64,
+            *mut c_void,
+        ) -> OSStatus,
     >,
     pub has_property: Option<
         unsafe extern "C" fn(

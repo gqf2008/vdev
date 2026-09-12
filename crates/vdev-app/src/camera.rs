@@ -3,10 +3,12 @@ use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeVideo};
 
 #[allow(deprecated)]
 pub fn camera_names() -> Vec<String> {
-    unsafe {
-        let devices = AVCaptureDevice::devicesWithMediaType(AVMediaTypeVideo.unwrap());
-        devices.iter().map(|d| d.localizedName().to_string()).collect()
-    }
+    // SAFETY：devicesWithMediaType 为已废弃但有效的类方法枚举
+    let devices = unsafe { AVCaptureDevice::devicesWithMediaType(AVMediaTypeVideo.unwrap()) };
+    devices
+        .iter()
+        .map(|d| unsafe { d.localizedName() }.to_string())
+        .collect()
 }
 
 pub fn find_vdev() -> bool {

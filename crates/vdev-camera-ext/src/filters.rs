@@ -17,12 +17,15 @@ use vdev_filter::{process_frame, FilterParams};
 
 struct Config {
     params: FilterParams,
-    /// VDEV_FILTER 里给过参数（哪怕全是默认值）
+    /// `VDEV_FILTER` 里给过参数（哪怕全是默认值）
     params_active: bool,
-    /// VDEV_BG 开了背景模糊
+    /// `VDEV_BG` 开了背景模糊
     bg_blur: bool,
 }
 
+/// 环境变量只解析一次，缓存进静态配置。
+// green_screen_threshold 经 clamp(0.0, 255.0) 后必落在 u8 域内，截断不可能发生
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn config() -> &'static Config {
     static CFG: OnceLock<Config> = OnceLock::new();
     CFG.get_or_init(|| {
@@ -30,7 +33,7 @@ fn config() -> &'static Config {
         let mut params_active = false;
         if let Ok(v) = std::env::var("VDEV_FILTER") {
             let parts: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            if parts.len() >= 1 {
+            if !parts.is_empty() {
                 params.brightness = parts[0];
                 params_active = true;
             }
@@ -112,6 +115,8 @@ pub fn apply(bgra: &mut [u8], width: u32, height: u32) {
 }
 
 #[cfg(test)]
+// 测试数据取值远小于 u8 上限，截断不可能发生
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 

@@ -32,7 +32,8 @@ impl BiquadCoeffs {
         let a = 10f32.powf(gain_db / 40.0);
         let w0 = 2.0 * PI * f0 / fs;
         let (sw, cw) = w0.sin_cos();
-        let alpha = sw / 2.0 * ((a + 1.0 / a) * (1.0 / 1.0 - 1.0) + 2.0).sqrt(); // slope S=1
+        // RBJ shelf alpha：S=1 时退化项 (1/S−1)=0，化简为 √2/2·sin(w0)（与原式逐位一致）
+        let alpha = sw / 2.0 * 2.0f32.sqrt();
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
         let b0 = a * ((a + 1.0) - (a - 1.0) * cw + two_sqrt_a_alpha);
         let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cw);
@@ -63,7 +64,8 @@ impl BiquadCoeffs {
         let a = 10f32.powf(gain_db / 40.0);
         let w0 = 2.0 * PI * f0 / fs;
         let (sw, cw) = w0.sin_cos();
-        let alpha = sw / 2.0 * ((a + 1.0 / a) * (1.0 - 1.0) + 2.0).sqrt();
+        // RBJ shelf alpha：同上，S=1 时退化项 (1/S−1)=0，化简为 √2/2·sin(w0)（与原式逐位一致）
+        let alpha = sw / 2.0 * 2.0f32.sqrt();
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
         let b0 = a * ((a + 1.0) + (a - 1.0) * cw + two_sqrt_a_alpha);
         let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cw);
@@ -75,10 +77,22 @@ impl BiquadCoeffs {
     }
 
     fn normalize(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+        }
     }
 
-    const IDENTITY: Self = Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 };
+    const IDENTITY: Self = Self {
+        b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+    };
 }
 
 // ---- DSP 管线 ----
@@ -209,7 +223,7 @@ mod tests {
         let mut data = sine(0.3, 1000.0, 512);
         d.process(&mut data);
         let p = peak(&data);
-        assert!((p - 0.6).abs() < 0.03, "gain+6dB 峰值={}（期望≈0.6）", p);
+        assert!((p - 0.6).abs() < 0.03, "gain+6dB 峰值={p}（期望≈0.6）");
     }
 
     #[test]
@@ -223,7 +237,54 @@ mod tests {
         let mut d100 = sine(0.5, 100.0, 512);
         d.process(&mut d100);
         let p100 = peak(&d100);
-        assert!((p1k - 1.0).abs() < 0.08, "1kHz 峰值={}", p1k);
-        assert!((p100 - 0.5).abs() < 0.05, "100Hz 峰值={}", p100);
+        assert!((p1k - 1.0).abs() < 0.08, "1kHz 峰值={p1k}");
+        assert!((p100 - 0.5).abs() < 0.05, "100Hz 峰值={p100}");
+    }
+
+    // 回归：shelf alpha 退化项化简（S=1 → (1/S−1)=0 → √2/2·sin(w0)）后，
+    // 系数必须与 RBJ cookbook 原式逐位一致（防止化简引入数值漂移）
+    #[test]
+    // 参照实现与被测实现使用同一公式同一求值顺序，位级相等是断言本意
+    #[allow(clippy::float_cmp)]
+    fn test_shelf_coeffs_match_rbj_reference() {
+        let fs = 48000.0f32;
+        for &(f0, gain_db) in &[(120.0, 3.0), (120.0, -6.0), (8000.0, 2.5), (8000.0, 0.0)] {
+            let a = 10f32.powf(gain_db / 40.0);
+            let w0 = 2.0 * PI * f0 / fs;
+            let (sw, cw) = w0.sin_cos();
+            let s = 1.0f32; // shelf slope S=1（用变量书写原始公式作参照实现）
+            let alpha = sw / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).sqrt();
+            let t = 2.0 * a.sqrt() * alpha;
+            // low shelf（RBJ cookbook 原式）
+            let low_a0 = (a + 1.0) + (a - 1.0) * cw + t;
+            let low_ref = [
+                a * ((a + 1.0) - (a - 1.0) * cw + t) / low_a0,
+                2.0 * a * ((a - 1.0) - (a + 1.0) * cw) / low_a0,
+                a * ((a + 1.0) - (a - 1.0) * cw - t) / low_a0,
+                -2.0 * ((a - 1.0) + (a + 1.0) * cw) / low_a0,
+                ((a + 1.0) + (a - 1.0) * cw - t) / low_a0,
+            ];
+            let low = BiquadCoeffs::low_shelf(f0, gain_db, fs);
+            assert_eq!(
+                [low.b0, low.b1, low.b2, low.a1, low.a2],
+                low_ref,
+                "low_shelf {f0}Hz {gain_db}dB"
+            );
+            // high shelf（RBJ cookbook 原式）
+            let high_a0 = (a + 1.0) - (a - 1.0) * cw + t;
+            let high_ref = [
+                a * ((a + 1.0) + (a - 1.0) * cw + t) / high_a0,
+                -2.0 * a * ((a - 1.0) + (a + 1.0) * cw) / high_a0,
+                a * ((a + 1.0) + (a - 1.0) * cw - t) / high_a0,
+                2.0 * ((a - 1.0) - (a + 1.0) * cw) / high_a0,
+                ((a + 1.0) - (a - 1.0) * cw - t) / high_a0,
+            ];
+            let high = BiquadCoeffs::high_shelf(f0, gain_db, fs);
+            assert_eq!(
+                [high.b0, high.b1, high.b2, high.a1, high.a2],
+                high_ref,
+                "high_shelf {f0}Hz {gain_db}dB"
+            );
+        }
     }
 }

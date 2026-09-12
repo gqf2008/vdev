@@ -1,7 +1,14 @@
 //! vdev-filter：BGRA32 实时图像滤镜管线。
 //! 供「远端 WebRTC 流 → 本地虚拟摄像头」链路使用：解码后的 BGRA 帧
-//! 经过可插拔滤镜链，再推给 FrameChannel → 虚拟摄像头。
+//! 经过可插拔滤镜链，再推给 `FrameChannel` → 虚拟摄像头。
 //! 设计目标：无堆分配、纯整数/浮点逐像素，实时帧处理友好。
+
+// 逐像素 DSP：像素值先钳位再转 u8（语义安全），单字母局部变量为像素处理惯例。
+#![allow(clippy::cast_possible_truncation)] // 钳位后 f32→u8/i32→u8
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)] // 像素坐标/计数换算浮点
+#![allow(clippy::many_single_char_names)] // 逐像素计算惯用单字母局部变量
 
 #[cfg(feature = "vision")]
 pub mod vision;
@@ -16,11 +23,20 @@ pub struct Pixel {
 }
 
 impl Pixel {
+    #[must_use]
     pub fn from_slice(s: &[u8]) -> Self {
-        Self { b: s[0], g: s[1], r: s[2], a: s[3] }
+        Self {
+            b: s[0],
+            g: s[1],
+            r: s[2],
+            a: s[3],
+        }
     }
     pub fn to_slice(self, s: &mut [u8]) {
-        s[0] = self.b; s[1] = self.g; s[2] = self.r; s[3] = self.a;
+        s[0] = self.b;
+        s[1] = self.g;
+        s[2] = self.r;
+        s[3] = self.a;
     }
 }
 
@@ -61,7 +77,7 @@ impl Default for FilterParams {
 #[inline]
 fn bcs(p: Pixel, params: &FilterParams) -> Pixel {
     let f = |c: u8| -> u8 {
-        let mut v = c as f32 / 255.0;
+        let mut v = f32::from(c) / 255.0;
         // 亮度（加性）
         v += params.brightness;
         // 对比度（围绕 0.5 缩放）
@@ -72,12 +88,13 @@ fn bcs(p: Pixel, params: &FilterParams) -> Pixel {
     let mut g = f(p.g);
     let mut b = f(p.b);
     // 饱和度：先转亮度，再线性插值
+    #[allow(clippy::float_cmp)] // 1.0 是「不调整饱和度」的哨兵值，非浮点运算结果
     if params.saturation != 1.0 {
-        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
         let s = params.saturation;
-        r = ((r as f32 - luma) * s + luma).clamp(0.0, 255.0) as u8;
-        g = ((g as f32 - luma) * s + luma).clamp(0.0, 255.0) as u8;
-        b = ((b as f32 - luma) * s + luma).clamp(0.0, 255.0) as u8;
+        r = ((f32::from(r) - luma) * s + luma).clamp(0.0, 255.0) as u8;
+        g = ((f32::from(g) - luma) * s + luma).clamp(0.0, 255.0) as u8;
+        b = ((f32::from(b) - luma) * s + luma).clamp(0.0, 255.0) as u8;
     }
     Pixel { r, g, b, a: p.a }
 }
@@ -88,17 +105,25 @@ fn green_screen(p: Pixel, threshold: u8) -> Pixel {
     if threshold == 0 {
         return p;
     }
-    let g = p.g as i32;
-    let r = p.r as i32;
-    let b = p.b as i32;
-    if g - r.max(b) > threshold as i32 {
-        Pixel { b: 0, g: 0, r: 0, a: 0 }
+    let g = i32::from(p.g);
+    let r = i32::from(p.r);
+    let b = i32::from(p.b);
+    if g - r.max(b) > i32::from(threshold) {
+        Pixel {
+            b: 0,
+            g: 0,
+            r: 0,
+            a: 0,
+        }
     } else {
         p
     }
 }
 
 /// 对一整帧 BGRA 应用滤镜（原地处理，无分配）。
+///
+/// # Panics
+/// `bgra.len() < width * height * 4` 时 panic（缓冲区太小）。
 pub fn process_frame(bgra: &mut [u8], width: u32, height: u32, params: &FilterParams) {
     let px = (width * height) as usize;
     let n = px * 4;
@@ -149,22 +174,27 @@ fn bilateral_smooth(bgra: &mut [u8], width: u32, height: u32, strength: f32) {
         for x in 0..w {
             let c = y * w + x;
             for ch in 0..3 {
-                let center = src[c * 4 + ch] as f32;
+                let center = f32::from(src[c * 4 + ch]);
                 let mut sum = 0.0f32;
                 let mut wsum = 0.0f32;
                 let mut si = 0usize;
                 for dy in -r..=r {
                     let ny = y as i32 + dy;
-                    if ny < 0 || ny >= h as i32 { si += (2 * r + 1) as usize; continue; }
+                    if ny < 0 || ny >= h as i32 {
+                        si += (2 * r + 1) as usize;
+                        continue;
+                    }
                     for dx in -r..=r {
                         let nx = x as i32 + dx;
                         let ws = spatial[si];
                         si += 1;
-                        if nx < 0 || nx >= w as i32 { continue; }
+                        if nx < 0 || nx >= w as i32 {
+                            continue;
+                        }
                         let ni = (ny as usize) * w + nx as usize;
-                        let diff = src[ni * 4 + ch] as f32 - center;
+                        let diff = f32::from(src[ni * 4 + ch]) - center;
                         let wgt = ws * (diff * diff * range_factor).exp();
-                        sum += wgt * src[ni * 4 + ch] as f32;
+                        sum += wgt * f32::from(src[ni * 4 + ch]);
                         wsum += wgt;
                     }
                 }
@@ -180,9 +210,9 @@ fn whiten(bgra: &mut [u8], width: u32, height: u32, strength: f32) {
     let px = (width * height) as usize;
     for i in 0..px {
         let o = i * 4;
-        let b = bgra[o] as f32;
-        let g = bgra[o + 1] as f32;
-        let r = bgra[o + 2] as f32;
+        let b = f32::from(bgra[o]);
+        let g = f32::from(bgra[o + 1]);
+        let r = f32::from(bgra[o + 2]);
         // 提亮（越暗提得越多）
         let lift = strength * 18.0;
         let mut b2 = b + lift;
@@ -211,12 +241,12 @@ fn sharpen_in_place(bgra: &mut [u8], width: u32, height: u32, strength: f32) {
             let c = y * w + x;
             for ch in 0..3 {
                 let o = c * 4 + ch;
-                let center = src[o] as f32;
+                let center = f32::from(src[o]);
                 let lap = 4.0 * center
-                    - src[o - w * 4] as f32
-                    - src[o + w * 4] as f32
-                    - src[o - 4] as f32
-                    - src[o + 4] as f32;
+                    - f32::from(src[o - w * 4])
+                    - f32::from(src[o + w * 4])
+                    - f32::from(src[o - 4])
+                    - f32::from(src[o + 4]);
                 let v = center + strength * lap;
                 bgra[o] = v.clamp(0.0, 255.0) as u8;
             }
@@ -231,14 +261,26 @@ mod tests {
     fn frame(color: Pixel, w: u32, h: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity((w * h * 4) as usize);
         for _ in 0..w * h {
-            v.push(color.b); v.push(color.g); v.push(color.r); v.push(color.a);
+            v.push(color.b);
+            v.push(color.g);
+            v.push(color.r);
+            v.push(color.a);
         }
         v
     }
 
     #[test]
     fn test_identity() {
-        let mut f = frame(Pixel { b: 10, g: 100, r: 200, a: 255 }, 4, 4);
+        let mut f = frame(
+            Pixel {
+                b: 10,
+                g: 100,
+                r: 200,
+                a: 255,
+            },
+            4,
+            4,
+        );
         let before = f.clone();
         process_frame(&mut f, 4, 4, &FilterParams::default());
         assert_eq!(f, before, "默认参数应直通");
@@ -246,85 +288,220 @@ mod tests {
 
     #[test]
     fn test_brightness_up() {
-        let mut f = frame(Pixel { b: 100, g: 100, r: 100, a: 255 }, 4, 4);
-        process_frame(&mut f, 4, 4, &FilterParams { brightness: 0.5, ..Default::default() });
+        let mut f = frame(
+            Pixel {
+                b: 100,
+                g: 100,
+                r: 100,
+                a: 255,
+            },
+            4,
+            4,
+        );
+        process_frame(
+            &mut f,
+            4,
+            4,
+            &FilterParams {
+                brightness: 0.5,
+                ..Default::default()
+            },
+        );
         let p = Pixel::from_slice(&f[0..4]);
-        assert!(p.r > 100 && p.g > 100 && p.b > 100, "亮度应提升，实际 r={}", p.r);
+        assert!(
+            p.r > 100 && p.g > 100 && p.b > 100,
+            "亮度应提升，实际 r={}",
+            p.r
+        );
     }
 
     #[test]
     fn test_saturation_zero_grayscale() {
-        let mut f = frame(Pixel { b: 50, g: 150, r: 250, a: 255 }, 4, 4);
-        process_frame(&mut f, 4, 4, &FilterParams { saturation: 0.0, ..Default::default() });
+        let mut f = frame(
+            Pixel {
+                b: 50,
+                g: 150,
+                r: 250,
+                a: 255,
+            },
+            4,
+            4,
+        );
+        process_frame(
+            &mut f,
+            4,
+            4,
+            &FilterParams {
+                saturation: 0.0,
+                ..Default::default()
+            },
+        );
         let p = Pixel::from_slice(&f[0..4]);
-        assert!((p.r as i32 - p.g as i32).abs() < 2 && (p.g as i32 - p.b as i32).abs() < 2,
-            "灰度化后 RGB 应接近，实际 r={} g={} b={}", p.r, p.g, p.b);
+        assert!(
+            (i32::from(p.r) - i32::from(p.g)).abs() < 2
+                && (i32::from(p.g) - i32::from(p.b)).abs() < 2,
+            "灰度化后 RGB 应接近，实际 r={} g={} b={}",
+            p.r,
+            p.g,
+            p.b
+        );
     }
 
     #[test]
     fn test_beauty_smooth_reduces_noise() {
         // 平坦灰底 + 随机噪点，磨皮后噪点方差应显著降低
-        let w = 16; let h = 16;
+        let w = 16;
+        let h = 16;
         let mut f = vec![0u8; (w * h * 4) as usize];
         let mut seed = 42u32;
-        for i in 0..(w*h) as usize {
-            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        for i in 0..(w * h) as usize {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
             let noise = ((seed >> 16) & 31) as i32 - 15; // -15..15
             let v = (128i32 + noise).clamp(0, 255) as u8;
             let o = i * 4;
-            f[o] = v; f[o+1] = v; f[o+2] = v; f[o+3] = 255;
+            f[o] = v;
+            f[o + 1] = v;
+            f[o + 2] = v;
+            f[o + 3] = 255;
         }
         let var = |d: &[u8]| -> f32 {
-            let mut sum = 0f32; let mut n = 0usize;
-            for i in 0..(w*h) as usize { sum += d[i*4] as f32; n += 1; }
+            let mut sum = 0f32;
+            let mut n = 0usize;
+            for i in 0..(w * h) as usize {
+                sum += f32::from(d[i * 4]);
+                n += 1;
+            }
             let mean = sum / n as f32;
             let mut v = 0f32;
-            for i in 0..(w*h) as usize { let d = d[i*4] as f32 - mean; v += d*d; }
+            for i in 0..(w * h) as usize {
+                let d = f32::from(d[i * 4]) - mean;
+                v += d * d;
+            }
             v / n as f32
         };
         let before = var(&f);
-        process_frame(&mut f, w, h, &FilterParams { beauty_strength: 1.0, ..Default::default() });
+        process_frame(
+            &mut f,
+            w,
+            h,
+            &FilterParams {
+                beauty_strength: 1.0,
+                ..Default::default()
+            },
+        );
         let after = var(&f);
-        assert!(after < before * 0.5, "磨皮应降低噪点方差：before={before:.1} after={after:.1}");
+        assert!(
+            after < before * 0.5,
+            "磨皮应降低噪点方差：before={before:.1} after={after:.1}"
+        );
     }
 
     #[test]
     fn test_beauty_keeps_edge() {
         // 左黑右白边界：磨皮后边界两侧仍接近黑/白（边缘保留）
-        let w = 16; let h = 16;
+        let w = 16;
+        let h = 16;
         let mut f = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h as usize { for x in 0..w as usize {
-            let v = if x < w as usize / 2 { 10 } else { 245 };
-            let o = (y * w as usize + x) * 4;
-            f[o]=v; f[o+1]=v; f[o+2]=v; f[o+3]=255;
-        }}
-        process_frame(&mut f, w, h, &FilterParams { beauty_strength: 1.0, ..Default::default() });
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let v = if x < w as usize / 2 { 10 } else { 245 };
+                let o = (y * w as usize + x) * 4;
+                f[o] = v;
+                f[o + 1] = v;
+                f[o + 2] = v;
+                f[o + 3] = 255;
+            }
+        }
+        process_frame(
+            &mut f,
+            w,
+            h,
+            &FilterParams {
+                beauty_strength: 1.0,
+                ..Default::default()
+            },
+        );
         // 检查离边界至少 3 像素的点仍保持接近原值
-        let left = f[(3 * w as usize + 3) * 4] as i32;      // 左侧内部
-        let right = f[(3 * w as usize + (w as usize-3)) * 4] as i32; // 右侧内部
+        let left = i32::from(f[(3 * w as usize + 3) * 4]); // 左侧内部
+        let right = i32::from(f[(3 * w as usize + (w as usize - 3)) * 4]); // 右侧内部
         assert!(left < 40, "左侧应仍偏黑，实际 {left}");
         assert!(right > 215, "右侧应仍偏白，实际 {right}");
     }
 
     #[test]
     fn test_whiten_brightens() {
-        let mut f = frame(Pixel { b: 100, g: 100, r: 100, a: 255 }, 4, 4);
-        process_frame(&mut f, 4, 4, &FilterParams { whiten_strength: 1.0, ..Default::default() });
+        let mut f = frame(
+            Pixel {
+                b: 100,
+                g: 100,
+                r: 100,
+                a: 255,
+            },
+            4,
+            4,
+        );
+        process_frame(
+            &mut f,
+            4,
+            4,
+            &FilterParams {
+                whiten_strength: 1.0,
+                ..Default::default()
+            },
+        );
         let p = Pixel::from_slice(&f[0..4]);
-        assert!(p.r > 100 && p.g > 100 && p.b > 100, "美白应提亮，实际 r={}", p.r);
+        assert!(
+            p.r > 100 && p.g > 100 && p.b > 100,
+            "美白应提亮，实际 r={}",
+            p.r
+        );
     }
 
     #[test]
     fn test_green_screen() {
         // 纯绿背景 → 透明
-        let mut f = frame(Pixel { b: 0, g: 255, r: 0, a: 255 }, 4, 4);
-        process_frame(&mut f, 4, 4, &FilterParams { green_screen_threshold: 30, ..Default::default() });
+        let mut f = frame(
+            Pixel {
+                b: 0,
+                g: 255,
+                r: 0,
+                a: 255,
+            },
+            4,
+            4,
+        );
+        process_frame(
+            &mut f,
+            4,
+            4,
+            &FilterParams {
+                green_screen_threshold: 30,
+                ..Default::default()
+            },
+        );
         let p = Pixel::from_slice(&f[0..4]);
         assert_eq!(p.a, 0, "绿幕应抠成透明");
 
         // 红色保留
-        let mut f2 = frame(Pixel { b: 0, g: 0, r: 255, a: 255 }, 4, 4);
-        process_frame(&mut f2, 4, 4, &FilterParams { green_screen_threshold: 30, ..Default::default() });
+        let mut f2 = frame(
+            Pixel {
+                b: 0,
+                g: 0,
+                r: 255,
+                a: 255,
+            },
+            4,
+            4,
+        );
+        process_frame(
+            &mut f2,
+            4,
+            4,
+            &FilterParams {
+                green_screen_threshold: 30,
+                ..Default::default()
+            },
+        );
         let p2 = Pixel::from_slice(&f2[0..4]);
         assert_eq!(p2.a, 255, "非绿色应保留");
     }

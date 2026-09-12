@@ -1,6 +1,6 @@
-//! 视频音频推流：AVAssetReader 解音轨 → CoreAudio AudioUnit 输出到 vdev-audio（自研虚拟声卡）。
+//! 视频音频推流：AVAssetReader 解音轨 → `CoreAudio` `AudioUnit` 输出到 vdev-audio（自研虚拟声卡）。
 //! 之后 QuickTime/Zoom 等把「麦克风」选成 vdev-audio 即可听到视频原声。
-//! 全 Rust FFI（AudioToolbox / AudioUnit / AVFoundation）。
+//! 全 Rust FFI（AudioToolbox / `AudioUnit` / `AVFoundation`）。
 
 use anyhow::{anyhow, Result};
 use objc2::msg_send;
@@ -9,20 +9,19 @@ use objc2::runtime::AnyObject;
 use objc2::ClassType;
 use objc2_av_foundation::{AVAssetReader, AVAssetReaderTrackOutput, AVURLAsset};
 use objc2_foundation::{NSDictionary, NSString, NSURL};
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 // ---------------- 常量（CoreAudio / AudioUnit）----------------
 const K_AUDIO_OBJECT_SYSTEM: u32 = 1; // kAudioObjectSystemObject
-const K_HW_PROP_DEVICES: u32 = 0x64657623; // kAudioHardwarePropertyDevices .dev#.
-const K_OBJ_SCOPE_GLOBAL: u32 = 0x676c6f62; // 'glob'
+const K_HW_PROP_DEVICES: u32 = 0x6465_7623; // kAudioHardwarePropertyDevices .dev#.
+const K_OBJ_SCOPE_GLOBAL: u32 = 0x676c_6f62; // 'glob'
 const K_OBJ_ELEMENT_MAIN: u32 = 0;
-const K_DEV_PROP_NAME_CFSTRING: u32 = 0x6c6e616d; // kAudioDevicePropertyDeviceNameCFString .lnam.
-const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = 0x61756f75; // 'auou'
-const K_AUDIO_UNIT_SUBTYPE_HAL: u32 = 0x6168616c; // 'ahal'
-const K_AUDIO_UNIT_MANUF_APPLE: u32 = 0x6170706c; // 'appl'
+const K_DEV_PROP_NAME_CFSTRING: u32 = 0x6c6e_616d; // kAudioDevicePropertyDeviceNameCFString .lnam.
+const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = 0x6175_6f75; // 'auou'
+const K_AUDIO_UNIT_SUBTYPE_HAL: u32 = 0x6168_616c; // 'ahal'
+const K_AUDIO_UNIT_MANUF_APPLE: u32 = 0x6170_706c; // 'appl'
 const K_OUTPUT_UNIT_PROP_CURRENT_DEVICE: u32 = 2000; // kAudioOutputUnitProperty_CurrentDevice
 const K_OUTPUT_UNIT_PROP_ENABLE_IO: u32 = 2003; // kAudioOutputUnitProperty_EnableIO
 const K_AUDIO_UNIT_PROP_STREAM_FORMAT: u32 = 8; // kAudioUnitProperty_StreamFormat
@@ -34,6 +33,8 @@ const SAMPLE_RATE: f64 = 48_000.0;
 const CHANNELS: u32 = 2;
 // 环缓冲容量：约 0.5s（按 48k*2ch*f32）
 
+// CoreAudio 句柄类型别名（C 头镜像），随 AudioBufferList 成套保留
+#[allow(dead_code)]
 type AudioObjectID = u32;
 
 #[repr(C)]
@@ -87,10 +88,13 @@ struct AudioTimeStamp {
 #[repr(C)]
 struct AudioUnitRenderingActionFlags(u32);
 
+// CoreAudio 句柄类型（C 头镜像），与 AudioUnit API 成套保留
 #[repr(C)]
+#[allow(dead_code)]
 struct AudioUnitElement(u32);
 
 #[repr(C)]
+#[allow(dead_code)]
 struct AudioUnit(u32);
 
 #[repr(C)]
@@ -223,18 +227,19 @@ fn ring_push(data: &[f32]) -> usize {
     for i in 0..n {
         buf[(head + i) & r.mask] = data[i];
     }
-    r.head.store(head.wrapping_add(n), std::sync::atomic::Ordering::Release);
+    r.head
+        .store(head.wrapping_add(n), std::sync::atomic::Ordering::Release);
     n
 }
 
-/// 清空环缓冲（重启 AudioUnit 前调用，丢弃旧数据避免延迟回放）。
+/// 清空环缓冲（重启 `AudioUnit` 前调用，丢弃旧数据避免延迟回放）。
 fn ring_reset() {
     let r = ring();
     r.head.store(0, std::sync::atomic::Ordering::Relaxed);
     r.tail.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 消费（渲染回调）：读最多 dst.len() 个样本到 dst，返回实际读到的数量。
+/// 消费（渲染回调）：读最多 `dst.len()` 个样本到 dst，返回实际读到的数量。
 fn ring_pop(dst: &mut [f32]) -> usize {
     let r = ring();
     let head = r.head.load(std::sync::atomic::Ordering::Acquire);
@@ -245,7 +250,8 @@ fn ring_pop(dst: &mut [f32]) -> usize {
     for i in 0..n {
         dst[i] = buf[(tail + i) & r.mask];
     }
-    r.tail.store(tail.wrapping_add(n), std::sync::atomic::Ordering::Release);
+    r.tail
+        .store(tail.wrapping_add(n), std::sync::atomic::Ordering::Release);
     n
 }
 
@@ -254,27 +260,36 @@ static AUDIO_LOG: Mutex<Option<LogFn>> = Mutex::new(None);
 
 /// 设置音频日志回调（UI 用它把状态打到底部日志区）；None 时退回 eprintln。
 pub fn set_log_cb(cb: Option<LogFn>) {
-    *AUDIO_LOG.lock().unwrap_or_else(|e| e.into_inner()) = cb;
+    *AUDIO_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cb;
 }
 
 fn alog(msg: impl AsRef<str>) {
-    let s = msg.as_ref().to_string();
-    // 诊断：同时落盘 /tmp/vdev-audio-push.log（音频推流状态排查用）
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let s = msg.as_ref().to_string();
+    // 诊断：同时落盘 /tmp/vdev-audio-push.log（音频推流状态排查用）
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true).mode(0o666);
     if let Ok(mut f) = opts.open("/tmp/vdev-audio-push.log") {
         let _ = writeln!(f, "[{}] {}", std::process::id(), s);
     }
-    if let Some(cb) = AUDIO_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    if let Some(cb) = AUDIO_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
         cb(s);
     } else {
-        eprintln!("{}", s);
+        eprintln!("{s}");
     }
 }
 
-// 渲染回调（实时线程）：拉 n 帧 x 2ch 交错 f32，环空补静音（零分配、零加锁）
+// 渲染回调（实时线程）：拉 n 帧 x 2ch 交错 f32，环空补静音（零分配、零加锁）。
+// 有意不包 catch_unwind：实时音频线程不宜捕获 panic——回调返回后 CoreAudio
+// 管线状态已不可信，且捕获本身可能分配/引入尾延迟；作为补偿，锁访问全部
+// 用中毒安全形式（into_inner），保证一次 panic 不会连锁成二次 panic。
 extern "C" fn render_cb(
     _in_ref_con: *mut c_void,
     _io_action_flags: *mut AudioUnitRenderingActionFlags,
@@ -288,47 +303,57 @@ extern "C" fn render_cb(
     if io_data.is_null() {
         return 0;
     }
-    unsafe {
-        let abl = &*io_data;
-        CB_NBUFS.compare_exchange(
-            0,
-            abl.m_number_buffers,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ).ok();
-        if abl.m_number_buffers > 0 {
-            CB_DATA_SIZE.compare_exchange(
+    // SAFETY：渲染回调契约保证 io_data 非空时指向有效的 AudioBufferList
+    let abl = unsafe { &*io_data };
+    {
+        CB_NBUFS
+            .compare_exchange(
                 0,
-                abl.m_buffers[0].m_data_byte_size,
+                abl.m_number_buffers,
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-            ).ok();
+            )
+            .ok();
+        if abl.m_number_buffers > 0 {
+            CB_DATA_SIZE
+                .compare_exchange(
+                    0,
+                    abl.m_buffers[0].m_data_byte_size,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .ok();
         }
-        CB_FRAMES.compare_exchange(
-            0,
-            in_number_frames,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ).ok();
+        CB_FRAMES
+            .compare_exchange(
+                0,
+                in_number_frames,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .ok();
         if abl.m_number_buffers == 0 || abl.m_buffers[0].m_data.is_null() {
             return 0;
         }
         let cap_bytes = abl.m_buffers[0].m_data_byte_size as usize;
         let write_samples = samples.min(cap_bytes / 4);
-        let dst = std::slice::from_raw_parts_mut(
-            abl.m_buffers[0].m_data as *mut f32,
-            write_samples,
-        );
+        // SAFETY：m_data 指向宿主提供的 write_samples×4 字节可写交错缓冲
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(abl.m_buffers[0].m_data.cast::<f32>(), write_samples)
+        };
         // 隔离测试：直接生成 440Hz 正弦（绕过环/解码），定位爆音来源
         if TEST_SINE.load(std::sync::atomic::Ordering::Relaxed) {
             let step = 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32;
-            let mut ph = *SINE_PHASE.lock().unwrap_or_else(|e| e.into_inner());
-            for i in 0..write_samples {
-                let v = (ph + i as f32 * step).sin() * 0.5;
-                dst[i] = v;
+            let mut ph = *SINE_PHASE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (i, d) in dst[..write_samples].iter_mut().enumerate() {
+                *d = (ph + i as f32 * step).sin() * 0.5;
             }
             ph = (ph + write_samples as f32 * step) % (2.0 * std::f32::consts::PI);
-            *SINE_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = ph;
+            *SINE_PHASE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ph;
             return 0;
         }
         let n = ring_pop(dst);
@@ -342,70 +367,75 @@ extern "C" fn render_cb(
 
 // 找名字包含 keyword 的音频设备 ID（vdev-audio / BlackHole 等）。
 fn find_device_id(keyword: &str) -> Option<u32> {
-    unsafe {
-        let addr = AudioObjectPropertyAddress {
-            m_selector: K_HW_PROP_DEVICES,
-            m_scope: K_OBJ_SCOPE_GLOBAL,
-            m_element: K_OBJ_ELEMENT_MAIN,
-        };
-        let mut size: u32 = 0;
-        let rc = AudioObjectGetPropertyDataSize(
+    let addr = AudioObjectPropertyAddress {
+        m_selector: K_HW_PROP_DEVICES,
+        m_scope: K_OBJ_SCOPE_GLOBAL,
+        m_element: K_OBJ_ELEMENT_MAIN,
+    };
+    let mut size: u32 = 0;
+    // SAFETY：设备枚举为只读查询，size/ids 为本函数持有的可写缓冲
+    let rc = unsafe {
+        AudioObjectGetPropertyDataSize(
             K_AUDIO_OBJECT_SYSTEM,
-            &addr,
+            &raw const addr,
             0,
             std::ptr::null(),
-            &mut size,
-        );
-        if rc != 0 {
-            return None;
-        }
-        let count = size as usize / std::mem::size_of::<u32>();
-        let mut ids = vec![0u32; count];
-        if AudioObjectGetPropertyData(
+            &raw mut size,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let count = size as usize / std::mem::size_of::<u32>();
+    let mut ids = vec![0u32; count];
+    if unsafe {
+        AudioObjectGetPropertyData(
             K_AUDIO_OBJECT_SYSTEM,
-            &addr,
+            &raw const addr,
             0,
             std::ptr::null(),
-            &mut size,
-            ids.as_mut_ptr() as *mut c_void,
-        ) != 0
-        {
-            return None;
-        }
-        let name_addr = AudioObjectPropertyAddress {
-            m_selector: K_DEV_PROP_NAME_CFSTRING,
-            m_scope: K_OBJ_SCOPE_GLOBAL,
-            m_element: K_OBJ_ELEMENT_MAIN,
-        };
-        for id in ids {
-            // 返回 CFStringRef（与 NSString toll-free 桥接），需要释放
-            let mut name_ref: *mut c_void = std::ptr::null_mut();
-            let mut nsize = std::mem::size_of::<*mut c_void>() as u32;
-            if AudioObjectGetPropertyData(
+            &raw mut size,
+            ids.as_mut_ptr().cast::<c_void>(),
+        )
+    } != 0
+    {
+        return None;
+    }
+    let name_addr = AudioObjectPropertyAddress {
+        m_selector: K_DEV_PROP_NAME_CFSTRING,
+        m_scope: K_OBJ_SCOPE_GLOBAL,
+        m_element: K_OBJ_ELEMENT_MAIN,
+    };
+    for id in ids {
+        // 返回 CFStringRef（与 NSString toll-free 桥接），需要释放
+        let mut name_ref: *mut c_void = std::ptr::null_mut();
+        let mut nsize = std::mem::size_of::<*mut c_void>() as u32;
+        if unsafe {
+            AudioObjectGetPropertyData(
                 id,
-                &name_addr,
+                &raw const name_addr,
                 0,
                 std::ptr::null(),
-                &mut nsize,
-                &mut name_ref as *mut *mut c_void as *mut c_void,
-            ) == 0 && !name_ref.is_null()
-            {
-                let ns = name_ref as *const NSString;
-                let name = unsafe { Retained::retain(ns as *mut NSString) }
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                // 释放 CFString（API 返回 +1）
-                unsafe {
-                    let _: () = msg_send![&*ns, release];
-                }
-                if name.to_lowercase().contains(&keyword.to_lowercase()) {
-                    return Some(id);
-                }
-            } else {
+                &raw mut nsize,
+                (&raw mut name_ref).cast::<c_void>(),
+            )
+        } == 0
+            && !name_ref.is_null()
+        {
+            let ns = name_ref as *const NSString;
+            let name = unsafe { Retained::retain(ns.cast_mut()) }
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            // 释放 CFString（API 返回 +1）
+            // SAFETY：ns 非空时指向 CFString（toll-free桥接 NSString）
+            let ns_ref: &NSString = unsafe { &*ns };
+            let _: () = unsafe { msg_send![ns_ref, release] };
+            if name.to_lowercase().contains(&keyword.to_lowercase()) {
+                return Some(id);
             }
         }
-        None
     }
+    None
 }
 
 /// 检测 vdev-audio 虚拟声卡是否已安装（系统音频设备里名字包含 vdev-audio）。
@@ -416,11 +446,11 @@ pub fn find_vdev_audio() -> bool {
 fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
     let desc = AudioStreamBasicDescription {
         m_sample_rate: SAMPLE_RATE,
-        m_format_id: 0x6c70636d, // kAudioFormatLinearPCM 'lpcm'
-        m_format_flags: 0x09,    // kAudioFormatFlagIsFloat(1) | kAudioFormatFlagIsPacked(8)
-        m_bytes_per_packet: (CHANNELS * 4) as u32,
+        m_format_id: 0x6c70_636d, // kAudioFormatLinearPCM 'lpcm'
+        m_format_flags: 0x09,     // kAudioFormatFlagIsFloat(1) | kAudioFormatFlagIsPacked(8)
+        m_bytes_per_packet: (CHANNELS * 4),
         m_frames_per_packet: 1,
-        m_bytes_per_frame: (CHANNELS * 4) as u32,
+        m_bytes_per_frame: (CHANNELS * 4),
         m_channels_per_frame: CHANNELS,
         m_bits_per_channel: 32,
         m_reserved: 0,
@@ -431,17 +461,17 @@ fn set_stream_format(unit: *mut OpaqueAudioComponentInstance) -> Result<()> {
             K_AUDIO_UNIT_PROP_STREAM_FORMAT,
             K_AUDIO_UNIT_SCOPE_INPUT,
             0,
-            &desc as *const AudioStreamBasicDescription as *const c_void,
+            (&raw const desc).cast::<c_void>(),
             std::mem::size_of::<AudioStreamBasicDescription>() as u32,
         )
     };
     if rc != 0 {
-        return Err(anyhow!("AudioUnitSetProperty(StreamFormat) 失败 rc={}", rc));
+        return Err(anyhow!("AudioUnitSetProperty(StreamFormat) 失败 rc={rc}"));
     }
     Ok(())
 }
 
-/// 启动视频音频推流：解音轨 → vdev-audio（后台线程，随 crate::VIDEO_STOP 停止）。
+/// 启动视频音频推流：解音轨 → vdev-audio（后台线程，随 `crate::VIDEO_STOP` 停止）。
 /// 返回是否成功启动（无音轨/无虚拟声卡则 false）。
 pub fn start_audio_push(path: &str) -> bool {
     let path = path.to_string();
@@ -453,30 +483,42 @@ pub fn start_audio_push(path: &str) -> bool {
         alog("音频推流: 未找到虚拟声卡（vdev-audio/BlackHole），跳过——请先安装 vdev-audio 驱动");
         return false;
     };
-    alog(format!("音频推流: 使用设备 {} 播放视频音轨", dev_id));
+    alog(format!("音频推流: 使用设备 {dev_id} 播放视频音轨"));
     std::thread::spawn(move || {
         let _ = run_audio(&path, dev_id);
     });
     true
 }
 
+// 线性解码→推流序列：步骤间共享 reader/track 状态，拆分反而要传一堆中间值。
+#[allow(clippy::too_many_lines)]
 fn run_audio(path: &str, dev_id: u32) -> bool {
+    #[repr(C)]
+    struct AURenderCallbackStruct {
+        input_proc: *const c_void,
+        input_proc_ref_con: *mut c_void,
+    }
     // 1) 打开 asset + 音频轨
     let asset = unsafe {
-        let url = NSURL::fileURLWithPath_isDirectory_relativeToURL(&NSString::from_str(path), false, None);
+        let url = NSURL::fileURLWithPath_isDirectory_relativeToURL(
+            &NSString::from_str(path),
+            false,
+            None,
+        );
         AVURLAsset::URLAssetWithURL_options(&url, None)
     };
-    let tracks = unsafe { asset.tracksWithMediaType(objc2_av_foundation::AVMediaTypeAudio.unwrap()) };
+    // tracksWithMediaType 已废弃但同步 API 仍是本路径最简形态；
+    // 换 loadTracksWithMediaType:completionHandler: 需引入回调状态机，保持现状。
+    #[allow(deprecated)]
+    let tracks =
+        unsafe { asset.tracksWithMediaType(objc2_av_foundation::AVMediaTypeAudio.unwrap()) };
     let Some(track) = tracks.firstObject() else {
         alog("音频推流: 视频没有音轨，跳过");
         return false;
     };
-    let reader = match unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) } {
-        Ok(r) => r,
-        Err(_) => {
-            alog("音频推流: AVAssetReader 创建失败");
-            return false;
-        }
+    let Ok(reader) = (unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }) else {
+        alog("音频推流: AVAssetReader 创建失败");
+        return false;
     };
 
     // 简化为用 kAudioFormatLinearPCM 相关键（AVFormatIDKey）避免复杂：
@@ -493,7 +535,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         ]);
     let vals: Retained<objc2_foundation::NSArray<AnyObject>> =
         objc2_foundation::NSArray::from_retained_slice(&[
-            objc2_foundation::NSNumber::numberWithUnsignedInt(0x6c70636d).into(), // kAudioFormatLinearPCM
+            objc2_foundation::NSNumber::numberWithUnsignedInt(0x6c70_636d).into(), // kAudioFormatLinearPCM
             objc2_foundation::NSNumber::numberWithInt(48_000).into(),
             objc2_foundation::NSNumber::numberWithInt(2).into(),
             objc2_foundation::NSNumber::numberWithInt(32).into(),
@@ -508,12 +550,17 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             forKeys: &*keys
         ]
     };
-    let desc: Retained<NSString> = unsafe { msg_send![&*dict, description] };
+    let _desc: Retained<NSString> = unsafe { msg_send![&*dict, description] };
     let output = unsafe {
-        AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(&*track, Some(&*dict))
+        AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
+            &track,
+            Some(&*dict),
+        )
     };
-    let odesc: Retained<NSString> = unsafe { msg_send![&*output, description] };
-    unsafe { reader.addOutput(&output); }
+    let _odesc: Retained<NSString> = unsafe { msg_send![&*output, description] };
+    unsafe {
+        reader.addOutput(&output);
+    }
     if !unsafe { reader.startReading() } {
         alog("音频推流: startReading 失败");
         return false;
@@ -527,34 +574,37 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         component_flags: 0,
         component_flags_mask: 0,
     };
-    let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &desc) };
+    let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &raw const desc) };
     if comp.is_null() {
         alog("音频推流: 找不到 HALOutput AudioUnit");
         return false;
     }
     let mut unit: *mut OpaqueAudioComponentInstance = std::ptr::null_mut();
-    if unsafe { AudioComponentInstanceNew(comp, &mut unit) } != 0 || unit.is_null() {
+    if unsafe { AudioComponentInstanceNew(comp, &raw mut unit) } != 0 || unit.is_null() {
         alog("音频推流: AudioComponentInstanceNew 失败");
         return false;
     }
     // 纯输出单元：显式启用 output element 0、禁用 input element 1
     let enable: u32 = 1;
     let disable: u32 = 0;
+    // SAFETY：unit 由 AudioComponentInstanceNew 创建，属性写入按 CoreAudio 契约
     unsafe {
         AudioUnitSetProperty(
             unit,
             K_OUTPUT_UNIT_PROP_ENABLE_IO,
             K_AUDIO_UNIT_SCOPE_OUTPUT, // 2
             0,
-            &enable as *const u32 as *const c_void,
+            (&raw const enable).cast::<c_void>(),
             4,
         );
+    }
+    unsafe {
         AudioUnitSetProperty(
             unit,
             K_OUTPUT_UNIT_PROP_ENABLE_IO,
             K_AUDIO_UNIT_SCOPE_INPUT,
             1,
-            &disable as *const u32 as *const c_void,
+            (&raw const disable).cast::<c_void>(),
             4,
         );
     }
@@ -569,7 +619,7 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             K_OUTPUT_UNIT_PROP_CURRENT_DEVICE,
             K_AUDIO_UNIT_SCOPE_GLOBAL,
             0,
-            &dev_id as *const u32 as *const c_void,
+            (&raw const dev_id).cast::<c_void>(),
             4,
         )
     } != 0
@@ -581,11 +631,6 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         return false;
     }
     // 渲染回调（AURenderCallbackStruct）
-    #[repr(C)]
-    struct AURenderCallbackStruct {
-        input_proc: *const c_void,
-        input_proc_ref_con: *mut c_void,
-    }
     let cb = AURenderCallbackStruct {
         input_proc: render_cb as *const c_void,
         input_proc_ref_con: std::ptr::null_mut(),
@@ -596,12 +641,12 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             K_AUDIO_UNIT_PROP_SET_RENDER_CB,
             K_AUDIO_UNIT_SCOPE_INPUT,
             0,
-            &cb as *const AURenderCallbackStruct as *const c_void,
+            (&raw const cb).cast::<c_void>(),
             std::mem::size_of::<AURenderCallbackStruct>() as u32,
         )
     };
     if rc != 0 {
-        alog(format!("音频推流: SetRenderCallback 失败 rc={}", rc));
+        alog(format!("音频推流: SetRenderCallback 失败 rc={rc}"));
         return false;
     }
     if std::env::var("VDEV_TEST_SINE").is_ok() {
@@ -619,15 +664,15 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         }
         let sample: *mut AnyObject = unsafe { msg_send![&*output, copyNextSampleBuffer] };
         if sample.is_null() {
-            let status: i64 = unsafe { msg_send![&*reader, status] };
+            let _status: i64 = unsafe { msg_send![&*reader, status] };
             break;
         }
         // CF 对象不能发 ObjC 消息，用 C API 取 AudioBufferList（blockBufferOut 必须非空）
         let mut size_needed: usize = 0;
-        let rc1 = unsafe {
+        let _rc1 = unsafe {
             CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-                sample as *mut c_void,
-                &mut size_needed,
+                sample.cast::<c_void>(),
+                &raw mut size_needed,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null(),
@@ -636,51 +681,65 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
                 std::ptr::null_mut(),
             )
         };
-        let mut storage = vec![
-            0u8;
-            size_needed.max(std::mem::size_of::<AudioBufferList>())
-        ];
-        let abl = storage.as_mut_ptr() as *mut AudioBufferList;
+        let mut storage = vec![0u8; size_needed.max(std::mem::size_of::<AudioBufferList>())];
+        // 对齐说明：macOS 系分配器最小对齐 16B，≥ AudioBufferList 所需 8B，
+        // u8 向量存储按整缓冲对齐使用是安全的（clippy::cast_ptr_alignment 静态存疑故标注）
+        #[allow(clippy::cast_ptr_alignment)]
+        let abl = storage.as_mut_ptr().cast::<AudioBufferList>();
         let mut block_buf: *mut c_void = std::ptr::null_mut();
         let rc2 = unsafe {
             CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-                sample as *mut c_void,
-                &mut size_needed,
+                sample.cast::<c_void>(),
+                &raw mut size_needed,
                 abl,
                 size_needed,
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                &mut block_buf,
+                &raw mut block_buf,
             )
         };
         if !block_buf.is_null() {
-            unsafe { CFRelease(block_buf as *const c_void); }
+            unsafe {
+                CFRelease(block_buf.cast_const());
+            }
         }
-        if rc2 == 0 && unsafe { (*abl).m_number_buffers } > 0
+        if rc2 == 0
+            && unsafe { (*abl).m_number_buffers } > 0
             && unsafe { (*abl).m_buffers[0].m_data_byte_size } > 0
             && !unsafe { (*abl).m_buffers[0].m_data }.is_null()
         {
             let n = unsafe { ((*abl).m_buffers[0].m_data_byte_size as usize) / 4 };
-            let src = unsafe {
-                std::slice::from_raw_parts((*abl).m_buffers[0].m_data as *const f32, n)
-            };
+            // SAFETY：m_data 已校验非空，按 m_data_byte_size/4 个 f32 读取
+            let data_ptr = unsafe { (*abl).m_buffers[0].m_data } as *const f32;
+            let src = unsafe { std::slice::from_raw_parts(data_ptr, n) };
             // 先等有足够空间再整块推入（不丢样本，避免爆音）。
             // 自愈：如果 ring 持续满（渲染端不消费，通常是被设备切换打断的 AudioUnit），
             // 超过 2s 就重启 AudioUnit 并清空环，避免永久静音。
             while ring_free() < src.len() {
+                // 内层必须也查 VIDEO_STOP：停止推流后渲染端永久不消费，
+                // 不查会陷入「每 2s 重启 AudioUnit」的自愈死循环，线程永不退出
+                if crate::VIDEO_STOP.load(Ordering::SeqCst) {
+                    break;
+                }
                 if stall_start.is_none() {
                     stall_start = Some(std::time::Instant::now());
                 }
                 if stall_start.unwrap().elapsed() >= std::time::Duration::from_secs(2) {
                     restarts += 1;
-                    alog(format!("音频推流: 输出端疑似卡死（{restarts} 次），重启 AudioUnit…"));
+                    alog(format!(
+                        "音频推流: 输出端疑似卡死（{restarts} 次），重启 AudioUnit…"
+                    ));
                     if unit_started {
-                        unsafe { AudioOutputUnitStop(unit); }
+                        unsafe {
+                            AudioOutputUnitStop(unit);
+                        }
                     }
                     ring_reset();
                     if unit_started {
-                        unsafe { AudioOutputUnitStart(unit); }
+                        unsafe {
+                            AudioOutputUnitStart(unit);
+                        }
                     }
                     stall_start = None;
                 }
@@ -693,7 +752,9 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
             pushed += written;
             if std::env::var("VDEV_AUDIO_DUMP").is_ok() {
                 use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
                     .open("/tmp/vdev-decoded.pcm")
                 {
                     let bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -715,12 +776,12 @@ fn run_audio(path: &str, dev_id: u32) -> bool {
         }
     }
     if unit_started {
-        unsafe { AudioOutputUnitStop(unit); }
+        unsafe {
+            AudioOutputUnitStop(unit);
+        }
     }
-    unsafe {
-        AudioUnitUninitialize(unit);
-        AudioComponentInstanceDispose(unit);
-    }
+    unsafe { AudioUnitUninitialize(unit) };
+    unsafe { AudioComponentInstanceDispose(unit) };
     let ur = UNDERRUNS.load(std::sync::atomic::Ordering::Relaxed);
     let nb = CB_NBUFS.load(std::sync::atomic::Ordering::Relaxed);
     let ds = CB_DATA_SIZE.load(std::sync::atomic::Ordering::Relaxed);

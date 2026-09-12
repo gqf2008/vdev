@@ -1,20 +1,22 @@
 //! vdev-spike-host：激活 spike 扩展的最小宿主。
-//! 只做一件事：对 com.vdev.camera.ext.spike 提交 OSSystemExtensionRequest 激活，
+//! 只做一件事：对 com.vdev.camera.ext.spike 提交 `OSSystemExtensionRequest` 激活，
 //! 然后转 runloop 等用户批准（120s）。
 
 use dispatch2::{DispatchObject, DispatchQueue};
 use objc2::define_class;
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::ClassType;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
+use objc2::ClassType;
 use objc2_foundation::{NSInteger, NSString};
 use std::ffi::{c_void, CString};
 use std::sync::{Mutex, OnceLock};
 
 const SPIKE_BUNDLE_ID: &str = "com.vdev.camera.ext.spike";
 
-static CALLBACK: OnceLock<Mutex<Option<Box<dyn FnMut(String) + Send>>>> = OnceLock::new();
+/// 拆出类型别名，避免 clippy `type_complexity` 警告。
+type HostCallback = Box<dyn FnMut(String) + Send>;
+static CALLBACK: OnceLock<Mutex<Option<HostCallback>>> = OnceLock::new();
 static DELEGATE_PTR: Mutex<usize> = Mutex::new(0);
 static REQUEST_PTR: Mutex<usize> = Mutex::new(0);
 static SYSEXT_QUEUE: OnceLock<usize> = OnceLock::new();
@@ -35,8 +37,11 @@ extern "C" {}
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFRunLoopDefaultMode: *const c_void;
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: bool)
-        -> i32;
+    fn CFRunLoopRunInMode(
+        mode: *const c_void,
+        seconds: f64,
+        return_after_source_handled: bool,
+    ) -> i32;
 }
 
 fn class(name: &str) -> &'static AnyClass {
@@ -49,7 +54,7 @@ fn fire(msg: String) {
     if let Some(cb) = CALLBACK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_mut()
     {
         cb(msg);
@@ -87,7 +92,7 @@ define_class!(
 
         #[unsafe(method(request:didFinishWithResult:))]
         fn did_finish(&self, _req: &AnyObject, result: NSInteger) {
-            fire(format!("完成 result={}", result));
+            fire(format!("完成 result={result}"));
         }
 
         #[unsafe(method(request:didFailWithError:))]
@@ -98,7 +103,9 @@ define_class!(
 );
 
 fn ensure_delegate() -> *mut AnyObject {
-    let mut p = DELEGATE_PTR.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = DELEGATE_PTR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if *p == 0 {
         let obj: *mut AnyObject = unsafe { msg_send![SysextDelegate::class(), new] };
         *p = obj as usize;
@@ -115,12 +122,12 @@ fn main() {
         .find(|a| !a.starts_with('-') && a.as_str() != args[0].as_str())
         .cloned()
         .unwrap_or_else(|| SPIKE_BUNDLE_ID.to_string());
-    println!("spike-host: 提交{}请求 {}", if deactivate { "停用" } else { "激活" }, bundle_id);
+    println!(
+        "spike-host: 提交{}请求 {bundle_id}",
+        if deactivate { "停用" } else { "激活" }
+    );
 
-    *CALLBACK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap() = Some(Box::new(|_| {}));
+    *CALLBACK.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(Box::new(|_| {}));
 
     let delegate = ensure_delegate();
     let manager = class("OSSystemExtensionManager");
@@ -132,19 +139,27 @@ fn main() {
 
     let req_cls = class("OSSystemExtensionRequest");
     let id = NSString::from_str(&bundle_id);
-    let req: *mut AnyObject = unsafe {
-        msg_send![req_cls, activationRequestForExtension: &*id, queue: sysext_queue()]
+    // SAFETY: req_cls/id 为合法 ObjC 类与字符串对象，queue 为进程生命周期持有的
+    // dispatch queue；selector 按 Apple 文档二选一（激活/停用请求）。
+    // 无法单测：OSSystemExtensionManager 请求依赖真实系统扩展框架与用户授权流程。
+    let req: *mut AnyObject = if deactivate {
+        // 停用必须走 deactivationRequestForExtension:queue:——此前无条件提交
+        // 激活请求，--deactivate 只影响了打印文案，实际从未停用
+        unsafe { msg_send![req_cls, deactivationRequestForExtension: &*id, queue: sysext_queue()] }
+    } else {
+        unsafe { msg_send![req_cls, activationRequestForExtension: &*id, queue: sysext_queue()] }
     };
     if req.is_null() {
         eprintln!("spike-host: 创建 OSSystemExtensionRequest 失败");
         std::process::exit(1);
     }
-    let req: *mut AnyObject = unsafe { msg_send![&*req, retain] };
-    unsafe {
-        let _: () = msg_send![&*req, setDelegate: &*delegate];
-        let _: () = msg_send![&*shared, submitRequest: &*req];
-    }
-    *REQUEST_PTR.lock().unwrap_or_else(|e| e.into_inner()) = req as usize;
+    let req: *mut AnyObject = unsafe { msg_send![req, retain] };
+    // SAFETY: req/shared 为刚创建并 retain 的对象指针，ObjC 消息逐条发送
+    let _: () = unsafe { msg_send![req, setDelegate: delegate] };
+    let _: () = unsafe { msg_send![shared, submitRequest: req] };
+    *REQUEST_PTR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = req as usize;
 
     // 打开系统设置（相机扩展页）
     let _ = std::process::Command::new("open")

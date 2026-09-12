@@ -16,3 +16,19 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/gqf2008/vdev"
+
+# 与 vdev-audio-win / vdev-display-win 两个子工作区的既有档位对齐：
+# unsafe 纪律 deny，pedantic 仅 warn（由 CI 的 `-D warnings` 收口）。
+# multiple_unsafe_ops_per_block 用 warn 而非 windows 侧的 deny：
+# 既有 objc2 代码习惯把一组 setter 消息放在同一 unsafe 块，直接 deny 会在
+# 并行修复期间大面积硬报错。
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+multiple_unsafe_ops_per_block = "warn"
+ignored_unit_patterns = "allow"
+missing_errors_doc = "allow"
+module_inception = "allow"
+module_name_repetitions = "allow"
