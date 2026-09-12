@@ -16,7 +16,7 @@ use windows::Win32::Media::DirectShow::{
 };
 use windows::Win32::Media::IReferenceClock;
 use windows::Win32::System::Com::{IPersist, IPersist_Impl};
-use windows_core::{implement, Error, Ref, GUID, PCWSTR, PWSTR};
+use windows_core::{implement, Error, Interface, Ref, GUID, PCWSTR, PWSTR};
 
 use super::pin::{OutputPin, PinInner};
 use super::streaming::{self, StreamThread};
@@ -39,6 +39,19 @@ enum FilterStateInternal {
 ///
 /// SAFETY 说明：DirectShow MTA 下 COM 接口（IBaseFilter/IFilterGraph/IReferenceClock）
 /// 允许跨线程访问；内部所有共享状态均受 Mutex/原子保护。
+///
+/// 所有权模型（修 B2 COM 自引用环，无法在 macOS 宿主单测——需 Windows COM
+/// 运行时；生命周期推演如下，随 Windows 侧 selftest 验证）：
+/// - 过滤器 COM 对象（F）持有 `Arc<FilterInner>`（FI）；
+/// - FI 持有输出 pin COM 对象的**初始强引用**（`pin_com`）⇒ pin 的存活期 ≤ F；
+/// - FI 只以**弱引用**回看自身 COM 对象（`self_base: Weak<IBaseFilter>`），
+///   pin 只以弱引用回看自身（`PinInner::self_pin: Weak<IPin>`）与 owner
+///   （`PinInner::filter: Weak<FilterInner>`）；
+/// - 强引用链无环：F → FI → pin(强) → PI；PI → FI/pin 均为弱。外部引用
+///   （图/调用方）全部释放后 F 引用计数归零 → F 析构 → 释放 FI → FI 释放
+///   pin 强引用 → pin 析构 → 释放 PI，全部可回收（原实现 filter/pin 各自
+///   缓存自身接口的强引用，引用计数永不归零，Stop 后不析构）；
+/// - 弱引用 upgrade 失败即对象正在析构 → 返回错误/空指针，不悬垂。
 pub struct FilterInner {
     name: Mutex<Vec<u16>>,
     graph: Mutex<Option<IFilterGraph>>,
@@ -46,19 +59,30 @@ pub struct FilterInner {
     clock: Mutex<Option<IReferenceClock>>,
     /// 输出 pin。
     pub pin: Arc<PinInner>,
+    /// 输出 pin COM 对象的初始强引用（过滤器持有；pin 自身与 FilterInner 均
+    /// 只存弱引用，见结构体文档所有权模型）。
+    pin_com: Mutex<Option<IPin>>,
     /// 共享帧通道（消费者端）。
     pub channel: Arc<SharedFrameChannel>,
     stream: Mutex<Option<StreamThread>>,
-    /// 自身 `IBaseFilter`（供 `QueryFilterInfo` / pin 的 `QueryPinInfo` 返回）。
-    self_base: Mutex<Option<IBaseFilter>>,
+    /// 自身 `IBaseFilter` 的**弱引用**（供 `QueryFilterInfo` / pin 的
+    /// `QueryPinInfo` 返回；析构中 upgrade 失败 → pFilter=null，不悬垂）。
+    self_base: Mutex<Option<windows_core::Weak<IBaseFilter>>>,
     /// 已交付帧计数（自测/调试用）。
     pub frames_delivered: AtomicU64,
 }
 
 impl FilterInner {
-    /// 返回缓存的自身 IBaseFilter（供 QueryFilterInfo / QueryPinInfo 使用）。
+    /// 返回缓存的自身 IBaseFilter 强引用（弱引用 upgrade）。
+    ///
+    /// 过滤器 COM 对象正在析构（外部强引用已归零）时返回 `None`——调用方
+    /// （pin 的 `QueryPinInfo`）相应写 null pFilter，DirectShow 允许调用方判空。
     pub(crate) fn self_base_owned(&self) -> Option<IBaseFilter> {
-        self.self_base.lock().unwrap().clone()
+        self.self_base
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(windows_core::Weak::upgrade)
     }
 }
 
@@ -74,6 +98,7 @@ impl FilterInner {
             state: Mutex::new(FilterStateInternal::Stopped),
             clock: Mutex::new(None),
             pin: Arc::new(PinInner::unattached()),
+            pin_com: Mutex::new(None),
             channel,
             stream: Mutex::new(None),
             self_base: Mutex::new(None),
@@ -84,7 +109,10 @@ impl FilterInner {
             inner: inner.pin.clone(),
         };
         let ipin: IPin = pin_obj.into();
-        inner.pin.set_self_pin(ipin);
+        inner.pin.set_self_pin(&ipin);
+        // pin 的初始强引用由过滤器持有（pin 自身只存弱引用，见 FilterInner
+        // 所有权模型）；此后 pin 存活期 ≤ 过滤器。
+        *inner.pin_com.lock().unwrap() = Some(ipin);
         // 把 pin 挂到过滤器（Weak，避免循环强引用）。
         *inner.pin.filter.lock().unwrap() = Some(Arc::downgrade(&inner));
         inner
@@ -107,7 +135,13 @@ pub fn create_filter_with_inner() -> windows_core::Result<(IBaseFilter, Arc<Filt
         inner: inner.clone(),
     };
     let base: IBaseFilter = obj.into();
-    *inner.self_base.lock().unwrap() = Some(base.clone());
+    // 修 B2：自缓存 IBaseFilter 改存**弱引用**。原实现 clone 强引用（windows_core
+    // 显式 AddRef）→ 过滤器引用计数含 1 个自引用，外部全部释放后仍停在 1，
+    // 永不析构（泄漏）。弱引用不参与强计数；析构中 upgrade 失败 → 返回 None。
+    // `#[implement]` 生成的对象必然支持 IWeakReferenceSource（WeakRefCount
+    // 无条件处理该 IID），downgrade 实际不会失败；万一失败则 QueryPinInfo
+    // 退化为 null pFilter（安全降级，不悬垂）。
+    *inner.self_base.lock().unwrap() = base.downgrade().ok();
     Ok((base, inner))
 }
 
@@ -275,6 +309,16 @@ impl VirtualCameraFilter {
     fn stop_streaming(&self) {
         let mut guard = self.inner.stream.lock().unwrap();
         if let Some(mut t) = guard.take() {
+            // 修 M1（顺序不变式，推演）：必须「先停线程（信号 + join），后
+            // Decommit」。`t.stop()` 返回时推流线程已死，其最后一轮
+            // GetBuffer / GetPointer / deliver_sample / Receive 均已结束——
+            // 因此下一步 Decommit（与 start_streaming 的 Commit 配对，对应
+            // CBaseOutputPin::Active/Inactive）时绝无线程再访问已 decommit 的
+            // 分配器内存。反序（先 Decommit）会让线程在 decommit 后仍可能进入
+            // 下一轮循环访问分配器状态，不取。
+            // 残余风险（有意接受）：线程可能阻塞在无超时的 GetBuffer 等下游释还
+            // 样本；DirectShow 全图 Stop 有顺序性（渲染器先停、样本释还），join
+            // 因此有界。
             t.stop();
             // 停止推流后释放分配器缓冲区（与 Commit 配对）。
             if let Some(conn) = self.inner.pin.connected() {

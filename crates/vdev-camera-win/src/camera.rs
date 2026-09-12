@@ -40,7 +40,9 @@ impl CameraServer {
 /// 32 位 DLL（`vdev_camera_win32.dll`）存在时才注册 32 位视图。
 ///
 /// 优先系统级（HKLM，需管理员），失败自动回退到当前用户级（HKCU，无需管理员，
-/// HKCR 合并视图同样可见）。模块路径取「当前可执行文件同目录下的 filter DLL」。
+/// HKCR 合并视图同样可见）。模块路径取「本模块（DLL/EXE）同目录下的 filter
+/// DLL」——regsvr32/LoadLibrary 宿主下即本 DLL 自身路径，CLI 下为 exe 同目录
+/// （见 [`crate::com::registry::module_file_path`]）。
 pub fn register_filter() -> Result<()> {
     let exe = module_file_path().context("get module path")?;
     let dir = Path::new(&exe)
@@ -60,21 +62,37 @@ pub fn register_filter() -> Result<()> {
 }
 
 /// 注销过滤器（清理 HKLM 与 HKCU 两个根的注册）。
+///
+/// 修 minor（错误不再被吞）：原实现 `let _ = delete_tree(..)` 恒返 `Ok(())`，
+/// `DllUnregisterServer` 因此恒返 S_OK。现聚合错误——任一视图删除失败即失败
+/// （`DllUnregisterServer` 返回失败码），但仍尽量删完所有视图再返回；键不
+/// 存在仍视为成功（见 [`delete_tree`]）。
 pub fn unregister_filter() -> Result<()> {
     let clsid = guid_string(&CLSID_VirtualCameraFilter);
     let cat = guid_string(&CLSID_VideoInputDeviceCategory);
     // 64 位视图（Software\Classes）与 32 位视图（Software\Classes\WOW6432Node）
     // × HKLM/HKCU 两个根，全部清理。
+    let mut first_err: Option<(String, std::io::Error)> = None;
     for (root, prefix) in [
         (HKEY_LOCAL_MACHINE, "Software\\Classes"),
         (HKEY_CURRENT_USER, "Software\\Classes"),
         (HKEY_LOCAL_MACHINE, "Software\\Classes\\WOW6432Node"),
         (HKEY_CURRENT_USER, "Software\\Classes\\WOW6432Node"),
     ] {
-        let _ = delete_tree(root, &format!("{prefix}\\CLSID\\{cat}\\Instance\\{clsid}"));
-        let _ = delete_tree(root, &format!("{prefix}\\CLSID\\{clsid}"));
+        for path in [
+            format!("{prefix}\\CLSID\\{cat}\\Instance\\{clsid}"),
+            format!("{prefix}\\CLSID\\{clsid}"),
+        ] {
+            if let Err(e) = delete_tree(root, &path) {
+                log::warn!("unregister: 删除 {path} 失败: {e}");
+                first_err.get_or_insert((path, e));
+            }
+        }
     }
-    Ok(())
+    match first_err {
+        Some((path, e)) => Err(anyhow!("注销未完全成功（{path}）: {e}")),
+        None => Ok(()),
+    }
 }
 
 /// 用显式 DLL 路径注册（64 位视图；32 位视图见 [`register_filter`]）。

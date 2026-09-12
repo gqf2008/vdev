@@ -11,6 +11,8 @@ use windows::Win32::System::Com::{
 };
 use windows_core::{implement, Interface, Ref, GUID, HRESULT};
 
+/// 通道读写的纯逻辑裁决（等待结果 / seqlock 读取；无 Windows 依赖，宿主可测）。
+pub(crate) mod channel_logic;
 pub mod registry;
 pub mod shm;
 

@@ -6,8 +6,13 @@
 
 use std::io;
 
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HMODULE,
+};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, KEY_ALL_ACCESS, REG_BINARY,
     REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -113,11 +118,34 @@ pub fn delete_tree(root: HKEY, path: &str) -> io::Result<()> {
     }
 }
 
+/// 模块地址锚点：位于本模块（DLL/EXE）内的静态符号。`GetModuleHandleExW`
+/// 以「模块内任意地址」反查所属模块句柄——regsvr32 / LoadLibrary 等宿主下
+/// 都能取到**本 DLL 自身**（`GetModuleFileNameW(None)` 取的是宿主 exe，
+/// 会把注册表 InprocServer32 写成宿主路径）。
+static MODULE_ANCHOR: u8 = 0;
+
 /// 当前模块（DLL/EXE）的完整路径。
+///
+/// 修 M3：原实现 `GetModuleFileNameW(None)`——`None` 语义是「当前进程的
+/// exe」，regsvr32 下恰好因调用方约定碰对，嵌进其他宿主（LoadLibrary 场景 /
+/// 64-32 双视图注册器）就会写错注册表路径。现以本模块内静态符号地址为锚
+/// （`GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`）取真句柄；
+/// `GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT` 表示只借用句柄、不增加
+/// 引用计数（因此不配对 FreeLibrary）。
 pub fn module_file_path() -> io::Result<String> {
+    let mut module = HMODULE::default();
+    // SAFETY: MODULE_ANCHOR 是模块内静态符号（地址恒有效）；module 为合法出参。
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(std::ptr::addr_of!(MODULE_ANCHOR).cast()),
+            &mut module,
+        )
+    }
+    .map_err(|e| io::Error::from_raw_os_error(e.code().0))?;
     let mut buf = vec![0u16; 2048];
     // SAFETY: buf 足够大，GetModuleFileNameW 写入后返回实际长度。
-    let len = unsafe { GetModuleFileNameW(None, &mut buf) };
+    let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) };
     if len == 0 {
         return Err(io::Error::last_os_error());
     }

@@ -223,7 +223,9 @@ pub fn render_pattern(out: &mut Vec<u8>, format: &VideoFormat, t: &mut f64) {
     *t += 1.0 / format.fps as f64;
     // 图案是 BGRA（4 字节/像素），不能用输出格式的 frame_size（YUY2 为 2 字节/像素）。
     out.resize(format.width as usize * format.height as usize * 4, 0);
-    for (i, px) in frame.data.chunks_exact(3).enumerate() {
+    // as_chunks::<3>()（clippy chunks_exact_to_as_chunks）：常量块大小用类型化切片，
+    // 语义与 chunks_exact(3) 完全一致。
+    for (i, px) in frame.data.as_chunks::<3>().0.iter().enumerate() {
         out[i * 4] = px[2]; // B
         out[i * 4 + 1] = px[1]; // G
         out[i * 4 + 2] = px[0]; // R

@@ -46,6 +46,9 @@ impl IEnumMediaTypes_Impl for MediaTypeEnum_Impl {
                         ppmediatypes
                             .add(i)
                             .write(media_type::alloc_media_type_copy(&mt));
+                        // 深拷贝已完成：释放临时 mt 的 pbFormat（CoTaskMem 块），
+                        // 否则每次枚举泄漏一个 VIDEOINFOHEADER（修 minor 泄漏）。
+                        media_type::free_format(&mt);
                         *idx += 1;
                         fetched += 1;
                     }

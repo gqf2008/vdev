@@ -23,6 +23,11 @@ use windows::Win32::System::Threading::{
 };
 use windows_core::PCWSTR;
 
+use super::channel_logic::{
+    judge_lock_wait, judge_seqlock_read, LockWaitVerdict, SeqlockVerdict, LOCK_WAIT_MS,
+    MAX_SEQLOCK_ATTEMPTS,
+};
+
 /// 命名共享内存。
 pub const SHM_NAME: &str = "Local\\vdev-camera-win-frames";
 /// 命名事件（新帧信号）。
@@ -199,12 +204,30 @@ impl SharedFrameChannel {
 
         // 跨进程互斥：多个生产者（CLI push / GUI 推流）并发写双缓冲时必须互斥，
         // 否则数据竞争（Rust unsafe 下为 UB，可能卡死/画面错乱）。
-        // SAFETY: publish_lock 有效；等待持锁。
-        let lock = unsafe { WaitForSingleObject(self.publish_lock, u32::MAX) };
-        if lock != WAIT_OBJECT_0 {
-            return Err(io::Error::other(format!(
-                "publish lock wait failed: {lock:?}"
-            )));
+        // 修 B1：INFINITE 改为有界等待（LOCK_WAIT_MS）——正常持锁
+        // 窗口是微秒级 memcpy+序号发布，超时即持锁方异常，放弃本帧由下一次推流
+        // 自然重试，避免推流线程在互斥体被异常持有时无界阻塞。
+        // SAFETY: publish_lock 有效；返回值为等待结果码（取裸码裁决）。
+        let verdict =
+            judge_lock_wait(unsafe { WaitForSingleObject(self.publish_lock, LOCK_WAIT_MS) }.0);
+        match verdict {
+            // WAIT_ABANDONED（接管语义，修 B1 核心）：上一持锁线程所在进程已退出，
+            // 内核已把互斥体所有权移交本次等待——必须按「已获得锁」继续。原实现
+            // 把它当失败返回，导致持锁方崩溃后无人再能接管互斥体、推帧永久失败。
+            // 接管后锁内数据可能被崩溃写撕坏：本函数按槽整体覆盖写，读方按
+            // seqlock 序号裁决兜底（见 `latest`，读到坏帧即丢弃）。
+            LockWaitVerdict::Acquired | LockWaitVerdict::AcquiredAbandoned => {}
+            LockWaitVerdict::TimedOut => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "publish lock not acquired within {LOCK_WAIT_MS}ms (previous holder stuck?)"
+                    ),
+                ));
+            }
+            LockWaitVerdict::Failed => {
+                return Err(io::Error::other("publish lock wait failed"));
+            }
         }
 
         let header = self.header();
@@ -228,22 +251,49 @@ impl SharedFrameChannel {
         Ok(())
     }
 
-    /// 消费者：取最新一帧；从未发布过返回 `None`。
+    /// 消费者：取最新一帧；从未发布过、头部无效或持续撕裂返回 `None`。
+    /// 返回 `None` 时 `out` 内容未定义（撕裂轮会留下按单槽容量截断的拷贝），
+    /// 调用方必须整帧覆盖后再使用（现调用方 `render_pattern` 满足）。
+    ///
+    /// 修 M2：经典 seqlock——读数据前/后各采一次发布序号，两次一致（期间无新
+    /// 发布）且头部自洽才采纳；序号不一致说明读到撕裂数据，**必须重读**而非
+    /// 使用旧读取值。最多重读 [`MAX_SEQLOCK_ATTEMPTS`] 轮（防写方高频发布导致
+    /// 活锁），超限按「无帧」返回，由调用方回退测试图案。
+    ///
+    /// 修 M2b：`seq_after` 在负载拷贝**完成之后**采样，序号括弧覆盖整个
+    /// （头部+负载）读取——拷贝期间写方完成两次发布回到同一槽（写方 2 倍以上
+    /// 吞吐且读方被抢占）时，拷贝的正是正在被覆盖的槽，只能靠拷贝后采样检出
+    /// 序号差值重读；修前 `seq_after` 在拷贝前采样，括弧只护住头部读取，
+    /// 这类撕裂会通过校验、撕裂像素被当稳定帧采纳。
     pub fn latest(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         let header = self.header();
         if header.ready.load(Ordering::Acquire) == 0 {
             return None;
         }
-        let seq = header.seq.load(Ordering::Acquire);
-        let width = header.width;
-        let height = header.height;
-        let buf_len = header.buf_len as usize;
-        if width == 0 || height == 0 || buf_len == 0 || buf_len > MAX_BUF {
-            return None;
+        for _ in 0..MAX_SEQLOCK_ATTEMPTS {
+            let seq_before = header.seq.load(Ordering::Acquire);
+            let width = header.width;
+            let height = header.height;
+            let buf_len = header.buf_len;
+            let slot_buf = self.buffer(seq_before & 1);
+            // 修 M2b：负载拷贝必须先于 `seq_after` 采样完成，序号括弧才能把
+            // 拷贝也括住（见函数文档）。拷贝长度按单槽容量截断：此刻 buf_len
+            // 尚未通过 judge 校验（可能是崩溃残留的垃圾值），截断阻断越界
+            // 拷贝；校验通过时 buf_len <= MAX_BUF，截断为恒等，正确路径不变。
+            let copy_len = (buf_len as usize).min(MAX_BUF);
+            out.resize(copy_len, 0);
+            out.copy_from_slice(&slot_buf[..copy_len]);
+            let seq_after = header.seq.load(Ordering::Acquire);
+            match judge_seqlock_read(seq_before, seq_after, width, height, buf_len, MAX_BUF) {
+                // 序号括弧内（头部+负载）读取完整且头部自洽：采纳 out 中拷贝。
+                SeqlockVerdict::Accept => return Some((width, height)),
+                // 序号稳定但头部无效（发布方崩溃残留）：重读无意义，按无帧处理。
+                SeqlockVerdict::NoFrame => return None,
+                // 撕裂：重读。
+                SeqlockVerdict::Retry => continue,
+            }
         }
-        out.resize(buf_len, 0);
-        out.copy_from_slice(&self.buffer(seq & 1)[..buf_len]);
-        Some((width, height))
+        None
     }
 
     /// 等待新帧事件；超时返回 `false`。
@@ -278,4 +328,20 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 fn os_error(e: windows_core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::channel_logic::{WAIT_ABANDONED_CODE, WAIT_OBJECT_0_CODE, WAIT_TIMEOUT_CODE};
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+    /// channel_logic 的裸等待码常量必须与 windows 绑定一致
+    /// （阳性对照：任一侧改错即红；此测试需 Windows 依赖树，随 crate 在
+    /// Windows 侧 `cargo test` 运行——宿主侧对应测试在 channel_logic.rs 内）。
+    #[test]
+    fn channel_logic_wait_codes_match_bindings() {
+        assert_eq!(WAIT_OBJECT_0_CODE, WAIT_OBJECT_0.0);
+        assert_eq!(WAIT_ABANDONED_CODE, WAIT_ABANDONED.0);
+        assert_eq!(WAIT_TIMEOUT_CODE, WAIT_TIMEOUT.0);
+    }
 }

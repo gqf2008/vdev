@@ -56,8 +56,11 @@ pub struct PinInner {
     pub name: Vec<u16>,
     current: Mutex<usize>,
     connected: Mutex<Option<ConnectedState>>,
-    /// 自身 `IPin`（构造时缓存，供 `Connect` 协商与枚举返回同一对象）。
-    self_pin: Mutex<Option<IPin>>,
+    /// 自身 `IPin` 的**弱引用**（构造时缓存，供 `Connect` 协商与枚举返回同一
+    /// 对象）。修 B2：强引用由所属过滤器持有（`FilterInner::pin_com`），
+    /// 本处存弱引用——否则 pin 引用计数含 1 个自引用，外部全部释放后仍停在
+    /// 1，永不析构。
+    self_pin: Mutex<Option<windows_core::Weak<IPin>>>,
     /// 下游是否处于 Flush 状态。
     pub flushing: AtomicBool,
     /// 最近一次 NewSegment 参数。
@@ -78,16 +81,25 @@ impl PinInner {
     }
 
     pub fn self_pin(&self) -> windows_core::Result<IPin> {
+        // 生命周期推演（修 B2）：pin 的唯一持久强引用由 owner（FilterInner::
+        // pin_com，随 owner 析构而释放）持有 ⇒ owner 存活期 ≥ pin。本弱引用
+        // upgrade 失败即 pin 正在（或已经）析构——owner 已释放强引用且外部
+        // 引用归零——此时返回错误而非悬垂访问。
         self.self_pin
             .lock()
             .unwrap()
-            .clone()
+            .as_ref()
+            .and_then(windows_core::Weak::upgrade)
             .ok_or_else(|| Error::from_hresult(VFW_E_NOT_CONNECTED))
     }
 
-    /// 缓存自身 `IPin`（构造时由过滤器调用一次）。
-    pub(crate) fn set_self_pin(&self, pin: IPin) {
-        *self.self_pin.lock().unwrap() = Some(pin);
+    /// 缓存自身 `IPin` 的弱引用（构造时由过滤器调用一次）。
+    ///
+    /// `downgrade` 经 `IWeakReferenceSource`（`#[implement]` 生成的对象必然
+    /// 支持）取弱引用，实际不会失败；万一失败则 [`Self::self_pin`] 退化为
+    /// `VFW_E_NOT_CONNECTED`（安全降级）。
+    pub(crate) fn set_self_pin(&self, pin: &IPin) {
+        *self.self_pin.lock().unwrap() = pin.downgrade().ok();
     }
 
     pub fn is_connected(&self) -> bool {
@@ -184,11 +196,26 @@ impl IPin_Impl for OutputPin_Impl {
             cbAlign: 1,
             cbPrefix: 0,
         };
-        let allocator = decide_allocator(&input, &props)?;
+        // 修 M4：上面 ReceiveConnection 已成功——下游自此进入「已连接」状态。
+        // 此后任何失败必须调 `peer.Disconnect()` 撤销半连接（镜像
+        // CBaseOutputPin::Connect 的回退路径），否则下游认为自己已连接而本 pin
+        // 未提交 connected，图状态不一致。
+        let allocator = match decide_allocator(&input, &props) {
+            Ok(a) => a,
+            Err(e) => {
+                // SAFETY: peer 有效（ReceiveConnection 刚成功）；Disconnect 撤销
+                // 其 ReceiveConnection 建立的连接，失败仅说明对端状态异常，忽略。
+                let _ = unsafe { peer.Disconnect() };
+                return Err(e);
+            }
+        };
 
         // 4. 提交连接状态。
         let mut guard = self.inner.connected.lock().unwrap();
         if guard.is_some() {
+            // 并发连接竞争的失败方同样负责回退半连接（同上）。
+            // SAFETY: peer 有效。
+            let _ = unsafe { peer.Disconnect() };
             return Err(Error::from_hresult(VFW_E_ALREADY_CONNECTED));
         }
         *guard = Some(ConnectedState {
@@ -332,8 +359,12 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
     fn GetFormat(&self) -> windows_core::Result<*mut AM_MEDIA_TYPE> {
         let f = self.inner.current_format();
         let mt = f.to_media_type();
-        // SAFETY: 返回 CoTaskMem 拷贝，调用方用 DeleteMediaType 释放。
-        Ok(unsafe { media_type::alloc_media_type_copy(&mt) })
+        // SAFETY: 返回 CoTaskMem 深拷贝，调用方用 DeleteMediaType 释放。
+        let copy = unsafe { media_type::alloc_media_type_copy(&mt) };
+        // 深拷贝已完成：释放临时 mt 的 pbFormat（CoTaskMem 块），否则每次
+        // GetFormat 泄漏一个 VIDEOINFOHEADER。
+        media_type::free_format(&mt);
+        Ok(copy)
     }
 
     fn GetNumberOfCapabilities(
@@ -366,7 +397,7 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
             .get(idx)
             .ok_or_else(|| Error::from_hresult(VFW_E_INVALIDMEDIATYPE))?;
         let mt = f.to_media_type();
-        // SAFETY: ppmt 由调用方分配；返回 CoTaskMem 拷贝。
+        // SAFETY: ppmt 由调用方分配；返回 CoTaskMem 深拷贝。
         unsafe {
             *ppmt = media_type::alloc_media_type_copy(&mt);
             let caps = video_stream_config_caps(f);
@@ -376,6 +407,9 @@ impl IAMStreamConfig_Impl for OutputPin_Impl {
                 std::mem::size_of::<VIDEO_STREAM_CONFIG_CAPS>(),
             );
         }
+        // 深拷贝已完成：释放临时 mt 的 pbFormat（CoTaskMem 块），否则每次
+        // GetStreamCaps 泄漏一个 VIDEOINFOHEADER。
+        media_type::free_format(&mt);
         Ok(())
     }
 }
