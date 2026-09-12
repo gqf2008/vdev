@@ -129,8 +129,6 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
   参照 `CBaseOutputPin::DecideAllocator`：先试下游分配器，失败回退 `CLSID_MemoryAllocator`，
   激活（Pause）时 `Commit`、停止（Stop）时 `Decommit`。
 - **推流线程在 Pause 启动**（送预滚帧），Run 只更新 `tstart`；否则图一直 GetState=Paused 死锁。
-- **不要 SetTime 样本时间戳**：基于 CBaseRenderer 的下游（NullRenderer 等）会按参考时钟等待，
-  帧率掉到 ~0；去掉后 ~26fps。
 - **FilterData 的媒体类型必须与 pin 实际输出一致**（本过滤器输出 YUY2）。
 - **输出格式选 YUY2（YUV），不要用 RGB32**：DirectShow 摄像头生态以 YUV 为主，
   VLC 3.0 等消费方无法从 RGB32（BI_RGB）媒体类型提取 fourcc（报 `unsupported format`）；
@@ -139,9 +137,14 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
   4294966216 导致「Program doesn't contain ES」黑屏；ffmpeg 8 对 YUV 负 biHeight
   也不取绝对值。正 biHeight + top-down 数据在 VLC/ffmpeg 下都正确显示
   （OBS/libdshowcapture 同款）。
-- **样本必须有时间戳**：VLC 的 grabber 用样本时间戳做 PTS，无时间戳会黑屏；
-  用流时间（相对 Run 开始从 0 递增，CBaseOutputPin 同款），不要用参考时钟绝对时间
-  （后者会让 CBaseRenderer 下游卡死）。
+- **样本必须 SetTime 时间戳，且必须填流时间域**：`IMediaSample::SetTime` 要填
+  流时间（相对 Run 开始从 0 递增、按帧间隔单调递增，CBaseOutputPin 同款）——
+  基于 CBaseRenderer 的下游拿它与参考时钟的流时间比较后按时呈现，VLC 的 grabber
+  用它做 PTS，无时间戳会黑屏。真正的坑在「域」：填参考时钟域的绝对/墙钟时间会让
+  下游按参考时钟等待、帧率掉到 ~0（当时去掉 SetTime 后恢复 ~26fps，遂有「不要
+  SetTime」的旧结论——那是误诊，正解是换流时间基准而非删时间戳）。当前实现即
+  流时间 + `SetSyncPoint(true)`，见
+  `crates/vdev-camera-win/src/dshow/streaming.rs:199-208`。
 
 ## 当前限制
 

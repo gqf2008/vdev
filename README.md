@@ -64,9 +64,9 @@ cargo build --release
 
 # 虚拟 HID
 vdev hid type "hello from vdev"
-vdev hid key 49          # 空格
-vdev hid mouse move 100 100
-vdev hid mouse click left
+vdev hid key space        # 空格（键名只收名字，全表见 vdev hid key --help）
+vdev hid move 100 100
+vdev hid click 100 100 --button left
 
 # 虚拟屏幕（私有 API，仅供学习）
 vdev screen list
@@ -75,7 +75,7 @@ vdev screen create --width 1920 --height 1080 --name vdev-demo
 # 虚拟摄像头（先出帧核心）
 vdev camera frame --out /tmp/frame.ppm
 
-# 监听键盘/鼠标（需要辅助功能权限）
+# 监听键盘/鼠标（需要辅助功能权限；无权限时立即报错、以非零退出码退出）
 vdev hid listen --seconds 10
 ```
 
@@ -90,8 +90,9 @@ vdev hid listen --seconds 10
   扩展显示已启用但进程不启动、摄像头消失），并通常需要重新批准一次。
 - **已内置自动修复**：激活完成但 15s 内摄像头未出现时，App 自动「停用→重新启用→轮询」；
   需要批准会自动打开系统设置。也可 CLI 触发：`/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-recover`。
-- **同屏只能有一个虚拟屏**：CLI `vdev screen create` 与 App 互斥，占用时创建会失败（日志有提示）。
-- **崩溃排查**：App 回调全部 `catch_unwind`，panic 会落盘 `$HOME/vdev-panic.log`
+- **虚拟屏无互斥**：CLI `vdev screen create` 与 App 可各自创建，彼此不加锁；
+  同时创建第二块虚拟屏可能失败、也可能得到两块（取决于 macOS 版本与当前系统状态）。
+- **崩溃排查**：App UI 回调有 `catch_unwind` 防护，panic 会落盘 `$HOME/vdev-panic.log`
   （沙盒 App 写不了 /tmp，沙盒容器里即 `~/Library/Containers/com.vdev.camera.host/Data/vdev-panic.log`）；
   崩溃报告在 `~/Library/Logs/DiagnosticReports/vdev-camera-*.ips`。
 - **文件选择器（视频推流）依赖沙盒文件权限**：宿主 App 是沙盒应用，entitlements 必须带
@@ -230,7 +231,7 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
 ## 权限说明（macOS）
 
 - **注入按键**：`CGEventPost` 无需辅助功能权限（macOS 10.15+ 对合成事件放行）。
-- **拦截/监听**（后续功能）：需要「辅助功能」权限。
+- **拦截/监听**（`vdev hid listen`）：需要「辅助功能」权限；无权限时立即报错退出（退出码非 0）。
 - **虚拟摄像头**：宿主 App 需要摄像头权限（仅用于检测安装状态）；扩展需在系统设置中批准；
   使用方（QuickTime/Zoom 等）各自需要摄像头权限。
 - **虚拟屏幕**：使用私有 API，仅供学习研究，不同 macOS 版本可能行为不同。
@@ -324,7 +325,7 @@ Windows 官方 **Indirect Display Driver（IddCx）**，**UMDF 用户态驱动**
 ```powershell
 vdev-display-win.exe add 1920x1080          # 添加一块虚拟屏
 vdev-display-win.exe add 3840x2160@120 1280x720@60/120 --name "vdev-4k"
-vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0 / persist
+vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0 / remove-all
 vdev-display-win.exe install --inf-dir target\dist
 ```
 
@@ -384,6 +385,15 @@ bcdedit /set testsigning on
 - [x] `vdev-hid-win`：KMDF HID minidriver，构建/报告单测通过
 - [ ] 装机验证（display/audio/hid）：开测试签名/装证书后真机安装、枚举、端到端实测
 - [ ] `vdev-app-win` 宿主 GUI 集成页完善（虚拟显示器页；声卡页已有）
+
+CI（`.github/workflows/ci.yml`，push main + PR 触发）：
+- **硬门禁**：macOS 主 workspace（fmt/check/test/clippy -D warnings）；Windows 用户态五个
+  独立 workspace（camera-win / hid-win / app-win / audio-win / display-win 用户态包）各自的
+  fmt/check/clippy（test 按包有则跑）。
+- **顾问 job（continue-on-error，红不阻塞）**：`windows-driver-wdk`——依赖 WDK 的驱动构建
+  （display-win 的 driver + wdf-umdf-sys bindgen、hid-win/kernel 的 wdk-build）。托管 runner
+  上 winget 装 WDK + LLVM 的组合未实测（wdk-build 可能还需 EWDK/WDKContentRoot），替代路径为
+  Windows 真机本地构建；稳定转绿后可去掉 continue-on-error 升级为硬门禁。
 
 ---
 

@@ -1,0 +1,130 @@
+# vdev CI：macOS 主 workspace + Windows 各独立 workspace 门禁。
+#
+# 门禁语义（看 CI 前先读本注释：红不等于阻塞，先区分硬门禁与顾问 job）：
+#
+# - 硬门禁（红即阻塞）：
+#   * macos：仓库根主 workspace（fmt / check / test / clippy -D warnings）。
+#   * windows-user 矩阵：五个 Windows 独立 workspace 的用户态门禁——
+#     vdev-camera-win / vdev-hid-win / vdev-app-win / vdev-audio-win /
+#     vdev-display-win（只测 WDK-free 的用户态包）。
+#
+# - 顾问 job（continue-on-error，红不阻塞合并，但必须人工读日志跟进）：
+#   * windows-driver-wdk：依赖 WDK 的驱动构建——vdev-display-win 的 driver +
+#     wdf-umdf-sys（bindgen 需 LLVM + WDK 注册表探测）与 vdev-hid-win/kernel
+#     （wdk-build，KMDF）。在 GitHub 托管 runner 上「winget 装
+#     Microsoft.WindowsWDK.10.0.26100 + LLVM」的组合未实测过，wdk-build 可能
+#     还需要 EWDK 或额外环境变量（如 WDKContentRoot）；因此先以 continue-on-error
+#     运行。替代路径：Windows 真机本地构建（见 README「Windows 通用：构建 /
+#     签名 / 安装」）。若某天该 job 稳定转绿，删除 continue-on-error 即升级为
+#     硬门禁；不许静默放弃。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS 主 workspace
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: check
+        run: cargo check --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  windows-user:
+    name: Windows 用户态 ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vdev-camera-win
+            dir: crates/vdev-camera-win
+            test_args: ""
+          - name: vdev-hid-win
+            dir: crates/vdev-hid-win
+            test_args: ""
+          - name: vdev-app-win
+            dir: crates/vdev-app-win
+            test_args: "--lib"
+          - name: vdev-audio-win
+            dir: crates/vdev-audio-win
+            test_args: ""
+          # display-win 用户态包：driver + wdf-umdf-sys 需要 WDK（bindgen），
+          # 归 windows-driver-wdk 顾问 job；此处只门禁 WDK-free 的三个包。
+          - name: vdev-display-win（用户态包）
+            dir: crates/vdev-display-win
+            pkgs: "-p vdev-display-win -p driver-ipc -p driver-logger"
+            test_args: null
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 每个 matrix 分支一个独立缓存，workspaces 限定到本 workspace，避免互相污染。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }}
+      - name: fmt
+        run: cargo fmt --all -- --check
+        working-directory: ${{ matrix.dir }}
+      - name: check
+        run: cargo check ${{ matrix.pkgs }} --all-targets
+        working-directory: ${{ matrix.dir }}
+      - name: test
+        run: cargo test ${{ matrix.test_args }}
+        working-directory: ${{ matrix.dir }}
+        if: matrix.test_args != null
+      - name: clippy
+        run: cargo clippy ${{ matrix.pkgs }} --all-targets -- -D warnings
+        working-directory: ${{ matrix.dir }}
+
+  # 顾问 job（continue-on-error）：原因与替代路径见文件头注释。
+  windows-driver-wdk:
+    name: Windows driver（WDK，顾问）
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/vdev-display-win
+            crates/vdev-hid-win/kernel
+      - name: 安装 WDK + LLVM（bindgen 依赖 libclang）
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::WDK winget 安装失败 (exit=$LASTEXITCODE)，后续 check 预计因缺 WDK 失败"; }
+          # runner 镜像可能已预装 LLVM：winget 对已安装包返回非 0，先 list 再决定装不装
+          winget list --id LLVM.LLVM --exact > $null
+          if ($LASTEXITCODE -ne 0) { winget install --id LLVM.LLVM --exact --silent --accept-package-agreements --accept-source-agreements; }
+          exit 0
+      - name: 导出 LIBCLANG_PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin"
+      - name: check display-win 全 workspace（含 driver + wdf-umdf-sys bindgen）
+        run: cargo check --workspace --all-targets
+        working-directory: crates/vdev-display-win
+      - name: check hid-win kernel workspace（wdk-build KMDF）
+        run: cargo check --workspace
+        working-directory: crates/vdev-hid-win/kernel
