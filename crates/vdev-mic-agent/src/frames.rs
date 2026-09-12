@@ -45,7 +45,12 @@ impl FrameAssembler {
     /// the capture callback may not allocate, and a lazily initialised global
     /// would need either a lock or `Once` on the audio thread.
     pub const fn new() -> Self {
-        Self { buf: [0.0; FRAME], len: 0, samples_in: 0, frames_out: 0 }
+        Self {
+            buf: [0.0; FRAME],
+            len: 0,
+            samples_in: 0,
+            frames_out: 0,
+        }
     }
 
     /// Feed any number of samples; `emit` is called once per completed frame.
@@ -113,7 +118,11 @@ pub struct DelayLine {
 
 impl DelayLine {
     pub fn new(delay: usize) -> Self {
-        Self { buf: vec![0.0; delay.max(1)], pos: 0, delay }
+        Self {
+            buf: vec![0.0; delay.max(1)],
+            pos: 0,
+            delay,
+        }
     }
 
     #[allow(dead_code)] // introspection; the value is fixed at construction
@@ -163,7 +172,11 @@ mod tests {
         for chunk in input.chunks(512) {
             a.push(chunk, |f| got.extend_from_slice(f));
         }
-        assert_eq!(got, input[..4800].to_vec(), "frames must be the input, in order");
+        assert_eq!(
+            got,
+            input[..4800].to_vec(),
+            "frames must be the input, in order"
+        );
         assert_eq!(a.pending(), 137);
         assert_eq!(a.samples_in(), input.len() as u64);
         assert_eq!(a.frames_out(), 10);

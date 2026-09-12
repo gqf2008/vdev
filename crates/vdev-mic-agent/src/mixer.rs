@@ -95,7 +95,8 @@ impl AdaptiveMixer {
         if !self.enabled {
             return 1.0;
         }
-        let e = frame.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / frame.len().max(1) as f64;
+        let e =
+            frame.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / frame.len().max(1) as f64;
 
         if !self.initialised {
             // Start pessimistic: assume the first frame is the worst case.
@@ -103,7 +104,11 @@ impl AdaptiveMixer {
             self.speech_level = e.max(1e-9);
             self.initialised = true;
         } else if vad < self.cfg.vad_thresh {
-            let k = if e < self.noise_floor { self.cfg.floor_fall } else { self.cfg.floor_rise };
+            let k = if e < self.noise_floor {
+                self.cfg.floor_fall
+            } else {
+                self.cfg.floor_rise
+            };
             self.noise_floor = (self.noise_floor + (e - self.noise_floor) * k).max(1e-9);
         } else if e > self.noise_floor {
             if self.have_speech {
@@ -116,8 +121,17 @@ impl AdaptiveMixer {
 
         let snr_db = 10.0 * (self.speech_level / self.noise_floor).max(1e-12).log10();
         let c = &self.cfg;
-        // hysteresis: a higher bar to *become* wet than to *stay* wet
-        let gate = if self.wet < 0.5 { c.gate_db + c.hysteresis_db } else { c.gate_db - c.hysteresis_db };
+        // hysteresis: a higher bar to *become* wet than to *stay* wet.
+        // Dry state (wet < 0.5) uses the *lower* gate, so dropping into wet
+        // needs the SNR to fall below gate_db - hysteresis_db; the wet state
+        // keeps the *higher* gate, so only SNR >= gate_db + hysteresis_db
+        // counts as clean again. Inside the band the state is stable -- a
+        // constant SNR can never flip-flop the gate (no limit cycle).
+        let gate = if self.wet < 0.5 {
+            c.gate_db - c.hysteresis_db
+        } else {
+            c.gate_db + c.hysteresis_db
+        };
         let target = if snr_db >= gate {
             c.min_wet
         } else if snr_db <= gate - c.ramp_db {
@@ -127,7 +141,11 @@ impl AdaptiveMixer {
             c.min_wet + t * (c.max_wet - c.min_wet)
         };
 
-        let k = if target > self.wet { c.attack } else { c.release };
+        let k = if target > self.wet {
+            c.attack
+        } else {
+            c.release
+        };
         self.wet = (self.wet + (target - self.wet) * k).clamp(0.0, 1.0);
         self.wet
     }
@@ -137,7 +155,9 @@ impl AdaptiveMixer {
     }
 
     pub fn long_term_snr_db(&self) -> f64 {
-        10.0 * (self.speech_level / self.noise_floor.max(1e-12)).max(1e-12).log10()
+        10.0 * (self.speech_level / self.noise_floor.max(1e-12))
+            .max(1e-12)
+            .log10()
     }
 }
 
@@ -166,7 +186,11 @@ mod tests {
     #[test]
     fn clean_speech_gets_bypassed() {
         let m = run(200, SPEECH, ROOM);
-        assert!(m.wet < 0.1, "expected bypass on clean speech, got {}", m.wet);
+        assert!(
+            m.wet < 0.1,
+            "expected bypass on clean speech, got {}",
+            m.wet
+        );
         assert!(m.long_term_snr_db() > 35.0, "snr {}", m.long_term_snr_db());
     }
 
@@ -175,7 +199,11 @@ mod tests {
     #[test]
     fn noisy_speech_stays_wet() {
         let m = run(200, 95.0, ROOM);
-        assert!(m.wet > 0.9, "expected full wet at 10 dB local SNR, got {}", m.wet);
+        assert!(
+            m.wet > 0.9,
+            "expected full wet at 10 dB local SNR, got {}",
+            m.wet
+        );
     }
 
     /// A mic sitting in noise: never any speech above the floor.
@@ -186,7 +214,11 @@ mod tests {
         for _ in 0..500 {
             m.update(&hiss, 0.01);
         }
-        assert!(m.wet > 0.9, "expected full wet in the noise floor, got {}", m.wet);
+        assert!(
+            m.wet > 0.9,
+            "expected full wet in the noise floor, got {}",
+            m.wet
+        );
     }
 
     /// Digital-silence pauses (what a clean synthetic reference looks like):
@@ -201,5 +233,121 @@ mod tests {
     fn disabled_means_pure_model_output() {
         let mut m = AdaptiveMixer::new(false);
         assert_eq!(m.update(&vec![1.0f32; 480], 0.0), 1.0);
+    }
+
+    /// Drive the mixer with constant-amplitude speech frames so the learned
+    /// long-term SNR settles at exactly `20*log10(speech_amp / first_amp)` dB:
+    /// the first frame seeds `noise_floor == speech_level`, and every later
+    /// frame is speech (vad above the threshold), so only `speech_level` moves.
+    /// Returns the average wet ratio over the last `tail` frames.
+    fn steady_state_wet(
+        first_amp: f32,
+        speech_amp: f32,
+        frames: usize,
+        tail: usize,
+    ) -> (f64, f64, f64) {
+        let first = vec![first_amp; 480];
+        let rest = vec![speech_amp; 480];
+        let mut m = AdaptiveMixer::new(true);
+        m.update(&first, 0.95);
+        let mut min = f64::MAX;
+        let mut max = f64::MIN;
+        let mut sum = 0.0;
+        for i in 0..frames {
+            let w = m.update(&rest, 0.95);
+            if i >= frames - tail {
+                min = min.min(w);
+                max = max.max(w);
+                sum += w;
+            }
+        }
+        (sum / tail as f64, min, max)
+    }
+
+    /// Directional property 1: a constant input SNR must drive `wet` to a fixed
+    /// point. With the hysteresis branches inverted, a constant SNR inside the
+    /// band (gate_db +/- hysteresis_db) flips the gate every time wet crosses
+    /// 0.5 and never settles -- a limit cycle.
+    #[test]
+    fn constant_snr_settles_without_limit_cycle() {
+        let levels: [f32; 5] = [16.0, 20.0, 22.0, 24.0, 28.0]; // around gate_db +/- hysteresis_db
+        for &db in &levels {
+            let ratio = 10f32.powf(db / 20.0);
+            let (_, min, max) = steady_state_wet(100.0, 100.0 * ratio, 1000, 100);
+            let spread = max - min;
+            assert!(
+                spread < 1e-3,
+                "{} dB SNR: wet limit-cycles, tail spread {}",
+                db,
+                spread
+            );
+        }
+    }
+
+    /// Directional property 2: the hysteresis must actually hold state -- a
+    /// constant SNR inside the band settles *wet* from a wet start and *dry*
+    /// from a dry start (entry bar gate_db - hysteresis_db is strictly below
+    /// the exit bar gate_db + hysteresis_db).
+    #[test]
+    fn hysteresis_keeps_the_current_state_inside_the_band() {
+        // 20 dB sits inside the band: wet state -> target 0.7, dry state -> 0.3.
+        let first = vec![100.0f32; 480];
+        let mid = vec![1000.0f32; 480]; // +20 dB over the floor
+        let dry_drive = vec![10000.0f32; 480]; // +40 dB: drives wet -> 0
+
+        // Wet start: a fresh mixer already sits at wet = 1.0.
+        let (ss_wet, _, _) = {
+            let mut m = AdaptiveMixer::new(true);
+            m.update(&first, 0.95);
+            let mut min = f64::MAX;
+            let mut max = f64::MIN;
+            let mut sum = 0.0;
+            for i in 0..1000 {
+                let w = m.update(&mid, 0.95);
+                if i >= 900 {
+                    min = min.min(w);
+                    max = max.max(w);
+                    sum += w;
+                }
+            }
+            (sum / 100.0, min, max)
+        };
+
+        // Dry start: a clean high-SNR prefix collapses wet to ~0 first.
+        let mut dry_start = AdaptiveMixer::new(true);
+        dry_start.update(&first, 0.95);
+        for _ in 0..800 {
+            dry_start.update(&dry_drive, 0.95);
+        }
+        assert!(
+            dry_start.wet < 0.05,
+            "prefix must reach the dry state, wet={}",
+            dry_start.wet
+        );
+        let mut ss_dry = 0.0;
+        for i in 0..1000 {
+            let w = dry_start.update(&mid, 0.95);
+            if i >= 900 {
+                ss_dry += w;
+            }
+        }
+        ss_dry /= 100.0;
+
+        assert!(
+            ss_wet > 0.5,
+            "wet start must stay wet inside the band, got {}",
+            ss_wet
+        );
+        assert!(
+            ss_dry < 0.5,
+            "dry start must stay dry inside the band, got {}",
+            ss_dry
+        );
+        assert!(
+            ss_wet - ss_dry > 0.1,
+            "steady states must differ (hysteresis width), wet={} dry={}",
+            ss_wet,
+            ss_dry
+        );
     }
 }

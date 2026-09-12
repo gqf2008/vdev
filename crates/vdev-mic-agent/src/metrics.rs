@@ -81,7 +81,11 @@ pub fn align(ref_sig: &[f32], est: &[f32], max_lag: usize) -> (Vec<f32>, usize, 
     let mut best_lag = 0usize;
     for lag in 0..=max_lag {
         let m = n - lag;
-        let numer: f64 = est64[lag..].iter().zip(&ref64[..m]).map(|(a, b)| a * b).sum();
+        let numer: f64 = est64[lag..]
+            .iter()
+            .zip(&ref64[..m])
+            .map(|(a, b)| a * b)
+            .sum();
         let den = ((ss_est[n] - ss_est[lag]).max(0.0) * ss_ref[m]).sqrt();
         if den <= 0.0 {
             continue;
@@ -140,7 +144,9 @@ pub fn si_sdr(ref_sig: &[f32], est: &[f32], max_lag: usize) -> Metrics {
 }
 
 fn frame_energies(x: &[f32]) -> Vec<f64> {
-    x.chunks_exact(FRAME)
+    x.as_chunks::<FRAME>()
+        .0
+        .iter()
         .map(|f| f.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / FRAME as f64)
         .collect()
 }
@@ -149,8 +155,10 @@ fn seg_snr_aligned(r: &[f32], e: &[f32]) -> f64 {
     let n = (r.len().min(e.len()) / FRAME) * FRAME;
     let pr = frame_energies(&r[..n]);
     let pe: Vec<f64> = e[..n]
-        .chunks_exact(FRAME)
-        .zip(r[..n].chunks_exact(FRAME))
+        .as_chunks::<FRAME>()
+        .0
+        .iter()
+        .zip(r[..n].as_chunks::<FRAME>().0)
         .map(|(ef, rf)| {
             ef.iter()
                 .zip(rf)
@@ -184,10 +192,14 @@ fn seg_snr_aligned(r: &[f32], e: &[f32]) -> f64 {
 fn noise_floor_aligned(r: &[f32], e: &[f32]) -> f64 {
     let n = (r.len().min(e.len()) / FRAME) * FRAME;
     let pr = frame_energies(&r[..n]);
-    let ef: Vec<&[f32]> = e[..n].chunks_exact(FRAME).collect();
+    let (ef, _) = e[..n].as_chunks::<FRAME>();
     let k = ((pr.len() as f64 * 0.10) as usize).max(1);
     let mut idx: Vec<usize> = (0..pr.len()).collect();
-    idx.sort_by(|&a, &b| pr[a].partial_cmp(&pr[b]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        pr[a]
+            .partial_cmp(&pr[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let samples: f64 = idx[..k]
         .iter()
         .map(|&i| ef[i].iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>())
@@ -201,7 +213,7 @@ fn speech_rms_aligned(r: &[f32], e: &[f32]) -> f64 {
     let pr = frame_energies(&r[..n]);
     let max_p = pr.iter().cloned().fold(f64::MIN, f64::max);
     let thr = max_p * 10f64.powf(-10.0 / 10.0);
-    let ef: Vec<&[f32]> = e[..n].chunks_exact(FRAME).collect();
+    let (ef, _) = e[..n].as_chunks::<FRAME>();
     let mut acc = 0.0;
     let mut cnt = 0usize;
     for i in 0..pr.len() {
@@ -234,10 +246,9 @@ mod tests {
     #[test]
     fn aligns_a_known_delay() {
         let n = 48_000;
-        let mut sig = vec![0.0f32; n];
-        for i in 0..n {
-            sig[i] = ((i as f64 * 0.01).sin() * 1000.0) as f32;
-        }
+        let sig: Vec<f32> = (0..n)
+            .map(|i| ((i as f64 * 0.01).sin() * 1000.0) as f32)
+            .collect();
         let mut delayed = vec![0.0f32; n];
         let lag = 960;
         delayed[lag..].copy_from_slice(&sig[..n - lag]);
@@ -249,7 +260,9 @@ mod tests {
     #[test]
     fn reports_full_si_sdr_on_identical_signals() {
         let n = 48_000;
-        let sig: Vec<f32> = (0..n).map(|i| ((i as f64 * 0.05).sin() * 5000.0) as f32).collect();
+        let sig: Vec<f32> = (0..n)
+            .map(|i| ((i as f64 * 0.05).sin() * 5000.0) as f32)
+            .collect();
         let m = si_sdr(&sig, &sig, 3 * FRAME);
         assert!(m.si_sdr_db > 100.0, "got {}", m.si_sdr_db);
     }

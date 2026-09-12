@@ -19,7 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use metrics::MetricsReport;
 use rnnoise::Engine;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -40,7 +40,7 @@ struct Cli {
 enum Cmd {
     /// Denoise one WAV file.
     Run(RunArgs),
-    /// Run the whole D1-D2 matrix (three SNRs x {fixed, adaptive}) and emit JSON.
+    /// Run the whole D1-D2 matrix (four SNRs x {fixed, adaptive}) and emit JSON.
     Bench(BenchArgs),
     /// Compare two WAVs sample by sample (used to cross-check against the C and
     /// Python harnesses -- same DLL, same frames, so they should agree exactly).
@@ -83,7 +83,7 @@ struct RunArgs {
 
 #[derive(Args)]
 struct BenchArgs {
-    /// Directory holding clean_ref.wav and noisy_snr{10,5,0}db.wav.
+    /// Directory holding clean_ref.wav and noisy_snr{30,10,5,0}db.wav.
     #[arg(long, default_value = "audio")]
     dir: PathBuf,
     /// JSON report output path.
@@ -164,8 +164,12 @@ fn main() -> Result<()> {
 fn cmd_run(a: RunArgs) -> Result<()> {
     let engine = Engine::load(a.dll.as_deref())?;
     println!("engine      : {}", engine.path.display());
-    println!("frame       : {} samples ({} ms), state {} B", engine.frame_size,
-             engine.frame_size as f64 / 48.0, engine.state_bytes);
+    println!(
+        "frame       : {} samples ({} ms), state {} B",
+        engine.frame_size,
+        engine.frame_size as f64 / 48.0,
+        engine.state_bytes
+    );
 
     let input = wavio::read(&a.input)?;
     let cfg = RunConfig {
@@ -190,21 +194,40 @@ fn cmd_run(a: RunArgs) -> Result<()> {
         json["before"] = serde_json::to_value(&before)?;
         json["after"] = serde_json::to_value(&after)?;
         println!("\n{:<12} {:>10} {:>10}", "", "before", "after");
-        println!("{:<12} {:>10.2} {:>10.2}  dB   SI-SDR", "SI-SDR", before.si_sdr_db, after.si_sdr_db);
-        println!("{:<12} {:>10.2} {:>10.2}  dB   segSNR", "segSNR", before.segsnr_db, after.segsnr_db);
-        println!("{:<12} {:>10.2} {:>10.2}  dBFS noise floor", "noise floor",
-                 before.noise_floor_dbfs, after.noise_floor_dbfs);
+        println!(
+            "{:<12} {:>10.2} {:>10.2}  dB   SI-SDR",
+            "SI-SDR", before.si_sdr_db, after.si_sdr_db
+        );
+        println!(
+            "{:<12} {:>10.2} {:>10.2}  dB   segSNR",
+            "segSNR", before.segsnr_db, after.segsnr_db
+        );
+        println!(
+            "{:<12} {:>10.2} {:>10.2}  dBFS noise floor",
+            "noise floor", before.noise_floor_dbfs, after.noise_floor_dbfs
+        );
     }
 
     println!("\n--- denoise stage ---");
     print_timing(&report.timing);
     println!("VAD mean    : {:.3}", report.vad_mean);
-    println!("wet ratio   : mean {:.3}  min {:.3}  max {:.3}",
-             report.wet_ratio_mean, report.wet_ratio_min, report.wet_ratio_max);
-    println!("noise floor : {:.1} dBFS (adaptive mixer estimate)", report.noise_floor_dbfs);
-    println!("long-term SNR: {:.1} dB  (adaptive gate decided on this)", report.long_term_snr_db);
-    println!("dry delay   : {} samples ({:.1} ms)", report.dry_delay_samples,
-             report.dry_delay_samples as f64 / 48.0);
+    println!(
+        "wet ratio   : mean {:.3}  min {:.3}  max {:.3}",
+        report.wet_ratio_mean, report.wet_ratio_min, report.wet_ratio_max
+    );
+    println!(
+        "noise floor : {:.1} dBFS (adaptive mixer estimate)",
+        report.noise_floor_dbfs
+    );
+    println!(
+        "long-term SNR: {:.1} dB  (adaptive gate decided on this)",
+        report.long_term_snr_db
+    );
+    println!(
+        "dry delay   : {} samples ({:.1} ms)",
+        report.dry_delay_samples,
+        report.dry_delay_samples as f64 / 48.0
+    );
 
     if let Some(p) = &a.stats {
         std::fs::write(p, serde_json::to_string_pretty(&json)?)?;
@@ -231,17 +254,56 @@ fn cmd_live(a: LiveArgs) -> Result<()> {
         record_out: a.record_out,
         report: a.report,
     };
-    platform::run_live(cfg)
+    platform::run_live(cfg).map_err(|e| {
+        // Engine::load fires deep inside the live path, and its bare
+        // "could not find librnnoise" hides what still works without a
+        // backend. Attach the escape hatch when -- and only when -- that
+        // is the failure, so device errors are not muddied by it.
+        let engine_load = e.chain().any(|c| {
+            let s = c.to_string();
+            s.contains("librnnoise") || s.starts_with("dlopen ")
+        });
+        if engine_load {
+            e.context(
+                "live denoising needs librnnoise (offline `run`/`bench` \
+                        score against the denoised audio, so they need it too); \
+                        only `live --probe digital` runs without a backend",
+            )
+        } else {
+            e
+        }
+    })
 }
 
 fn print_timing(t: &stats::TimingStats) {
-    println!("frames      : {}  ({:.3} s of audio)", t.frames, t.audio_seconds);
-    println!("frame time  : min {:.4}  avg {:.4}  p50 {:.4}  p95 {:.4}  p99 {:.4}  max {:.4} ms",
-             t.frame_ms_min, t.frame_ms_avg, t.frame_ms_p50, t.frame_ms_p95, t.frame_ms_p99, t.frame_ms_max);
-    println!("wall        : {:.4} s   RTF {:.5}   frame budget used (p99) {:.2} %",
-             t.wall_seconds, t.real_time_factor, t.realtime_budget_used_pct);
-    println!("cpu         : {:.4} s   {:.2} % of one core to run realtime   -> {:.0} streams/core{:.0}",
-             t.cpu_seconds, t.cpu_percent_realtime, t.realtime_streams_per_core, ' ');
+    println!(
+        "frames      : {}  ({:.3} s of audio)",
+        t.frames, t.audio_seconds
+    );
+    println!(
+        "frame time  : min {:.4}  avg {:.4}  p50 {:.4}  p95 {:.4}  p99 {:.4}  max {:.4} ms",
+        t.frame_ms_min,
+        t.frame_ms_avg,
+        t.frame_ms_p50,
+        t.frame_ms_p95,
+        t.frame_ms_p99,
+        t.frame_ms_max
+    );
+    println!(
+        "wall        : {:.4} s   RTF {:.5}   frame budget used (p99) {:.2} %",
+        t.wall_seconds, t.real_time_factor, t.realtime_budget_used_pct
+    );
+    // proctime::cpu_seconds() is Windows-only; elsewhere it is 0.0 and the
+    // derived percentages would be garbage (streams/core divides 0 by 1e-9).
+    // Say "n/a" instead of inventing numbers.
+    if t.cpu_seconds > 0.0 {
+        println!(
+            "cpu         : {:.4} s   {:.2} % of one core to run realtime   -> {:.0} streams/core",
+            t.cpu_seconds, t.cpu_percent_realtime, t.realtime_streams_per_core
+        );
+    } else {
+        println!("cpu         : n/a  (process CPU time not measured on this platform)");
+    }
 }
 
 #[derive(Serialize)]
@@ -317,8 +379,24 @@ fn cmd_bench(a: BenchArgs) -> Result<()> {
     // keep the rendered audio next to the report, so the A/B bundle can be rebuilt
     let wav_dir = a.dir.clone();
     let variants = [
-        ("full_wet", RunConfig { mix: 1.0, adaptive: false, warmup_frames: 100, lookahead_samples: 960 }),
-        ("adaptive", RunConfig { mix: 1.0, adaptive: true, warmup_frames: 100, lookahead_samples: 960 }),
+        (
+            "full_wet",
+            RunConfig {
+                mix: 1.0,
+                adaptive: false,
+                warmup_frames: 100,
+                lookahead_samples: 960,
+            },
+        ),
+        (
+            "adaptive",
+            RunConfig {
+                mix: 1.0,
+                adaptive: true,
+                warmup_frames: 100,
+                lookahead_samples: 960,
+            },
+        ),
     ];
 
     let mut cases = Vec::new();
@@ -326,7 +404,15 @@ fn cmd_bench(a: BenchArgs) -> Result<()> {
     // Case 0: push a perfectly clean recording through the model. This is the
     // row that motivates the adaptive gate.
     cases.push(bench_case(
-        "clean_ref", "clean_ref.wav", &reference, &reference, &engine, &variants, max_lag, &wav_dir, None,
+        "clean_ref",
+        "clean_ref.wav",
+        &reference,
+        &reference,
+        &engine,
+        &variants,
+        max_lag,
+        &wav_dir,
+        None,
     )?);
 
     for snr in [30, 10, 5, 0] {
@@ -334,7 +420,15 @@ fn cmd_bench(a: BenchArgs) -> Result<()> {
         let path = a.dir.join(&name);
         let input = wavio::read(&path).with_context(|| format!("reading {}", path.display()))?;
         cases.push(bench_case(
-            &format!("snr{snr}db"), &name, &input, &reference, &engine, &variants, max_lag, &wav_dir, Some(snr),
+            &format!("snr{snr}db"),
+            &name,
+            &input,
+            &reference,
+            &engine,
+            &variants,
+            max_lag,
+            &wav_dir,
+            Some(snr),
         )?);
     }
 
@@ -364,24 +458,46 @@ fn bench_case(
     engine: &Engine,
     variants: &[(&str, RunConfig)],
     max_lag: usize,
-    wav_dir: &PathBuf,
+    wav_dir: &Path,
     snr: Option<i32>,
 ) -> Result<CaseReport> {
     let mut out_variants = Vec::new();
     for (label, cfg) in variants {
-        let (v, samples) = run_variant(label, label.to_string(), input, reference, engine, *cfg, max_lag)?;
+        let (v, samples) = run_variant(
+            label,
+            label.to_string(),
+            input,
+            reference,
+            engine,
+            *cfg,
+            max_lag,
+        )?;
         let out_name = match snr {
             Some(n) => format!("after_rust_{label}_snr{n}db.wav"),
             None => format!("after_rust_{label}_cleanref.wav"),
         };
         wavio::write(&wav_dir.join(&out_name), &samples)?;
+        // Same n/a rule as print_timing: without a cpu_seconds measurement the
+        // "% core realtime" figure would print a fabricated 0.00 %.
+        let core_pct = if v.run.timing.cpu_seconds > 0.0 {
+            format!("{:.2}%", v.run.timing.cpu_percent_realtime)
+        } else {
+            "n/a".to_string()
+        };
         println!(
             "{:<10} {:<9} | SI-SDR {:>7.2} -> {:>7.2} dB | segSNR {:>6.2} -> {:>6.2} | \
-             floor {:>7.2} -> {:>7.2} dBFS | p99 {:.4} ms | {:.2}% core realtime | wet {:.2}",
-            case, label, v.before.si_sdr_db, v.after.si_sdr_db,
-            v.before.segsnr_db, v.after.segsnr_db,
-            v.before.noise_floor_dbfs, v.after.noise_floor_dbfs,
-            v.run.timing.frame_ms_p99, v.run.timing.cpu_percent_realtime, v.run.wet_ratio_mean
+             floor {:>7.2} -> {:>7.2} dBFS | p99 {:.4} ms | {} core realtime | wet {:.2}",
+            case,
+            label,
+            v.before.si_sdr_db,
+            v.after.si_sdr_db,
+            v.before.segsnr_db,
+            v.after.segsnr_db,
+            v.before.noise_floor_dbfs,
+            v.after.noise_floor_dbfs,
+            v.run.timing.frame_ms_p99,
+            core_pct,
+            v.run.wet_ratio_mean
         );
         out_variants.push(v);
     }
@@ -400,7 +516,10 @@ fn host_description() -> String {
 fn toolchain_description() -> String {
     // rustc has no compile-time version macro, and `rustc -V` at runtime is not
     // worth a subprocess; the lockfile + README pin the rest.
-    format!("Rust stable, {} release profile (LTO thin, panic=abort)", std::env::consts::ARCH)
+    format!(
+        "Rust stable, {} release profile (LTO thin, panic=abort)",
+        std::env::consts::ARCH
+    )
 }
 
 fn cmd_diff(a: DiffArgs) -> Result<()> {

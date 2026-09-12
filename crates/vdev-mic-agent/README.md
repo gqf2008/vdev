@@ -62,8 +62,12 @@ target/release/vdev-mic-agent live --probe digital --seconds 30 --report /tmp/di
 target/release/vdev-mic-agent live --probe acoustic --seconds 30 --report /tmp/acoustic.json
 ```
 
-The denoise backend is loaded **at runtime** (`libloading`), never linked, so
-the agent still starts when the model is missing. `librnnoise-0.dll` /
+The denoise backend is loaded **at runtime** (`libloading`), never linked — so
+there is no link-time dependency on RNNoise. Loading is still a hard
+requirement for every denoise path: `run`, `bench`, and `live` (denoise and
+`--probe acoustic`) print a load error and exit when `librnnoise` is missing.
+The one exception is `live --probe digital`, the digital loopback probe, which
+needs no backend and runs without it. `librnnoise-0.dll` /
 `librnnoise.dylib` is resolved in order: `--dll <path>`, `$RNNOISE_DLL`, next to
 the executable, then a `third_party/` tree walked up to 5 levels — so
 `crates/vdev-mic-agent/third_party/native/` works from a workspace build, and
@@ -219,5 +223,14 @@ a real device to measure.
 * **Engine selection.** DeepFilterNet3 is ~9× the CPU for clearly better audio;
   the tiering policy is a product decision, not a code one.
 * **Subjective listening.** Every number here is objective; a blind A/B is owed.
-* `cpu_seconds()` is a Windows implementation. macOS returns 0.0, so the `live`
-  CPU column is 0.0 there until `task_info`/`clock_gettime` lands.
+* `cpu_seconds()` is a Windows implementation. macOS returns 0.0, so until
+  `task_info`/`clock_gettime` lands the CPU columns print `n/a` (CPU % of one
+  core, streams per core) instead of the meaningless numbers 0 CPU time would
+  produce.
+
+## Known limitations
+
+* A pure-silence reference WAV gives `segSNR = NaN`, which JSON cannot
+  represent, so `run --reference` / `bench` exit with a serialization error.
+  That is expected — there is no meaningful SNR against digital silence — treat
+  the clean error exit as intended, not a crash.

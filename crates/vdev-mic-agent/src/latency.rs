@@ -113,7 +113,10 @@ pub fn detect_with(
         prefix.push(prev + (x as f64) * (x as f64));
     }
 
-    let mut best = Detection { start: 0, ncc: -1.0 };
+    let mut best = Detection {
+        start: 0,
+        ncc: -1.0,
+    };
 
     // A cheap amplitude gate first: windows quieter than -60 dBFS relative to
     // the marker cannot be the marker, and skipping them is most of the work
@@ -131,7 +134,10 @@ pub fn detect_with(
         }
         let ncc = dot / (needle_energy * win_energy).sqrt();
         if ncc > best.ncc as f64 {
-            best = Detection { start: i, ncc: ncc as f32 };
+            best = Detection {
+                start: i,
+                ncc: ncc as f32,
+            };
         }
     }
 
@@ -141,6 +147,14 @@ pub fn detect_with(
         None
     }
 }
+
+/// Hard cap on stored raw samples. `record()` runs on the realtime audio
+/// callback path, so the buffer must have a bounded worst case and never
+/// reallocate without limit. Once the cap is reached, further round trips
+/// still count in `detected` but are *not* appended; the summary statistics
+/// therefore describe the first [`MAX_SAMPLES`] detections only, and
+/// `LatencyStats::overflowed` reports how many were left out.
+const MAX_SAMPLES: usize = 4096;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LatencyStats {
@@ -156,6 +170,9 @@ pub struct LatencyStats {
     /// Standard deviation, in ms. A wide spread means the call will *occasionally*
     /// feel worse than the median suggests -- worth reporting next to p95.
     pub stdev_ms: f64,
+    /// Round trips beyond [`MAX_SAMPLES`] that were counted but not stored:
+    /// the percentile fields describe the first [`MAX_SAMPLES`] detections only.
+    pub overflowed: u64,
 }
 
 /// Accumulates inject->hear deltas.
@@ -167,6 +184,7 @@ pub struct LatencyStats {
 #[derive(Debug)]
 pub struct LatencyProbe {
     deltas_ms: Vec<f64>,
+    overflowed: u64,
     injected: u64,
     detected: u64,
     rejected: u64,
@@ -180,11 +198,17 @@ impl Default for LatencyProbe {
 
 impl LatencyProbe {
     pub fn new() -> Self {
-        Self { deltas_ms: Vec::new(), injected: 0, detected: 0, rejected: 0 }
+        Self {
+            deltas_ms: Vec::with_capacity(MAX_SAMPLES), // one upfront allocation on the RT path
+            overflowed: 0,
+            injected: 0,
+            detected: 0,
+            rejected: 0,
+        }
     }
 
     #[allow(dead_code)] // only useful for a thread-fed emitter; the probe in
-    // `platform/macos` timestamps inside the callback instead
+                        // `platform/macos` timestamps inside the callback instead
     pub fn mark_injected(&mut self) {
         self.injected += 1;
     }
@@ -195,7 +219,12 @@ impl LatencyProbe {
     pub fn record(&mut self, sent: Instant, heard: Instant) {
         self.detected += 1;
         // saturating: a clock that appears to run backwards reports 0, not a panic
-        self.deltas_ms.push(heard.duration_since(sent).as_secs_f64() * 1000.0);
+        let ms = heard.duration_since(sent).as_secs_f64() * 1000.0;
+        if self.deltas_ms.len() < MAX_SAMPLES {
+            self.deltas_ms.push(ms);
+        } else {
+            self.overflowed += 1;
+        }
     }
 
     pub fn record_rejected(&mut self) {
@@ -223,6 +252,7 @@ impl LatencyProbe {
                 p95_ms: 0.0,
                 max_ms: 0.0,
                 stdev_ms: 0.0,
+                overflowed: self.overflowed,
             };
         }
         let pick = |q: f64| v[(((n as f64 - 1.0) * q).round() as usize).min(n - 1)];
@@ -239,6 +269,7 @@ impl LatencyProbe {
             p95_ms: pick(0.95),
             max_ms: v[n - 1],
             stdev_ms: var.sqrt(),
+            overflowed: self.overflowed,
         }
     }
 }
@@ -276,7 +307,9 @@ mod tests {
         let mut s = 12345u64;
         let mut buf: Vec<f32> = (0..2048)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .map(|x| x * 0.3)
@@ -295,7 +328,9 @@ mod tests {
         let mut s = 999u64;
         let buf: Vec<f32> = (0..2048)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
             })
             .collect();
@@ -336,5 +371,22 @@ mod tests {
         let s = p.stats();
         assert_eq!(s.count, 0);
         assert!(s.p95_ms.is_finite() && s.mean_ms.is_finite());
+    }
+
+    /// record() must never grow the buffer past MAX_SAMPLES (it runs on the
+    /// realtime callback path); extra detections are counted, stats stay valid.
+    #[test]
+    fn record_is_bounded_and_stats_stay_usable() {
+        let mut p = LatencyProbe::new();
+        let t0 = Instant::now();
+        for _ in 0..(MAX_SAMPLES as u64 + 500) {
+            p.record(t0, t0);
+        }
+        assert_eq!(p.samples().len(), MAX_SAMPLES);
+        let s = p.stats();
+        assert_eq!(s.count, MAX_SAMPLES);
+        assert_eq!(s.detected, MAX_SAMPLES as u64 + 500);
+        assert_eq!(s.overflowed, 500);
+        assert!(s.mean_ms.is_finite() && s.max_ms.is_finite() && s.stdev_ms.is_finite());
     }
 }

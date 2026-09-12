@@ -67,7 +67,9 @@ impl SpscRing {
     /// Samples currently queued.
     #[allow(dead_code)] // the report reads the counters, not the level
     pub fn len(&self) -> usize {
-        self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
+        self.head
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.tail.load(Ordering::Acquire))
     }
 
     #[allow(dead_code)] // companion to `len`
@@ -230,7 +232,11 @@ mod tests {
         let before = r2.starved_samples();
         let mut out2 = [9.0f32; 5];
         assert_eq!(r2.pop(&mut out2), 0);
-        assert_eq!(out2, [9.0, 9.0, 9.0, 9.0, 9.0], "pop leaves the caller's buffer alone");
+        assert_eq!(
+            out2,
+            [9.0, 9.0, 9.0, 9.0, 9.0],
+            "pop leaves the caller's buffer alone"
+        );
         assert_eq!(r2.starved_samples(), before);
     }
 
@@ -248,7 +254,12 @@ mod tests {
                 let mut written = 0usize;
                 let mut v = 0.0f32;
                 while written < n {
-                    let chunk: Vec<f32> = (0..480).map(|_| { v += 1.0; v }).collect();
+                    let chunk: Vec<f32> = (0..480)
+                        .map(|_| {
+                            v += 1.0;
+                            v
+                        })
+                        .collect();
                     let take = chunk.len().min(n - written);
                     // spin on a full ring rather than dropping, so the test can
                     // assert losslessness

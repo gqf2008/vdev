@@ -41,7 +41,12 @@ pub struct RunConfig {
 
 impl Default for RunConfig {
     fn default() -> Self {
-        Self { mix: 1.0, adaptive: false, warmup_frames: 100, lookahead_samples: 960 }
+        Self {
+            mix: 1.0,
+            adaptive: false,
+            warmup_frames: 100,
+            lookahead_samples: 960,
+        }
     }
 }
 
@@ -109,7 +114,11 @@ pub fn process(input: &[f32], engine: &Engine, cfg: &RunConfig) -> Result<RunOut
         timing.push(dt_ms);
 
         // ---- dry/wet -----------------------------------------------------
-        let w = if cfg.adaptive { mixer.update(dry, vad) } else { cfg.mix as f64 };
+        let w = if cfg.adaptive {
+            mixer.update(dry, vad)
+        } else {
+            cfg.mix as f64
+        };
         let dst = &mut out[i * fs..(i + 1) * fs];
         if w >= 1.0 {
             dst.copy_from_slice(wet_frame);

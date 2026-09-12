@@ -26,9 +26,20 @@ pub fn cpu_seconds() -> f64 {
     }
 
     unsafe {
-        let (mut creation, mut exit, mut kernel, mut user) =
-            (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
-        if GetProcessTimes(GetCurrentProcess(), &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+        let (mut creation, mut exit, mut kernel, mut user) = (
+            FileTime::default(),
+            FileTime::default(),
+            FileTime::default(),
+            FileTime::default(),
+        );
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
             return 0.0;
         }
         let ticks = |t: FileTime| ((t.high as u64) << 32 | t.low as u64) as f64;

@@ -81,7 +81,7 @@ impl Default for LiveConfig {
 pub fn run_live(cfg: LiveConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return macos::run(cfg);
+        macos::run(cfg)
     }
     #[cfg(not(target_os = "macos"))]
     {

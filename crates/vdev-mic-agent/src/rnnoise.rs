@@ -5,9 +5,10 @@
 //!     `librnnoise.dll.a`); MSVC's linker cannot consume the GNU import library,
 //!     and asking users to own a `dlltool`-regenerated `.lib` is a support
 //!     burden for zero benefit here;
-//!   * the real product (vdev-mic-agent) has to degrade gracefully when the
-//!     denoise backend is missing or fails to load -- a hard link-time
-//!     dependency would make the whole agent unstartable;
+//!   * runtime loading keeps the build free of a link-time `-lrnnoise`
+//!     dependency (no import-library plumbing, no dlltool dance). This is a
+//!     packaging benefit only: the denoise paths still fail at load time when
+//!     the backend is missing -- they do not degrade at runtime (see README);
 //!   * the same `libloading` code path works on macOS (CoreAudio builds ship a
 //!     `librnnoise.dylib`), so D3-D4 reuse this file unchanged.
 //!
@@ -18,6 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const FRAME: usize = 480; // 10 ms @ 48 kHz, == rnnoise_get_frame_size()
 
@@ -27,10 +29,12 @@ type FnCreate = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type FnProcessFrame = unsafe extern "C" fn(*mut c_void, *mut f32, *const f32) -> f32;
 type FnDestroy = unsafe extern "C" fn(*mut c_void);
 
-/// Loaded library + resolved entry points. Kept alive for as long as any
-/// `Denoiser` created from it exists.
+/// Loaded library + resolved entry points. The library's lifetime is held
+/// through an `Arc<Library>` that every [`Denoiser`] created from this
+/// `Engine` shares, so dropping the `Engine` can never `dlclose` code a live
+/// `Denoiser` still executes.
 pub struct Engine {
-    _lib: Library,
+    _lib: Arc<Library>,
     create: FnCreate,
     process: FnProcessFrame,
     destroy: FnDestroy,
@@ -46,8 +50,8 @@ impl Engine {
             .or_else(default_dll_candidates)
             .ok_or_else(|| anyhow!("could not find librnnoise; pass --dll <path>"))?;
 
-        let lib = unsafe { Library::new(&path) }
-            .with_context(|| format!("dlopen {}", path.display()))?;
+        let lib =
+            unsafe { Library::new(&path) }.with_context(|| format!("dlopen {}", path.display()))?;
 
         unsafe {
             let get_frame_size: FnGetFrameSize = *lib.get(b"rnnoise_get_frame_size\0")?;
@@ -58,12 +62,14 @@ impl Engine {
 
             let frame_size = get_frame_size() as usize;
             if frame_size != FRAME {
-                // Not fatal (a future RNNoise could change it) but worth knowing.
-                eprintln!("note: rnnoise frame size is {frame_size}, expected {FRAME}");
+                // The platform layer hardcodes FRAME-sized buffers and frame
+                // splitting; any other frame_size would read/write out of
+                // bounds or desynchronise the stream, so refuse to start.
+                bail!("rnnoise frame size is {frame_size}, expected {FRAME}");
             }
 
             Ok(Engine {
-                _lib: lib,
+                _lib: Arc::new(lib),
                 create,
                 process,
                 destroy,
@@ -86,6 +92,7 @@ impl Engine {
             destroy: self.destroy,
             frame_size: self.frame_size,
             out: vec![0.0f32; self.frame_size],
+            _lib: Arc::clone(&self._lib),
         })
     }
 }
@@ -96,6 +103,10 @@ pub struct Denoiser {
     destroy: FnDestroy,
     frame_size: usize,
     out: Vec<f32>,
+    /// Shared ownership of the loaded library: the library's lifetime is
+    /// jointly held by the `Arc` in every `Denoiser`, so the raw `process`/
+    /// `destroy` pointers stay valid even after the `Engine` is dropped.
+    _lib: Arc<Library>,
 }
 
 impl Denoiser {
