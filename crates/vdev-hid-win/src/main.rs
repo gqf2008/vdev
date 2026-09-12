@@ -1,14 +1,13 @@
 //! vdev-hid-win：Windows 虚拟 HID（SendInput 注入）CLI。
+//! 非 Windows 宿主仅编译纯逻辑模块并运行其单测（cfg 门控对称）。
 
+#[cfg(windows)]
 mod kernel;
 mod keycodes;
+mod report;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use vdev_hid_win::{
-    KeyAction, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MouseAction, MouseButton, mouse_button,
-    mouse_move_absolute, mouse_move_relative, mouse_wheel, send_hotkey, send_key, send_text,
-};
 
 #[derive(Parser)]
 #[command(
@@ -131,34 +130,88 @@ enum KernelMouseCmd {
     Wheel { delta: i32 },
 }
 
-fn parse_button(s: &str) -> Result<MouseButton> {
-    match s.to_ascii_lowercase().as_str() {
-        "left" => Ok(MouseButton::Left),
-        "right" => Ok(MouseButton::Right),
-        "middle" => Ok(MouseButton::Middle),
-        _ => bail!("未知鼠标按键：{s}（left/right/middle）"),
+/// Windows 命令行参数转义：含空白/引号/为空的参数用双引号包裹，
+/// 内部引号按 MSVCRT argv 规则转义（引号前反斜杠翻倍再补一个）。
+/// 修复记录：原实现 `args.join(" ")`，路径含空格即碎成多个参数。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
     }
-}
-
-fn parse_mods(combo: &str) -> Result<(Vec<u16>, String)> {
-    let parts: Vec<&str> = combo.split('+').collect();
-    let (mods, key) = parts.split_at(parts.len() - 1);
-    let mut vks = Vec::new();
-    for m in mods {
-        let vk = match m.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => MOD_CONTROL,
-            "alt" => MOD_ALT,
-            "shift" => MOD_SHIFT,
-            "win" | "lwin" => 0x5B,
-            _ => bail!("未知修饰键：{m}（ctrl/alt/shift/win）"),
-        };
-        vks.push(vk);
+    let mut out = String::with_capacity(arg.len() + 8);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // 引号本身按 \" 转义，其前连续反斜杠翻倍（2n+1 规则）
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
     }
-    Ok((vks, key[0].to_string()))
+    // 收尾引号前的连续反斜杠翻倍（2n 规则）
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    #[cfg(windows)]
+    return run(Args::parse());
+
+    #[cfg(not(windows))]
+    anyhow::bail!("vdev-hid-win 仅支持 Windows 执行（宿主平台只运行纯逻辑单测）")
+}
+
+#[cfg(windows)]
+fn run(args: Args) -> Result<()> {
+    use anyhow::{Context as _, bail};
+    use vdev_hid_win::{
+        KeyAction, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MouseAction, MouseButton, mouse_button,
+        mouse_move_absolute, mouse_move_relative, mouse_wheel, send_hotkey, send_key, send_text,
+    };
+
+    fn parse_button(s: &str) -> Result<MouseButton> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" => Ok(MouseButton::Left),
+            "right" => Ok(MouseButton::Right),
+            "middle" => Ok(MouseButton::Middle),
+            _ => bail!("未知鼠标按键：{s}（left/right/middle）"),
+        }
+    }
+
+    fn parse_mods(combo: &str) -> Result<(Vec<u16>, String)> {
+        let parts: Vec<&str> = combo.split('+').collect();
+        let (mods, key) = parts.split_at(parts.len() - 1);
+        let mut vks = Vec::new();
+        for m in mods {
+            let vk = match m.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => MOD_CONTROL,
+                "alt" => MOD_ALT,
+                "shift" => MOD_SHIFT,
+                "win" | "lwin" => 0x5B,
+                _ => bail!("未知修饰键：{m}（ctrl/alt/shift/win）"),
+            };
+            vks.push(vk);
+        }
+        Ok((vks, key[0].to_string()))
+    }
+
     match args.command {
         Command::Kernel { cmd } => match cmd {
             KernelCmd::Install { inf_dir } => {
@@ -289,8 +342,16 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
-/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后退出。
+
+/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后以其退出码退出。
+///
+/// 修复记录：原实现 `args.join(" ")`（空格路径碎参）且无条件 `exit(0)`（吞掉
+/// 提权子进程的真实退出码）；现逐参数转义并回传 GetExitCodeProcess 结果。
+#[cfg(windows)]
 fn ensure_elevated() -> Result<()> {
+    use anyhow::Context as _;
+    use windows::Win32::Foundation::CloseHandle;
+
     // SAFETY: IsUserAnAdmin 只读当前令牌
     if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
         return Ok(());
@@ -302,7 +363,11 @@ fn ensure_elevated() -> Result<()> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    // 每个参数独立转义后拼接，空格/引号路径不会碎参
     let args_wide: Vec<u16> = args
+        .iter()
+        .map(|a| quote_arg(a))
+        .collect::<Vec<_>>()
         .join(" ")
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -319,7 +384,75 @@ fn ensure_elevated() -> Result<()> {
     unsafe { windows::Win32::UI::Shell::ShellExecuteExW(&mut sei) }
         .context("请求管理员权限失败（请以管理员身份重试）")?;
     if !sei.hProcess.is_invalid() {
+        // SAFETY: SEE_MASK_NOCLOSEPROCESS 使 ShellExecuteExW 返回子进程句柄
         unsafe { windows::Win32::System::Threading::WaitForSingleObject(sei.hProcess, u32::MAX) };
+        let mut code: u32 = 0;
+        // SAFETY: 句柄有效且已等待其退出
+        let got = unsafe {
+            windows::Win32::System::Threading::GetExitCodeProcess(sei.hProcess, &mut code)
+        };
+        // SAFETY: 关闭自有句柄，避免泄漏
+        unsafe { CloseHandle(sei.hProcess) }.ok();
+        std::process::exit(elevated_exit_code(true, got.is_ok(), code));
     }
-    std::process::exit(0);
+    // ShellExecuteExW 成功却未见子进程句柄（SEE_MASK_NOCLOSEPROCESS 下属意外）：
+    // 无法等待/回传提权子进程结果，打印诊断并按失败退出。
+    // 修复记录：原实现此处 exit(0)，静默吞掉提权子进程结果。
+    eprintln!("警告：ShellExecuteExW 已成功但未返回提权子进程句柄，无法回传其退出码");
+    std::process::exit(elevated_exit_code(false, false, 0));
+}
+
+/// 提权子进程结果 → 本进程退出码（纯函数，宿主可单测）：
+/// 句柄有效且 GetExitCodeProcess 成功 → 原样回传子进程退出码；
+/// 未拿到句柄或查询失败 → 1（结果无法回传即按失败，禁止静默当成功）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn elevated_exit_code(handle_valid: bool, query_ok: bool, child_code: u32) -> i32 {
+    if !handle_valid || !query_ok {
+        return 1;
+    }
+    child_code as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M9 回归：参数转义（修复前 join(" ") 使空格路径碎参）
+    #[test]
+    fn quote_arg_escapes_spaces_and_quotes() {
+        assert_eq!(quote_arg("install"), "install");
+        assert_eq!(quote_arg("kernel"), "kernel");
+        assert_eq!(
+            quote_arg(r"C:\Program Files\vdev\vdev-hid-win.exe"),
+            "\"C:\\Program Files\\vdev\\vdev-hid-win.exe\""
+        );
+        // 空 参数也须包裹
+        assert_eq!(quote_arg(""), "\"\"");
+        // 内部引号按 MSVCRT 规则转义；引号前反斜杠翻倍
+        assert_eq!(quote_arg("a\"b"), "\"a\\\"b\"");
+        assert_eq!(
+            quote_arg(r"ends with backslash\"),
+            "\"ends with backslash\\\\\""
+        );
+    }
+
+    /// M8：键名解析在 bin 目标同样可用（宿主单测）
+    #[test]
+    fn keycodes_reachable_from_bin() {
+        assert_eq!(keycodes::key_to_vk("A"), Some(0x41));
+        assert_eq!(keycodes::key_to_vk("f13"), Some(0x7C));
+    }
+
+    /// 回归：提权子进程结果无法回传时退出码必须非 0。修复前 ShellExecuteExW
+    /// 成功但 hProcess 意外无效 → exit(0)，静默吞掉提权子进程结果。
+    #[test]
+    fn elevated_exit_code_is_nonzero_when_child_result_unavailable() {
+        // 子进程成功 → 原样回传 0；非零（如驱动安装 3010 REBOOT_REQUIRED）原样回传
+        assert_eq!(elevated_exit_code(true, true, 0), 0);
+        assert_eq!(elevated_exit_code(true, true, 3010), 3010);
+        // 查询子进程退出码失败 → 按失败
+        assert_eq!(elevated_exit_code(true, false, 0), 1);
+        // 句柄意外无效 → 按失败（修复前此处等价返回 0）
+        assert_eq!(elevated_exit_code(false, false, 0), 1);
+    }
 }

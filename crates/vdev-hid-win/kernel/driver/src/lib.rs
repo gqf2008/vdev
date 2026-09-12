@@ -8,7 +8,6 @@ mod hid;
 
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use hid::{
     HID_DESCRIPTOR, HID_DEVICE_ATTRIBUTES, HID_XFER_PACKET, KEYBOARD_REPORT_DESCRIPTOR,
@@ -17,7 +16,7 @@ use hid::{
 use wdk_sys::{
     DRIVER_OBJECT, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PVOID, PWSTR, ULONG, UNICODE_STRING,
     WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE,
-    WDFDEVICE_INIT, WDFDRIVER, WDFKEY, WDFMEMORY, WDFQUEUE, WDFREQUEST,
+    WDFDEVICE_INIT, WDFDRIVER, WDFKEY, WDFMEMORY, WDFQUEUE, WDFREQUEST, WDFSPINLOCK,
     call_unsafe_wdf_function_binding,
 };
 
@@ -26,11 +25,18 @@ const VID: u16 = 0x5644;
 const PID_KBD: u16 = 0x4849;
 const PID_MOUSE: u16 = 0x484D;
 
-/// NTSTATUS 常量（wdk-sys 未生成）
+/// NTSTATUS 常量（wdk-sys 未生成；值依 ntstatus.h）
 const STATUS_SUCCESS: NTSTATUS = 0;
-const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010u32 as NTSTATUS;
-const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000Du32 as NTSTATUS;
-const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_020Cu32 as NTSTATUS;
+const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010u32 as NTSTATUS; // ntstatus.h
+const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000Du32 as NTSTATUS; // ntstatus.h
+// ntstatus.h：STATUS_INVALID_BUFFER_SIZE = 0xC0000206（原 0xC000020C 系笔误，
+// 该值为 STATUS_CONNECTION_DISCONNECTED）
+const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as NTSTATUS;
+// ntstatus.h STATUS_NOT_SUPPORTED（0xC00000BB）：请求不被设备支持，
+// hidclass 会把映射成 ERROR_NOT_SUPPORTED 上报给 HidD_* 调用方
+const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BBu32 as NTSTATUS;
+// bugcodes.h MANUALLY_INITIATED_CRASH：panic 处理器 bugcheck 码
+const MANUALLY_INITIATED_CRASH: u32 = 0x0000_00E2;
 
 /// 键盘输入报告：8 字节（1 修饰键 + 1 保留 + 6 按键）
 const KBD_REPORT_SIZE: usize = 8;
@@ -141,11 +147,14 @@ struct State {
 }
 
 struct StateCell {
-    lock: AtomicBool,
+    /// WDF 框架自旋锁：DriverEntry 中创建一次（早于一切回调，无并发写），之后只读
+    spin_lock: UnsafeCell<WDFSPINLOCK>,
     state: UnsafeCell<State>,
 }
 
-// SAFETY: state 仅在持有自旋锁时访问；WDFQUEUE 与 [u8; 8] 均可在内核线程间共享
+// SAFETY: spin_lock 仅在 DriverEntry（单线程、无并发）中创建，之后只读；
+// state 仅在持有 WdfSpinLock（WdfSpinLockAcquire/Release 临界区）时访问；
+// WDFSPINLOCK/WDFQUEUE 句柄与 [u8; 8] 均可跨线程共享
 unsafe impl Sync for StateCell {}
 
 const fn new_instance() -> Instance {
@@ -159,28 +168,53 @@ const fn new_instance() -> Instance {
 }
 
 static STATE: StateCell = StateCell {
-    lock: AtomicBool::new(false),
+    spin_lock: UnsafeCell::new(core::ptr::null_mut()),
     state: UnsafeCell::new(State {
         kbd: new_instance(),
         mouse: new_instance(),
     }),
 };
 
-/// 自旋锁守卫（RAII 释放）
-struct StateGuard<'a>(&'a StateCell);
-
 impl StateCell {
+    /// DriverEntry：创建 KMDF 框架自旋锁。未给对象属性时（WDF_NO_OBJECT_ATTRIBUTES）
+    /// 其父对象默认为 framework driver object，生命周期等同驱动。
+    /// 选用 WdfSpinLock 而非手工 KSPIN_LOCK：IRQL 提升与恢复由框架处理，
+    /// 临界区内只做内存读写与 WdfIoQueueRetrieveNextRequest（DISPATCH_LEVEL 合法），
+    /// 不需要 PASSIVE_LEVEL 等待语义。
+    fn init(&self) -> NTSTATUS {
+        let mut lock: WDFSPINLOCK = core::ptr::null_mut();
+        // SAFETY: 空对象属性合法；lock 输出指针有效
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfSpinLockCreate,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                &mut lock
+            )
+        };
+        if status < 0 {
+            return status;
+        }
+        // SAFETY: DriverEntry 早于一切并发回调，此处独占写
+        unsafe {
+            *self.spin_lock.get() = lock;
+        }
+        STATUS_SUCCESS
+    }
+
+    /// 获取自旋锁并返回 RAII 守卫（Drop 时 Release）
     fn lock(&self) -> StateGuard<'_> {
-        while self
-            .lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        // SAFETY: init 之后只读
+        let lock = unsafe { *self.spin_lock.get() };
+        // SAFETY: lock 为 init 创建的有效句柄；Acquire 自动提升 IRQL 到 DISPATCH_LEVEL
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockAcquire, lock);
         }
         StateGuard(self)
     }
 }
+
+/// 自旋锁守卫（RAII 释放）
+struct StateGuard<'a>(&'a StateCell);
 
 impl core::ops::Deref for StateGuard<'_> {
     type Target = State;
@@ -199,7 +233,11 @@ impl core::ops::DerefMut for StateGuard<'_> {
 
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
-        self.0.lock.store(false, Ordering::Release);
+        // SAFETY: 与 WdfSpinLockAcquire 成对；Release 恢复原 IRQL
+        let lock = unsafe { *self.0.spin_lock.get() };
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfSpinLockRelease, lock);
+        }
     }
 }
 
@@ -383,12 +421,13 @@ unsafe extern "C" fn evt_io_internal_device_control(
 /// 分发 HID IOCTL（按队列所属实例取角色）
 ///
 /// # Safety
-/// request 必须为有效 WDFREQUEST。
+/// request 必须为有效 WDFREQUEST；output_len/input_len 须为该请求对应方向的
+/// 缓冲区长度（KMDF 回调参数即 DeviceIoControl 的 Output/InputBufferLength）。
 unsafe fn dispatch_ioctl(
     queue: WDFQUEUE,
     request: WDFREQUEST,
-    _output_len: usize,
-    _input_len: usize,
+    output_len: usize,
+    input_len: usize,
     code: u32,
 ) -> DispatchResult {
     let Some(role) = role_for_queue(queue) else {
@@ -412,21 +451,23 @@ unsafe fn dispatch_ioctl(
             unsafe { handle_read_report(role, request) }
         }
         hid::IOCTL_HID_WRITE_REPORT | hid::IOCTL_HID_SET_OUTPUT_REPORT => {
-            // 注入入口：接收报告并投递
-            DispatchResult::Complete(unsafe { handle_inject(role, request) })
+            // 注入入口：接收报告并投递（包经 Irp->UserBuffer 传入）
+            DispatchResult::Complete(unsafe { handle_inject(role, request, input_len) })
         }
         hid::IOCTL_HID_GET_INPUT_REPORT => {
-            // HidD_GetInputReport：返回当前状态
-            DispatchResult::Complete(unsafe { handle_get_input_report(role, request) })
+            // HidD_GetInputReport：返回当前状态（包经 Irp->UserBuffer 传入）
+            DispatchResult::Complete(unsafe { handle_get_input_report(role, request, output_len) })
         }
         hid::IOCTL_HID_GET_FEATURE | hid::IOCTL_HID_SET_FEATURE => {
-            // 无 feature 报告；空操作
-            DispatchResult::Complete(STATUS_SUCCESS)
+            // 本设备无 feature 报告：返回 NOT_SUPPORTED 而非伪成功
+            //（ntstatus.h 0xC00000BB；hidclass 映射 ERROR_NOT_SUPPORTED 给 HidD_* 调用方）
+            DispatchResult::Complete(STATUS_NOT_SUPPORTED)
         }
         hid::IOCTL_HID_GET_STRING => {
-            // 设备名由 INF 提供；返回空串即可
-            DispatchResult::Complete(STATUS_SUCCESS)
+            // 设备字符串由 INF/devnode 提供，minidriver 不实现 HID 字符串：同上 NOT_SUPPORTED
+            DispatchResult::Complete(STATUS_NOT_SUPPORTED)
         }
+        // 未知 IOCTL 属无效请求（hidclass 只发已知集合）
         _ => DispatchResult::Complete(STATUS_INVALID_DEVICE_REQUEST),
     }
 }
@@ -500,11 +541,11 @@ unsafe fn handle_read_report(role: Role, request: WDFREQUEST) -> DispatchResult 
 /// 注入入口：解析 HID_XFER_PACKET，把报告写入状态并投递
 ///
 /// # Safety
-/// request 为有效 WDFREQUEST。
-unsafe fn handle_inject(role: Role, request: WDFREQUEST) -> NTSTATUS {
+/// request 为有效 WDFREQUEST；input_len 为其输入缓冲区长度。
+unsafe fn handle_inject(role: Role, request: WDFREQUEST, input_len: usize) -> NTSTATUS {
     let report_size = report_size(role);
     let mut packet = HID_XFER_PACKET::default();
-    let status = unsafe { retrieve_packet(request, true, &mut packet) };
+    let status = unsafe { retrieve_packet(request, input_len, &mut packet) };
     if status < 0 {
         return status;
     }
@@ -534,11 +575,11 @@ unsafe fn handle_inject(role: Role, request: WDFREQUEST) -> NTSTATUS {
 /// HidD_GetInputReport：把当前报告拷贝到 packet.reportBuffer
 ///
 /// # Safety
-/// request 为有效 WDFREQUEST。
-unsafe fn handle_get_input_report(role: Role, request: WDFREQUEST) -> NTSTATUS {
+/// request 为有效 WDFREQUEST；output_len 为其输出缓冲区长度。
+unsafe fn handle_get_input_report(role: Role, request: WDFREQUEST, output_len: usize) -> NTSTATUS {
     let report_size = report_size(role);
     let mut packet = HID_XFER_PACKET::default();
-    let status = unsafe { retrieve_packet(request, false, &mut packet) };
+    let status = unsafe { retrieve_packet(request, output_len, &mut packet) };
     if status < 0 {
         return status;
     }
@@ -601,41 +642,30 @@ fn inject_report(role: Role, report: &[u8]) {
 
 // ---------------- 缓冲区辅助 ----------------
 
-/// 从请求输入/输出缓冲区取 HID_XFER_PACKET
+/// 从请求取 HID_XFER_PACKET：hidclass 把包结构体放在 `Irp->UserBuffer`
+///（无论 METHOD_NEITHER 还是 METHOD_*_DIRECT，vhidmini2 util.c
+/// `RequestGetHidXferPacket_ToRead/WriteToDevice` 同款取法——WdfRequestRetrieve
+/// Input/OutputMemory 对这类请求取到的不是该包，必须经 WDM 逃逸取 IRP）。
+/// `buffer_len` 为该请求对应方向的缓冲区长度（Input/OutputBufferLength），
+/// 与 vhidmini2 一样先做包大小下限校验。
 ///
 /// # Safety
-/// request 为有效 WDFREQUEST。
+/// request 为有效 WDFREQUEST；buffer_len 须与请求实际缓冲区长度一致。
 unsafe fn retrieve_packet(
     request: WDFREQUEST,
-    from_input: bool,
+    buffer_len: usize,
     packet: &mut HID_XFER_PACKET,
 ) -> NTSTATUS {
-    let mut memory: WDFMEMORY = core::ptr::null_mut();
-    let status = if from_input {
-        // SAFETY: 取输入缓冲区
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut memory)
-        }
-    } else {
-        // SAFETY: 取输出缓冲区
-        unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestRetrieveOutputMemory, request, &mut memory)
-        }
-    };
-    if status < 0 {
-        return status;
-    }
-    let mut len: usize = 0;
-    // SAFETY: memory 有效
-    let buf: PVOID =
-        unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, memory, &mut len) };
-    if len < size_of::<HID_XFER_PACKET>() {
+    if buffer_len < size_of::<HID_XFER_PACKET>() {
         return STATUS_INVALID_BUFFER_SIZE;
     }
-    // SAFETY: buf 指向 hidclass 传入的 HID_XFER_PACKET，长度 >= sizeof
+    // SAFETY: request 为有效 WDFREQUEST
+    let irp = unsafe { call_unsafe_wdf_function_binding!(WdfRequestWdmGetIrp, request) };
+    // SAFETY: hidclass 派发 minidriver IOCTL 时保证 UserBuffer 指向有效的
+    // HID_XFER_PACKET（包所在缓冲区长度已由上面 buffer_len 校验）；整包按字节拷出
     unsafe {
         core::ptr::copy_nonoverlapping(
-            buf.cast::<u8>(),
+            (*irp).UserBuffer.cast::<u8>(),
             (packet as *mut HID_XFER_PACKET).cast::<u8>(),
             size_of::<HID_XFER_PACKET>(),
         );
@@ -698,7 +728,7 @@ pub unsafe extern "system" fn driver_entry(
         ..WDF_DRIVER_CONFIG::default()
     };
     // SAFETY: driver/registry_path 由 DriverEntry 提供且有效；config 有效；handle 输出可空
-    unsafe {
+    let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,
             driver as PDRIVER_OBJECT,
@@ -707,12 +737,30 @@ pub unsafe extern "system" fn driver_entry(
             &mut config,
             WDF_NO_HANDLE.cast::<WDFDRIVER>(),
         )
+    };
+    if status < 0 {
+        return status;
     }
+    // 初始化全局 WDF 自旋锁（早于一切设备/IO 回调）
+    STATE.init()
 }
 
-/// panic 处理器：内核不允许 unwind，卡死等待调试器
+/// panic 处理器：内核态 panic 无法 unwind，自旋=静默挂死；直接 bugcheck 留下蓝屏证据。
+/// BugCheck 码取 bugcodes.h 的 MANUALLY_INITIATED_CRASH (0xE2)，
+/// 参数 1 传 PanicInfo 指针供调试器/转储定位。
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // SAFETY: bugcheck 为终态调用（不返回），参数仅承载诊断信息
+    unsafe {
+        wdk_sys::ntddk::KeBugCheckEx(
+            MANUALLY_INITIATED_CRASH as _,
+            (info as *const core::panic::PanicInfo).addr() as _,
+            0,
+            0,
+            0,
+        );
+    }
+    // KeBugCheckEx 不返回；仅满足类型系统
     loop {}
 }

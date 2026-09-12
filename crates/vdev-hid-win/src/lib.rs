@@ -1,15 +1,10 @@
 //! vdev 虚拟 HID（Windows）：SendInput 事件注入（路线 A，用户态）。
 //! 等价 macOS vdev-hid 的 CGEventPost 语义：向系统注入键盘/鼠标事件。
+//!
+//! 窗口相关实现按 `#[cfg(windows)]` 门控；宿主（macOS）`cargo test` 编译并运行
+//! windows-free 纯逻辑模块（`report`）的单测，windows 目标运行全量（cfg 门控对称）。
 
 #![allow(clippy::missing_errors_doc)]
-
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
-    VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT,
-};
 
 /// 按键事件（down/up/tap）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +30,24 @@ pub enum MouseAction {
     Click,
 }
 
+#[cfg(windows)]
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+    VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT,
+};
+
+/// 快捷键修饰位（VK_CONTROL/VK_MENU/VK_SHIFT，winuser.h 稳定 ABI 值）
+#[cfg(windows)]
+pub const MOD_CONTROL: u16 = VK_CONTROL.0;
+#[cfg(windows)]
+pub const MOD_ALT: u16 = VK_MENU.0;
+#[cfg(windows)]
+pub const MOD_SHIFT: u16 = VK_SHIFT.0;
+
+#[cfg(windows)]
 fn keyboard_input(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     let mut ki = KEYBDINPUT {
         wVk: VIRTUAL_KEY(vk),
@@ -55,6 +68,7 @@ fn keyboard_input(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     input
 }
 
+#[cfg(windows)]
 fn unicode_input(ch: u16) -> INPUT {
     let ki = KEYBDINPUT {
         wVk: VIRTUAL_KEY(0),
@@ -71,6 +85,7 @@ fn unicode_input(ch: u16) -> INPUT {
     input
 }
 
+#[cfg(windows)]
 fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
     let mi = MOUSEINPUT {
         dx,
@@ -88,6 +103,7 @@ fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
     input
 }
 
+#[cfg(windows)]
 fn dispatch(inputs: &[INPUT]) -> anyhow::Result<u32> {
     // SAFETY: inputs 均为有效初始化的 INPUT
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
@@ -104,6 +120,7 @@ fn dispatch(inputs: &[INPUT]) -> anyhow::Result<u32> {
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn send_key(vk: u16, action: KeyAction) -> anyhow::Result<u32> {
     let mut inputs = Vec::new();
     match action {
@@ -121,6 +138,7 @@ pub fn send_key(vk: u16, action: KeyAction) -> anyhow::Result<u32> {
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn send_hotkey(modifiers: &[u16], vk: u16) -> anyhow::Result<u32> {
     let mut inputs = Vec::new();
     for m in modifiers {
@@ -134,14 +152,11 @@ pub fn send_hotkey(modifiers: &[u16], vk: u16) -> anyhow::Result<u32> {
     dispatch(&inputs)
 }
 
-pub const MOD_CONTROL: u16 = VK_CONTROL.0;
-pub const MOD_ALT: u16 = VK_MENU.0;
-pub const MOD_SHIFT: u16 = VK_SHIFT.0;
-
 /// 输入文本（UTF-16，支持中文等任意 Unicode；经 KEYEVENTF_UNICODE）
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn send_text(text: &str) -> anyhow::Result<u32> {
     let mut inputs = Vec::new();
     for u in text.encode_utf16() {
@@ -162,6 +177,7 @@ pub fn send_text(text: &str) -> anyhow::Result<u32> {
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn mouse_move_relative(dx: i32, dy: i32) -> anyhow::Result<u32> {
     dispatch(&[mouse_input(MOUSEEVENTF_MOVE, dx, dy, 0)])
 }
@@ -170,6 +186,7 @@ pub fn mouse_move_relative(dx: i32, dy: i32) -> anyhow::Result<u32> {
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn mouse_move_absolute(x: u16, y: u16) -> anyhow::Result<u32> {
     dispatch(&[mouse_input(
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
@@ -179,6 +196,7 @@ pub fn mouse_move_absolute(x: u16, y: u16) -> anyhow::Result<u32> {
     )])
 }
 
+#[cfg(windows)]
 fn button_down_flag(btn: MouseButton) -> MOUSE_EVENT_FLAGS {
     match btn {
         MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
@@ -187,6 +205,7 @@ fn button_down_flag(btn: MouseButton) -> MOUSE_EVENT_FLAGS {
     }
 }
 
+#[cfg(windows)]
 fn button_up_flag(btn: MouseButton) -> MOUSE_EVENT_FLAGS {
     match btn {
         MouseButton::Left => MOUSEEVENTF_LEFTUP,
@@ -199,6 +218,7 @@ fn button_up_flag(btn: MouseButton) -> MOUSE_EVENT_FLAGS {
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn mouse_button(btn: MouseButton, action: MouseAction) -> anyhow::Result<u32> {
     let mut inputs = Vec::new();
     match action {
@@ -216,11 +236,12 @@ pub fn mouse_button(btn: MouseButton, action: MouseAction) -> anyhow::Result<u32
 ///
 /// # Errors
 /// SendInput 失败时返回错误。
+#[cfg(windows)]
 pub fn mouse_wheel(delta: i32) -> anyhow::Result<u32> {
     dispatch(&[mouse_input(MOUSEEVENTF_WHEEL, 0, 0, delta as u32)])
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

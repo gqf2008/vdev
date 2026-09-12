@@ -1,5 +1,7 @@
 //! 键名 → 虚拟键码（VK_*）映射（大小写不敏感）
 #![allow(clippy::missing_errors_doc)]
+// 非 Windows 目标：本模块仅被单测消费（消费方 run() 为 windows 门控）
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// 解析键名到虚拟键码
 pub fn key_to_vk(name: &str) -> Option<u16> {

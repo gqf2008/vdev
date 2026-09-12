@@ -1,11 +1,29 @@
-//! HID minidriver 契约：类型、IOCTL 常量与键盘报告描述符（对照 hidport.h / vhidmini2）
+//! HID minidriver 契约：类型（对照 hidport.h / hidclass.h）；
+//! IOCTL 常量与报告描述符的纯逻辑在 `contract.rs`（windows-free，可宿主单测）。
 
 #![allow(non_snake_case, non_camel_case_types)]
 
+use core::mem::size_of;
+
 use wdk_sys::{PVOID, UCHAR, ULONG};
 
+#[path = "contract.rs"]
+mod contract;
+
+pub use contract::{
+    IOCTL_HID_GET_DEVICE_ATTRIBUTES, IOCTL_HID_GET_DEVICE_DESCRIPTOR, IOCTL_HID_GET_FEATURE,
+    IOCTL_HID_GET_INPUT_REPORT, IOCTL_HID_GET_REPORT_DESCRIPTOR, IOCTL_HID_GET_STRING,
+    IOCTL_HID_READ_REPORT, IOCTL_HID_SET_FEATURE, IOCTL_HID_SET_OUTPUT_REPORT,
+    IOCTL_HID_WRITE_REPORT, KEYBOARD_REPORT_DESCRIPTOR, MOUSE_REPORT_DESCRIPTOR,
+};
+
 /// HID 描述符（IOCTL_HID_GET_DEVICE_DESCRIPTOR 返回）
-#[repr(C)]
+///
+/// 布局出处：hidport.h `_HID_DESCRIPTOR`，整体被 `pshpack1.h`/`poppack.h` 包裹
+/// （1 字节对齐，sizeof = 9）——Rust 侧必须 `packed` 与之对齐。
+/// packed 结构体禁止 `&field`/跨字段引用：所有字段访问一律按值读写或整结构体
+/// 字节拷贝（当前仅静态构造 + `copy_to_output` 整体拷出，无字段引用）。
+#[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct HID_DESCRIPTOR {
     pub bLength: UCHAR,
@@ -16,14 +34,25 @@ pub struct HID_DESCRIPTOR {
     pub DescriptorList: [HID_DESCRIPTOR_LIST_ENTRY; 1],
 }
 
-#[repr(C)]
+/// hidport.h `_HID_DESCRIPTOR_DESC_LIST`（同在 pshpack1.h 范围内：UCHAR+USHORT 紧排）
+#[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct HID_DESCRIPTOR_LIST_ENTRY {
     pub bDescriptorType: UCHAR,
     pub wDescriptorLength: u16,
 }
 
+// 编译期布局断言：与 hidport.h pshpack1.h 的 9 字节一致。
+// 验证范围（如实表述）：contract.rs（IOCTL 常量+描述符字节）经宿主 `cargo test`
+// 编译并运行单测验证（src/report.rs 以 #[path] 共享同一份）；本 packed 结构体与
+// 下方断言只能在 Windows 侧编译时验证——kernel workspace 因 wdk-build 拒绝非
+// Windows 主机，本机 macOS 编不到（rustc 1.98 已手工验证 packed+derive+静态构造
+// 可编译）。
+const _: () = assert!(size_of::<HID_DESCRIPTOR>() == 9);
+
 /// 设备属性（IOCTL_HID_GET_DEVICE_ATTRIBUTES 返回）
+///
+/// 布局出处：hidport.h `HID_DEVICE_ATTRIBUTES`（无 pack 包裹，自然对齐，sizeof = 8）
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct HID_DEVICE_ATTRIBUTES {
@@ -33,7 +62,9 @@ pub struct HID_DEVICE_ATTRIBUTES {
     pub VersionNumber: u16,
 }
 
-/// hidclass 与 minidriver 之间传递报告的传输包（hidport.h HID_XFER_PACKET）
+/// hidclass 与 minidriver 之间传递报告的传输包
+///
+/// 布局出处：hidclass.h `HID_XFER_PACKET`（无 pack 包裹，自然对齐）
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct HID_XFER_PACKET {
@@ -41,96 +72,3 @@ pub struct HID_XFER_PACKET {
     pub reportBufferLen: ULONG,
     pub reportId: UCHAR,
 }
-
-/// CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, id, method, FILE_ANY_ACCESS=0)
-const fn ctl_code(id: u32, method: u32) -> u32 {
-    (0x0Bu32 << 16) | (id << 2) | method
-}
-
-/// METHOD_NEITHER = 3
-pub const IOCTL_HID_GET_DEVICE_DESCRIPTOR: u32 = ctl_code(0x0000, 3);
-pub const IOCTL_HID_GET_REPORT_DESCRIPTOR: u32 = ctl_code(0x0001, 3);
-pub const IOCTL_HID_READ_REPORT: u32 = ctl_code(0x0002, 3);
-pub const IOCTL_HID_WRITE_REPORT: u32 = ctl_code(0x0003, 3);
-pub const IOCTL_HID_GET_DEVICE_ATTRIBUTES: u32 = ctl_code(0x0004, 3);
-pub const IOCTL_HID_GET_STRING: u32 = ctl_code(0x0005, 3);
-/// METHOD_OUT_DIRECT = 2
-pub const IOCTL_HID_GET_FEATURE: u32 = ctl_code(0x0006, 2);
-/// METHOD_IN_DIRECT = 0
-pub const IOCTL_HID_SET_FEATURE: u32 = ctl_code(0x0007, 0);
-pub const IOCTL_HID_GET_INPUT_REPORT: u32 = ctl_code(0x0008, 2);
-pub const IOCTL_HID_SET_OUTPUT_REPORT: u32 = ctl_code(0x0009, 0);
-
-/// 键盘 HID 报告描述符：标准 Boot Keyboard 输入报告（8 字节）+ 厂商 8 字节输出管道。
-/// 输出管道（Usage Undefined）专供用户态注入：WriteFile 的 8 字节报告经
-/// IOCTL_HID_WRITE_REPORT 到达 minidriver，被当作键盘输入报告投递。
-pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x06, // Usage (Keyboard)
-    0xA1, 0x01, // Collection (Application)
-    0x05, 0x07, //   Usage Page (Key Codes)
-    0x19, 0xE0, //   Usage Minimum (224)
-    0x29, 0xE7, //   Usage Maximum (231)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x01, //   Logical Maximum (1)
-    0x75, 0x01, //   Report Size (1)
-    0x95, 0x08, //   Report Count (8)
-    0x81, 0x02, //   Input (Data, Variable, Absolute) —— 修饰键
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x08, //   Report Size (8)
-    0x81, 0x01, //   Input (Constant) —— 保留
-    0x95, 0x06, //   Report Count (6)
-    0x75, 0x08, //   Report Size (8)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x65, //   Logical Maximum (101)
-    0x05, 0x07, //   Usage Page (Key Codes)
-    0x19, 0x00, //   Usage Minimum (0)
-    0x29, 0x65, //   Usage Maximum (101)
-    0x81, 0x00, //   Input (Data, Array) —— 按键码
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8)
-    0x95, 0x08, //   Report Count (8)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
-    0xC0, // End Collection
-];
-
-/// 鼠标 HID 报告描述符：标准鼠标输入（4 字节）+ 厂商 4 字节输出管道（注入）
-pub static MOUSE_REPORT_DESCRIPTOR: [u8; 67] = [
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x02, // Usage (Mouse)
-    0xA1, 0x01, // Collection (Application)
-    0x09, 0x01, //   Usage (Pointer)
-    0xA1, 0x00, //   Collection (Physical)
-    0x05, 0x09, //     Usage Page (Buttons)
-    0x19, 0x01, //     Usage Minimum (1)
-    0x29, 0x03, //     Usage Maximum (3)
-    0x15, 0x00, //     Logical Minimum (0)
-    0x25, 0x01, //     Logical Maximum (1)
-    0x95, 0x03, //     Report Count (3)
-    0x75, 0x01, //     Report Size (1)
-    0x81, 0x02, //     Input (Data, Variable, Absolute) —— 键位
-    0x95, 0x01, //     Report Count (1)
-    0x75, 0x05, //     Report Size (5)
-    0x81, 0x01, //     Input (Constant)
-    0x05, 0x01, //     Usage Page (Generic Desktop)
-    0x09, 0x30, //     Usage (X)
-    0x09, 0x31, //     Usage (Y)
-    0x09, 0x38, //     Usage (Wheel)
-    0x15, 0x81, //     Logical Minimum (-127)
-    0x25, 0x7F, //     Logical Maximum (127)
-    0x75, 0x08, //     Report Size (8)
-    0x95, 0x03, //     Report Count (3)
-    0x81, 0x06, //     Input (Data, Variable, Relative) —— X/Y/滚轮
-    0xC0, //   End Collection (Physical)
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8)
-    0x95, 0x04, //   Report Count (4)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
-    0xC0, // End Collection
-];

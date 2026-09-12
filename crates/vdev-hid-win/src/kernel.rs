@@ -1,6 +1,9 @@
 //! vdev-hid-win 内核路线（路线 B）：虚拟 HID 内核驱动的安装/状态与报告注入。
-//! 安装/卸载/状态走 SetupAPI（HIDClass，Root\vdev-hid）；注入经 HID 接口
-//! WriteFile 8 字节键盘报告（厂商输出管道），由驱动投递给 hidclass。
+//! 安装/卸载/状态走 SetupAPI（HIDClass，Root\vdev-hid[-mouse]）；注入经 HID 接口
+//! WriteFile 8 字节键盘 / 4 字节鼠标报告（厂商输出管道），由驱动投递给 hidclass。
+//!
+//! 纯逻辑（键码映射/报告组装/HWID 匹配）在 `crate::report`（windows-free，可宿主单测），
+//! 本模块经重导出保持既有调用面不变。本模块整体仅 Windows 可编译（SetupAPI/WMI）。
 
 use std::path::Path;
 
@@ -24,12 +27,18 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
+// ---------------- 纯逻辑重导出（保持既有调用面） ----------------
+
+use crate::report::hwid_matches;
+pub use crate::report::{PID_KBD, PID_MOUSE};
+pub use crate::report::{key_to_hid, make_report, mouse_button_bit, mouse_report};
+
+/// 键盘设备硬件 ID（与 INF `Root\vdev-hid` 一致）
 pub const HARDWARE_ID: &str = r"Root\vdev-hid";
+/// 鼠标设备硬件 ID（与 INF `Root\vdev-hid-mouse` 一致）
+pub const MOUSE_HARDWARE_ID: &str = r"Root\vdev-hid-mouse";
 /// vdev 虚拟键盘 VID/PID（与驱动一致）
 const VID: u16 = 0x5644;
-
-/// 8 字节键盘报告：1 修饰键 + 1 保留 + 6 按键
-const KEYBOARD_REPORT_SIZE: usize = 8;
 
 // ---------------- 安装 / 卸载 / 状态（SetupAPI） ----------------
 
@@ -64,29 +73,18 @@ fn read_multi_sz(
         }
         buf.resize(required as usize, 0);
     }
-    buf.chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    buf.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect()
 }
 
-fn wide_contains(haystack: &[u16], needle: &str) -> bool {
-    let needle: Vec<u16> = needle.encode_utf16().collect();
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle.as_slice())
-}
-
-fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_HIDCLASS),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
-    }
-    .context("SetupDiGetClassDevsW failed")?;
-    let mut found = None;
+/// 按 HWID（精确匹配，大小写不敏感）在设备集合中查找节点
+fn find_device_by_hwid(
+    devs: windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+    hwid: &str,
+) -> Option<SP_DEVINFO_DATA> {
     let mut index = 0u32;
     loop {
         let mut info = SP_DEVINFO_DATA {
@@ -98,16 +96,14 @@ fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
         }
         index += 1;
         let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-        if wide_contains(&hwids, HARDWARE_ID) {
-            found = Some(info);
-            break;
+        if hwid_matches(&hwids, hwid) {
+            return Some(info);
         }
     }
-    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(found)
+    None
 }
 
-fn remove_all_nodes() -> Result<usize> {
+fn open_class_devices() -> Result<windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO> {
     let devs = unsafe {
         SetupDiGetClassDevsW(
             Some(&GUID_DEVCLASS_HIDCLASS),
@@ -117,6 +113,18 @@ fn remove_all_nodes() -> Result<usize> {
         )
     }
     .context("SetupDiGetClassDevsW failed")?;
+    Ok(devs)
+}
+
+fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
+    let devs = open_class_devices()?;
+    let found = find_device_by_hwid(devs, HARDWARE_ID);
+    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+    Ok(found)
+}
+
+fn remove_all_nodes() -> Result<usize> {
+    let devs = open_class_devices()?;
     let mut to_remove: Vec<SP_DEVINFO_DATA> = Vec::new();
     let mut index = 0u32;
     loop {
@@ -129,7 +137,7 @@ fn remove_all_nodes() -> Result<usize> {
         }
         index += 1;
         let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-        if wide_contains(&hwids, HARDWARE_ID) {
+        if hwid_matches(&hwids, HARDWARE_ID) || hwid_matches(&hwids, MOUSE_HARDWARE_ID) {
             to_remove.push(info);
         }
     }
@@ -161,7 +169,71 @@ fn remove_all_nodes() -> Result<usize> {
     Ok(to_remove.len())
 }
 
-/// 安装驱动：清理旧节点 + 创建设备节点 + DiInstallDriverW 装入驱动存储
+/// 创建并注册一个设备节点（硬件 ID 由 INF 模型行匹配到对应安装节，
+/// Role 键由 INF 的 AddReg 写入，用户态不重复设置）
+fn create_and_register_device(
+    devs: windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+    class_name: &[u16],
+    class_guid: &windows::core::GUID,
+    hardware_id: &str,
+) -> Result<()> {
+    let mut dev_info = SP_DEVINFO_DATA {
+        cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+        ..Default::default()
+    };
+    let class_name_cstr: Vec<u16> = class_name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .copied()
+        .chain(std::iter::once(0))
+        .collect();
+    let create_res = unsafe {
+        SetupDiCreateDeviceInfoW(
+            devs,
+            PCWSTR(class_name_cstr.as_ptr()),
+            class_guid,
+            None,
+            None,
+            DICD_GENERATE_ID,
+            Some(&mut dev_info),
+        )
+    };
+    match create_res {
+        Ok(()) => {}
+        Err(e) if e.code().0 as u32 == 0xE0000207 => {
+            unsafe {
+                SetupDiOpenDeviceInfoW(
+                    devs,
+                    PCWSTR(class_name_cstr.as_ptr()),
+                    None,
+                    0,
+                    Some(&mut dev_info),
+                )
+            }
+            .with_context(|| "SetupDiOpenDeviceInfoW failed")?;
+        }
+        Err(e) => return Err(e).context("SetupDiCreateDeviceInfoW failed"),
+    }
+    let mut hwid: Vec<u16> = hardware_id.encode_utf16().collect();
+    hwid.push(0);
+    hwid.push(0);
+    let bytes = hwid
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<u8>>();
+    unsafe {
+        SetupDiSetDeviceRegistryPropertyW(devs, &mut dev_info, SPDRP_HARDWAREID, Some(&bytes))
+    }
+    .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
+    unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
+        .with_context(|| "DIF_REGISTERDEVICE failed")?;
+    Ok(())
+}
+
+/// 安装驱动：清理旧节点 + 创建键盘/鼠标两个设备节点 + DiInstallDriverW 装入驱动存储
+///
+/// 修复记录：原实现只创建 `Root\vdev-hid`（键盘）节点，INF 的鼠标安装节
+/// （`Root\vdev-hid-mouse`）永远匹配不上，鼠标设备无法枚举。
 pub fn install(inf_dir: &Path) -> Result<()> {
     let inf_path = inf_dir.join("vdev-hid.inf");
     if !inf_path.exists() {
@@ -196,56 +268,10 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         .context("SetupDiCreateDeviceInfoList failed")?;
 
     let result = (|| -> Result<()> {
-        let mut dev_info = SP_DEVINFO_DATA {
-            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        let class_name_cstr: Vec<u16> = class_name
-            .iter()
-            .take_while(|&&c| c != 0)
-            .copied()
-            .chain(std::iter::once(0))
-            .collect();
-        let create_res = unsafe {
-            SetupDiCreateDeviceInfoW(
-                devs,
-                PCWSTR(class_name_cstr.as_ptr()),
-                &class_guid,
-                None,
-                None,
-                DICD_GENERATE_ID,
-                Some(&mut dev_info),
-            )
-        };
-        match create_res {
-            Ok(()) => {}
-            Err(e) if e.code().0 as u32 == 0xE0000207 => {
-                unsafe {
-                    SetupDiOpenDeviceInfoW(
-                        devs,
-                        PCWSTR(class_name_cstr.as_ptr()),
-                        None,
-                        0,
-                        Some(&mut dev_info),
-                    )
-                }
-                .with_context(|| "SetupDiOpenDeviceInfoW failed")?;
-            }
-            Err(e) => return Err(e).context("SetupDiCreateDeviceInfoW failed"),
+        // 键盘 + 鼠标两个根枚举节点，HWID 与 INF 模型行逐一对应
+        for hardware_id in [HARDWARE_ID, MOUSE_HARDWARE_ID] {
+            create_and_register_device(devs, &class_name, &class_guid, hardware_id)?;
         }
-        let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
-        hwid.push(0);
-        hwid.push(0);
-        let bytes = hwid
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect::<Vec<u8>>();
-        unsafe {
-            SetupDiSetDeviceRegistryPropertyW(devs, &mut dev_info, SPDRP_HARDWAREID, Some(&bytes))
-        }
-        .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
-            .with_context(|| "DIF_REGISTERDEVICE failed")?;
 
         let inf_path = std::fs::canonicalize(&inf_path).context("无法解析 INF 绝对路径")?;
         let inf_path_wide: Vec<u16> = inf_path
@@ -275,45 +301,14 @@ pub fn install(inf_dir: &Path) -> Result<()> {
     result
 }
 
-/// 卸载
+/// 卸载：移除键盘与鼠标全部残留节点
 pub fn uninstall() -> Result<bool> {
-    let Some(dev_info) = find_device()? else {
-        println!("未找到 vdev 虚拟键盘设备");
+    let removed = remove_all_nodes()?;
+    if removed == 0 {
+        println!("未找到 vdev 虚拟键盘/鼠标设备");
         return Ok(false);
-    };
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_HIDCLASS),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
     }
-    .context("SetupDiGetClassDevsW failed")?;
-    let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-        ClassInstallHeader:
-            windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<
-                    windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
-                >() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-        Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
-        HwProfile: 0,
-    };
-    unsafe {
-        windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
-            devs,
-            Some(&dev_info),
-            (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
-        )
-    }
-    .context("SetupDiSetDeviceInstallParamsW failed")?;
-    unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(&dev_info)) }
-        .with_context(|| "DIF_REMOVE failed")?;
-    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    println!("已移除 vdev 虚拟键盘设备");
+    println!("已移除 {removed} 个 vdev 虚拟设备节点");
     Ok(true)
 }
 
@@ -334,15 +329,7 @@ pub fn status() -> Result<DeviceStatus> {
             friendly_name: None,
         });
     };
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_HIDCLASS),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
-    }
-    .context("SetupDiGetClassDevsW failed")?;
+    let devs = open_class_devices()?;
     let driver = {
         let buf = read_multi_sz(devs, &dev_info, SPDRP_DRIVER);
         if buf.is_empty() {
@@ -377,7 +364,7 @@ pub fn status() -> Result<DeviceStatus> {
 
 // ---------------- 报告注入（经 HID 接口 WriteFile） ----------------
 
-/// 按 VID/PID 找到 vdev 虚拟键盘的 HID 设备路径
+/// 按 VID/PID 找到 vdev 虚拟键盘/鼠标的 HID 设备路径
 fn find_hid_path(pid: u16) -> Result<String> {
     let hid_guid = unsafe { HidD_GetHidGuid() };
     let devs = unsafe {
@@ -432,10 +419,12 @@ fn find_hid_path(pid: u16) -> Result<String> {
         }
         // 设备路径紧跟在 cbSize 之后（wchar_t 对齐）
         let path_ptr = unsafe { detail.cast::<u8>().add(std::mem::size_of::<u32>()) }.cast::<u16>();
+        // 有界 NUL 扫描：路径长度受缓冲区字节数约束（修复前无上限，畸形数据会越界读）
+        let max_chars = buf.len().saturating_sub(std::mem::size_of::<u32>()) / 2;
         let mut path_w: Vec<u16> = Vec::new();
         let mut i = 0usize;
         unsafe {
-            loop {
+            while i < max_chars {
                 let c = *path_ptr.add(i);
                 if c == 0 {
                     break;
@@ -472,10 +461,10 @@ fn find_hid_path(pid: u16) -> Result<String> {
         }
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    result.context("未找到 vdev 虚拟键盘 HID 设备（先安装驱动）")
+    result.context("未找到 vdev 虚拟 HID 设备（先安装驱动）")
 }
 
-/// 写入一个 8 字节键盘报告（按下/抬起）
+/// 写入一份报告（键盘 8 字节 / 鼠标 4 字节，按下/抬起）
 pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
     let path = find_hid_path(pid)?;
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -501,140 +490,6 @@ pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
         bail!("写入 HID 报告失败：{}", windows::core::Error::from_win32());
     }
     Ok(())
-}
-
-/// 键名 → （修饰键位, HID 用法码）
-pub fn key_to_hid(name: &str) -> Result<(u8, Option<u8>)> {
-    let n = name.to_ascii_lowercase();
-    // 修饰键：报告第 0 字节位（直接返回，不占按键槽）
-    match n.as_str() {
-        "ctrl" | "control" => return Ok((0x01, None)),
-        "shift" => return Ok((0x02, None)),
-        "alt" => return Ok((0x04, None)),
-        "win" | "lwin" => return Ok((0x08, None)),
-        _ => {}
-    }
-    // 单字母 a-z -> 0x04..
-    if n.len() == 1
-        && let Some(c) = n.chars().next()
-    {
-        if c.is_ascii_lowercase() {
-            return Ok((0, Some(0x04 + (c as u8 - b'a'))));
-        }
-        if c.is_ascii_digit() {
-            return Ok((0, Some(0x1E + (c as u8 - b'0'))));
-        }
-    }
-    // F1-F24
-    if let Some(f) = n.strip_prefix('f')
-        && let Ok(num) = f.parse::<u16>()
-        && (1..=24).contains(&num)
-    {
-        let usage = if num <= 12 {
-            0x3A + num - 1
-        } else {
-            0x68 + num - 13
-        };
-        return Ok((0, Some(usage as u8)));
-    }
-    let map: &[(&str, u8)] = &[
-        ("enter", 0x28),
-        ("return", 0x28),
-        ("esc", 0x29),
-        ("escape", 0x29),
-        ("backspace", 0x2A),
-        ("tab", 0x2B),
-        ("space", 0x2C),
-        ("minus", 0x2D),
-        ("equal", 0x2E),
-        ("lbrace", 0x2F),
-        ("rbrace", 0x30),
-        ("backslash", 0x31),
-        ("semicolon", 0x33),
-        ("quote", 0x34),
-        ("grave", 0x35),
-        ("comma", 0x36),
-        ("period", 0x37),
-        ("slash", 0x38),
-        ("capslock", 0x39),
-        ("caps", 0x39),
-        ("f1", 0x3A),
-        ("f2", 0x3B),
-        ("f3", 0x3C),
-        ("f4", 0x3D),
-        ("f5", 0x3E),
-        ("f6", 0x3F),
-        ("f7", 0x40),
-        ("f8", 0x41),
-        ("f9", 0x42),
-        ("f10", 0x43),
-        ("f11", 0x44),
-        ("f12", 0x45),
-        ("printscreen", 0x46),
-        ("scrolllock", 0x47),
-        ("pause", 0x48),
-        ("insert", 0x49),
-        ("ins", 0x49),
-        ("home", 0x4A),
-        ("pageup", 0x4B),
-        ("delete", 0x4C),
-        ("del", 0x4C),
-        ("end", 0x4D),
-        ("pagedown", 0x4E),
-        ("right", 0x4F),
-        ("left", 0x50),
-        ("down", 0x51),
-        ("up", 0x52),
-        ("numlock", 0x53),
-        ("numpad0", 0x62),
-        ("numpad1", 0x59),
-        ("numpad2", 0x5A),
-        ("numpad3", 0x5B),
-        ("numpad4", 0x5C),
-        ("numpad5", 0x5D),
-        ("numpad6", 0x5E),
-        ("numpad7", 0x5F),
-        ("numpad8", 0x60),
-        ("numpad9", 0x61),
-    ];
-    if let Some((_, usage)) = map.iter().find(|(k, _)| *k == n.as_str()) {
-        return Ok((0, Some(*usage)));
-    }
-    bail!(
-        "未知键名：{name}（支持 a-z/0-9/F1-F24/enter/tab/space/esc/backspace/arrows/ctrl/alt/shift/win 等）"
-    )
-}
-
-/// 构造键盘报告：mods 为修饰位，usage 为按键（None 表示纯修饰键）
-pub fn make_report(mods: u8, usage: Option<u8>) -> [u8; KEYBOARD_REPORT_SIZE] {
-    let mut r = [0u8; KEYBOARD_REPORT_SIZE];
-    r[0] = mods;
-    if let Some(u) = usage {
-        r[2] = u;
-    }
-    r
-}
-/// 键盘 HID 设备 PID（"HI"）
-pub const PID_KBD: u16 = 0x4849;
-
-/// 鼠标 HID 设备 PID（"HM"）
-pub const PID_MOUSE: u16 = 0x484D;
-/// 鼠标报告长度：1 键位 + X + Y + 滚轮
-pub const MOUSE_REPORT_SIZE: usize = 4;
-
-/// 构造 4 字节鼠标报告（键位 + 相对 X/Y + 滚轮，带符号）
-pub fn mouse_report(buttons: u8, dx: i8, dy: i8, wheel: i8) -> [u8; MOUSE_REPORT_SIZE] {
-    [buttons, dx as u8, dy as u8, wheel as u8]
-}
-
-/// 鼠标按键位（HID：bit0 左 / bit1 右 / bit2 中）
-pub fn mouse_button_bit(button: &str) -> Result<u8> {
-    match button.to_ascii_lowercase().as_str() {
-        "left" => Ok(0x01),
-        "right" => Ok(0x02),
-        "middle" => Ok(0x04),
-        _ => bail!("未知鼠标按键：{button}（left/right/middle）"),
-    }
 }
 
 /// 相对移动
@@ -676,54 +531,4 @@ pub fn mouse_wheel(delta: i32) -> Result<()> {
     let rep = mouse_report(0, 0, 0, wheel);
     write_report(PID_MOUSE, &rep)?;
     Ok(())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_to_hid_letters_and_digits() {
-        assert_eq!(key_to_hid("a").unwrap(), (0, Some(0x04)));
-        assert_eq!(key_to_hid("z").unwrap(), (0, Some(0x1D)));
-        assert_eq!(key_to_hid("A").unwrap(), (0, Some(0x04)));
-        assert_eq!(key_to_hid("0").unwrap(), (0, Some(0x1E)));
-        assert_eq!(key_to_hid("9").unwrap(), (0, Some(0x27)));
-    }
-
-    #[test]
-    fn key_to_hid_modifiers_and_named() {
-        assert_eq!(key_to_hid("ctrl").unwrap(), (0x01, None));
-        assert_eq!(key_to_hid("shift").unwrap(), (0x02, None));
-        assert_eq!(key_to_hid("alt").unwrap(), (0x04, None));
-        assert_eq!(key_to_hid("win").unwrap(), (0x08, None));
-        assert_eq!(key_to_hid("enter").unwrap(), (0, Some(0x28)));
-        assert_eq!(key_to_hid("space").unwrap(), (0, Some(0x2C)));
-        assert_eq!(key_to_hid("f1").unwrap(), (0, Some(0x3A)));
-        assert_eq!(key_to_hid("f12").unwrap(), (0, Some(0x45)));
-        assert!(key_to_hid("zzz").is_err());
-    }
-
-    #[test]
-    fn make_report_layout() {
-        assert_eq!(
-            make_report(0x03, Some(0x04)),
-            [0x03, 0, 0x04, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(make_report(0, None), [0; 8]);
-    }
-
-    #[test]
-    fn mouse_report_layout() {
-        // 键位 + X(10) + Y(-5) + 滚轮(1)
-        assert_eq!(mouse_report(0x01, 10, -5, 1), [0x01, 10, 251, 1]);
-        assert_eq!(mouse_report(0, 0, 0, 0), [0; 4]);
-    }
-
-    #[test]
-    fn mouse_button_bits() {
-        assert_eq!(mouse_button_bit("left").unwrap(), 0x01);
-        assert_eq!(mouse_button_bit("right").unwrap(), 0x02);
-        assert_eq!(mouse_button_bit("middle").unwrap(), 0x04);
-        assert!(mouse_button_bit("x1").is_err());
-    }
 }
