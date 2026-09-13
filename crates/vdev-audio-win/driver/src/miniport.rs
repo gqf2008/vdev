@@ -565,6 +565,48 @@ static AUDIO_SIGNALPROCESSINGMODE_DEFAULT: GUID = GUID {
     data3: 0x4965,
     data4: [0xb7, 0xd1, 0x1e, 0xef, 0x22, 0x8d, 0x2a, 0xf3],
 };
+/// 本驱动在 streaming pin 上暴露的信号处理模式（对照 sysvad speakertoptable.h 的
+/// SpeakerHostPinSupportedDeviceModes：RAW/DEFAULT/MEDIA/MOVIE/COMMUNICATIONS/NOTIFICATION）。
+/// 引擎会用 `IMiniportAudioSignalProcessing::GetModes` 取这个列表，并在
+/// `KSPROPERTY_PIN_PROPOSEDATAFORMAT2` 请求里带上对应模式属性。
+static SUPPORTED_MODES: [GUID; 6] = [
+    AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+    // RAW {9E90EA20-B493-4FD1-A1A8-7E1361A956CF}
+    GUID {
+        data1: 0x9e90_ea20,
+        data2: 0xb493,
+        data3: 0x4fd1,
+        data4: [0xa1, 0xa8, 0x7e, 0x13, 0x61, 0xa9, 0x56, 0xcf],
+    },
+    // MEDIA {4780004E-7133-41D8-8C74-660DADD2C0EE}
+    GUID {
+        data1: 0x4780_004e,
+        data2: 0x7133,
+        data3: 0x41d8,
+        data4: [0x8c, 0x74, 0x66, 0x0d, 0xad, 0xd2, 0xc0, 0xee],
+    },
+    // MOVIE {B26FEB0D-EC94-477C-9494-D1AB8E753F6E}
+    GUID {
+        data1: 0xb26f_eb0d,
+        data2: 0xec94,
+        data3: 0x477c,
+        data4: [0x94, 0x94, 0xd1, 0xab, 0x8e, 0x75, 0x3f, 0x6e],
+    },
+    // COMMUNICATIONS {98951333-B9CD-48B1-A0A3-FF40682D73F7}
+    GUID {
+        data1: 0x9895_1333,
+        data2: 0xb9cd,
+        data3: 0x48b1,
+        data4: [0xa0, 0xa3, 0xff, 0x40, 0x68, 0x2d, 0x73, 0xf7],
+    },
+    // NOTIFICATION {9CF2A70B-F377-403B-BD6B-360863E0355C}
+    GUID {
+        data1: 0x9cf2_a70b,
+        data2: 0xf377,
+        data3: 0x403b,
+        data4: [0xbd, 0x6b, 0x36, 0x08, 0x63, 0xe0, 0x35, 0x5c],
+    },
+];
 
 /// portcls.h `IPinCount`：PinCount(PinId, Necessary, Current, Possible, GlobalCurrent, GlobalPossible)
 #[repr(C)]
@@ -635,13 +677,17 @@ unsafe extern "system" fn signal_proc_get_modes(
     }
     let cap = unsafe { *num };
     if modes.is_null() || cap == 0 {
-        unsafe { *num = 1 };
+        unsafe { *num = SUPPORTED_MODES.len() as u32 };
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if (cap as usize) < SUPPORTED_MODES.len() {
+        unsafe { *num = SUPPORTED_MODES.len() as u32 };
         return STATUS_BUFFER_TOO_SMALL;
     }
     // SAFETY: 调用方保证 modes 至少可容纳 *num 个 GUID
     unsafe {
-        core::ptr::write(modes, AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
-        *num = 1;
+        core::ptr::copy_nonoverlapping(SUPPORTED_MODES.as_ptr(), modes, SUPPORTED_MODES.len());
+        *num = SUPPORTED_MODES.len() as u32;
     }
     STATUS_SUCCESS
 }
@@ -1811,18 +1857,44 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
     let need = size_of::<KsDataFormatWaveFormatExtensible>() as u32;
     if verb & KSPROPERTY_TYPE_GET != 0 {
         dbg_inc(&DBG_PROPOSED_GET);
-        if r.ValueSize < need {
+        // 官方契约（sysvad minwavert.cpp::PropertyHandlerProposedFormat2）：
+        //   cbMinSize = DefaultFormat->FormatSize 向上取 8 对齐，**再加上实例里的属性列表长度**
+        //   （KSATTRIBUTE 链，承载 AUDIO_SIGNALPROCESSINGMODE 等），value = [格式][属性列表]。
+        // 0 长度缓冲 = "只问需要多大" → 回 STATUS_BUFFER_OVERFLOW + ValueSize；
+        // 不足 → BUFFER_TOO_SMALL；足够 → 拷格式 + 原样回拷属性列表。
+        // 回归：原实现只拷 104 字节格式、0 长度也回 BUFFER_TOO_SMALL，引擎会反复提案。
+        const KSP_PIN_SIZE: usize = 32; // KSPROPERTY(24) + PinId(4) + Reserved(4)
+        let attr_len = (r.InstanceSize as usize).saturating_sub(KSP_PIN_SIZE);
+        let fmt_size = need as usize;
+        let need_total = ((fmt_size + 7) & !7) + attr_len;
+        if r.ValueSize == 0 {
+            r.ValueSize = need_total as u32;
+            DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        if (r.ValueSize as usize) < need_total {
+            r.ValueSize = need_total as u32;
+            DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
             return STATUS_BUFFER_TOO_SMALL;
         }
-        // SAFETY: 目标缓冲区 >= need 字节；源为只读静态（DEVICE_FORMAT 永不改写）
+        // SAFETY: 目标缓冲区 >= need_total；源为只读静态（DEVICE_FORMAT 永不改写）
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (&raw const DEVICE_FORMAT).cast::<u8>(),
                 r.Value.cast::<u8>(),
-                need as usize,
+                fmt_size,
             );
+            if attr_len > 0 && !r.Instance.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    (r.Instance as *const u8).add(KSP_PIN_SIZE),
+                    r.Value.cast::<u8>().add(fmt_size),
+                    attr_len,
+                );
+            }
         }
-        r.ValueSize = need;
+        DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
+        DBG_PROPOSED_ATTR_LEN.store(attr_len as u32, Ordering::Relaxed);
+        r.ValueSize = need_total as u32;
         return STATUS_SUCCESS;
     }
 
@@ -1946,6 +2018,9 @@ static DBG_AE_SET_STATUS: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_TAG: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_RATE: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_BITS: AtomicU32 = AtomicU32::new(0);
+/// PROPOSEDATAFORMAT2 GET 的返回长度与实例属性列表长度（看引擎带的模式属性）
+static DBG_PROPOSED_GET_SIZE: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_ATTR_LEN: AtomicU32 = AtomicU32::new(0);
 /// 引擎节点方法全量计数（16 个方法各一个槽，按 vtable 顺序）
 static DBG_AE_CALLS: [AtomicU32; 16] = [
     AtomicU32::new(0), // 0 GetAudioEngineDescriptor
@@ -2016,7 +2091,7 @@ static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
 };
 const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
 /// 计数器快照长度：32 个 u32
-const DBG_STATS_LEN: usize = 42 * 4;
+const DBG_STATS_LEN: usize = 44 * 4;
 
 unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
     // SAFETY: PortCls 保证 req 有效
@@ -2072,6 +2147,8 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
             DBG_AE_STORED_BITS.load(Ordering::Relaxed),
             DBG_AE_LAST_FAIL_IDX.load(Ordering::Relaxed),
             DBG_AE_LAST_FAIL_STATUS.load(Ordering::Relaxed),
+            DBG_PROPOSED_GET_SIZE.load(Ordering::Relaxed),
+            DBG_PROPOSED_ATTR_LEN.load(Ordering::Relaxed),
         ];
         // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
         unsafe {
