@@ -7,16 +7,16 @@ use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
 use serde::Serialize;
+use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DiInstallDriverW, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
-    SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-    SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiGetINFClassW, SetupDiOpenDeviceInfoW, SetupDiSetDeviceInstallParamsW,
-    SetupDiSetDeviceRegistryPropertyW, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE,
-    DIIRFLAG_FORCE_INF, DI_REMOVEDEVICE_GLOBAL, GUID_DEVCLASS_DISPLAY, HDEVINFO,
-    SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER, SPDRP_FRIENDLYNAME,
-    SPDRP_HARDWAREID, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
-    SP_REMOVEDEVICE_PARAMS,
+    CM_Get_Device_IDW, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW, DiInstallDriverW,
+    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
+    SetupDiOpenDeviceInfoW, SetupDiSetDeviceRegistryPropertyW, CM_LOCATE_DEVNODE_NORMAL,
+    CR_SUCCESS, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIIRFLAG_FORCE_INF, GUID_DEVCLASS_DISPLAY,
+    HDEVINFO, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DRIVER,
+    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
 };
 
 pub const HARDWARE_ID: &str = r"Root\vdev-display";
@@ -308,24 +308,7 @@ fn remove_all_nodes() -> Result<usize> {
     }
 
     for info in &mut to_remove {
-        let params = SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-            Scope: DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            SetupDiSetDeviceInstallParamsW(
-                devs,
-                Some(info),
-                (&params as *const SP_REMOVEDEVICE_PARAMS).cast::<SP_DEVINSTALL_PARAMS_W>(),
-            )
-        }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        remove_subtree(info)?;
     }
 
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
@@ -353,26 +336,7 @@ pub fn uninstall() -> Result<bool> {
 
     let result = (|| -> Result<()> {
         let dev_info = open_device(devs, &instance_id)?;
-
-        let params = SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-            Scope: DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            SetupDiSetDeviceInstallParamsW(
-                devs,
-                Some(&dev_info),
-                (&params as *const SP_REMOVEDEVICE_PARAMS).cast::<SP_DEVINSTALL_PARAMS_W>(),
-            )
-        }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
-
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(&dev_info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        remove_subtree(&dev_info)?;
 
         Ok(())
     })();
@@ -381,6 +345,39 @@ pub fn uninstall() -> Result<bool> {
     result?;
     println!("已移除 vdev 虚拟显示器设备");
     Ok(true)
+}
+
+/// 用配置管理器（CfgMgr）移除设备子树。
+///
+/// 不用 DIF_REMOVE：那条路在本机两条写法都失败——`SetupDiSetDeviceInstallParamsW`
+/// 强转 `SP_REMOVEDEVICE_PARAMS` 报 `0x800706F8`，改 `SetupDiSetClassInstallParamsW`
+/// 同样失败（HID 侧实测结论，显示器侧同款代码）。`CM_Query_And_Remove_SubTreeW`
+/// 是 neflib/nefcon 同款做法，实测可用。
+fn remove_subtree(info: &SP_DEVINFO_DATA) -> Result<()> {
+    let mut id_buf = [0u16; 512];
+    // SAFETY: info.DevInst 来自 SetupDi* 枚举；id_buf 可写且有长度
+    let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+    if cr != CR_SUCCESS {
+        bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
+    }
+    let mut devinst = 0u32;
+    // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+    let cr = unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR(id_buf.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if cr != CR_SUCCESS {
+        bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
+    }
+    // SAFETY: devinst 有效；不关心 veto 详情
+    let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+    if cr != CR_SUCCESS {
+        bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
+    }
+    Ok(())
 }
 
 /// 设备状态
