@@ -215,7 +215,7 @@ vdev-audio-win.exe uninstall                       # 卸载
 
 INF 是 Media 类（`ClassGuid={4d36e96c-…}`）、`Root\vdev-audio` 硬件 ID，`Include=ks.inf,wdmaudio.inf` 借用系统注册节。有个值得单独说的细节：**INF 必须是 UTF-16 LE（带 BOM）**——SetupAPI 只认这个编码，仓库的宿主单测会读 INF 字节流校验 BOM、CRLF 行尾，以及四个 `KSNAME_*` 接口模板与驱动里 `PcRegisterSubdevice` 注册名逐字节一致（这个 INF 曾是 UTF-8+双 BOM，还是审查抓出来的）。
 
-CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 fmt/check/test/clippy（默认 feature，纯逻辑测试全部可跑）；依赖 WDK 的驱动本体构建目前是 `continue-on-error` 的顾问 job，红不阻塞。
+CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 fmt/check/test/clippy（默认 feature，纯逻辑测试全部可跑）；依赖 WDK 的驱动本体构建由 `windows-driver-wdk` job 覆盖（runner 上装 WDK + LLVM 后 `cargo check --workspace`），该 job 起初以 `continue-on-error` 顾问形式上线、已于 2026-09 升为**硬门禁**。
 
 ## 七、现状与局限
 
