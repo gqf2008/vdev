@@ -9,19 +9,20 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-    DIIRFLAG_FORCE_INF, DiInstallDriverW, GUID_DEVCLASS_HIDCLASS, SETUP_DI_GET_CLASS_DEVS_FLAGS,
-    SETUP_DI_REGISTRY_PROPERTY, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SPDRP_DRIVER,
-    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
-    SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-    SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
-    SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDeviceInfoW,
-    SetupDiSetDeviceRegistryPropertyW,
+    DI_REMOVEDEVICE_GLOBAL, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE,
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, DIIRFLAG_FORCE_INF, DiInstallDriverW,
+    GUID_DEVCLASS_HIDCLASS, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
+    SP_CLASSINSTALL_HEADER, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS,
+    SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
+    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
+    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid,
 };
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
@@ -142,26 +143,28 @@ fn remove_all_nodes() -> Result<usize> {
         }
     }
     for info in &mut to_remove {
-        let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader:
-                windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                    cbSize: std::mem::size_of::<
-                        windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
-                    >() as u32,
-                    InstallFunction: DIF_REMOVE,
-                },
-            Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
+        // DIF_REMOVE 的参数是**类安装参数**（SP_REMOVEDEVICE_PARAMS），必须走
+        // SetupDiSetClassInstallParamsW。此前误用 SetupDiSetDeviceInstallParamsW 并把
+        // 16 字节的 SP_REMOVEDEVICE_PARAMS 强转成 SP_DEVINSTALL_PARAMS_W：后者 cbSize
+        // 是 200+ 字节，SetupAPI 校验 cbSize 后直接返回 ERROR_INVALID_USER_BUFFER
+        // (0x800706F8)，导致 uninstall 恒失败、有残留节点时 install 也起不来。
+        let params = SP_REMOVEDEVICE_PARAMS {
+            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+                cbSize: std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
+                InstallFunction: DIF_REMOVE,
+            },
+            Scope: DI_REMOVEDEVICE_GLOBAL,
             HwProfile: 0,
         };
         unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
+            SetupDiSetClassInstallParamsW(
                 devs,
                 Some(info),
-                (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                    .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
+                Some(&params.ClassInstallHeader),
+                std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
             )
         }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
+        .context("SetupDiSetClassInstallParamsW failed")?;
         unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(info)) }
             .with_context(|| "DIF_REMOVE failed")?;
     }
@@ -240,9 +243,12 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         bail!("找不到 INF: {}", inf_path.display());
     }
 
-    let removed = remove_all_nodes()?;
-    if removed > 0 {
-        println!("已清理 {removed} 个残留设备节点");
+    // 清残留节点是尽力而为：正在工作的虚拟键鼠（HID 子设备被系统占用）可能拒绝移除，
+    // 此时不应阻断安装——DiInstallDriverW 会把驱动包应用到所有匹配设备（含新节点）。
+    match remove_all_nodes() {
+        Ok(0) => {}
+        Ok(n) => println!("已清理 {n} 个残留设备节点"),
+        Err(e) => println!("提示：清理残留设备节点未成功（{e}），继续安装"),
     }
 
     let inf_wide: Vec<u16> = inf_path
@@ -364,8 +370,11 @@ pub fn status() -> Result<DeviceStatus> {
 
 // ---------------- 报告注入（经 HID 接口 WriteFile） ----------------
 
-/// 按 VID/PID 找到 vdev 虚拟键盘/鼠标的 HID 设备路径
-fn find_hid_path(pid: u16) -> Result<String> {
+/// 按 VID/PID 收集 vdev 虚拟键盘/鼠标的**全部** HID 接口路径。
+///
+/// 一个 HID 设备可能有多个顶层集合（TLC）：键/鼠本身，以及厂商注入管道。
+/// 注入只对厂商管道有效，因此这里返回全部候选、由 `write_report` 逐个试写。
+fn find_hid_paths(pid: u16) -> Result<Vec<String>> {
     let hid_guid = unsafe { HidD_GetHidGuid() };
     let devs = unsafe {
         SetupDiGetClassDevsW(
@@ -376,7 +385,7 @@ fn find_hid_path(pid: u16) -> Result<String> {
         )
     }
     .context("SetupDiGetClassDevsW(hid) failed")?;
-    let mut result = None;
+    let mut result: Vec<String> = Vec::new();
     let mut index = 0u32;
     loop {
         let mut iface = SP_DEVICE_INTERFACE_DATA {
@@ -436,10 +445,13 @@ fn find_hid_path(pid: u16) -> Result<String> {
         let path = String::from_utf16_lossy(&path_w);
         // 打开并核对 VID/PID
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // 只请求写权限：键盘/鼠标顶层集合（TLC）被系统限制，非管理员以
+        // GENERIC_READ|GENERIC_WRITE 打开会得到 ERROR_ACCESS_DENIED(5)——实测
+        // `\\?\hid#...#\kbd` 用 rw 打开 err=5、只写打开成功。注入只需要写。
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
+                GENERIC_WRITE.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -456,17 +468,35 @@ fn find_hid_path(pid: u16) -> Result<String> {
         let ok = unsafe { HidD_GetAttributes(handle, &mut attrs) };
         unsafe { CloseHandle(handle) }.ok();
         if ok.as_bool() && attrs.VendorID == VID && attrs.ProductID == pid {
-            result = Some(path);
-            break;
+            result.push(path);
         }
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    result.context("未找到 vdev 虚拟 HID 设备（先安装驱动）")
+    if result.is_empty() {
+        bail!("未找到 vdev 虚拟 HID 设备（先安装驱动）");
+    }
+    Ok(result)
 }
 
 /// 写入一份报告（键盘 8 字节 / 鼠标 4 字节，按下/抬起）
+///
+/// 候选接口可能不止一个（键/鼠 TLC + 厂商注入管道 TLC）；系统只允许对**厂商管道**
+/// 写输出报告，对键/鼠 TLC 写会返回 ERROR_INVALID_FUNCTION。这里逐个试写，
+/// 第一个成功即返回，全部失败才报最后一个错误。
 pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
-    let path = find_hid_path(pid)?;
+    let paths = find_hid_paths(pid)?;
+    let mut last_error = None;
+    for path in &paths {
+        match write_report_to(path, report) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("写入 HID 报告失败：没有可用接口")))
+}
+
+/// 向指定 HID 接口路径写入一份输出报告
+fn write_report_to(path: &str, report: &[u8]) -> Result<()> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let handle = unsafe {
         CreateFileW(
