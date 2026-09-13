@@ -81,7 +81,31 @@ pub const IOCTL_HID_GET_INPUT_REPORT: u32 = hid_out_ctl_code(104);
 /// 按键码数组范围 0x00-0x73（115）：覆盖注入侧全部 usage——F13-F24 为 0x68-0x73
 ///（USB HID Usage Tables Keyboard/Keypad Page），其余键均 ≤0x65。
 /// 修复记录：原 Usage/Logical Max 0x65 覆盖不了 F13+，注入 F13-F24 会被 hidclass 丢弃。
-pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
+/// 注入管道（厂商自定义顶层集合）的字节序列，键盘 8 字节 / 鼠标 4 字节共用同一形状。
+///
+/// 为什么不把注入输出报告放进键盘/鼠标集合里：系统对**键盘/鼠标顶层集合（TLC）**
+/// 做输出报告限制——HidD_SetOutputReport 与 WriteFile 一律返回
+/// ERROR_INVALID_FUNCTION(1)，加不加管理员都一样（本机 Win10 19045 实测，8 字节与
+/// 9 字节都试过）。把管道单独做成 0xFF00 厂商 TLC 后，用户态可正常读写、可写输出报告。
+macro_rules! injection_pipe {
+    ($count:expr) => {
+        [
+            0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
+            0x09, 0x01, // Usage (Vendor 1)
+            0xA1, 0x01, // Collection (Application) —— 注入管道 TLC
+            0x09, 0x01, //   Usage (Vendor 1)
+            0x15, 0x00, //   Logical Minimum (0)
+            0x26, 0xFF, 0x00, //   Logical Maximum (255)
+            0x75, 0x08, //   Report Size (8)
+            0x95, $count, //   Report Count
+            0x91, 0x02, //   Output (Data, Variable, Absolute) —— 注入报告
+            0xC0, // End Collection
+        ]
+    };
+}
+
+/// 键盘 HID 报告描述符：键盘 TLC（8 字节输入）+ 厂商 8 字节输出管道（注入）
+pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 66] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection (Application)
@@ -104,18 +128,21 @@ pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
     0x19, 0x00, //   Usage Minimum (0)
     0x29, 0x73, //   Usage Maximum (115) —— 覆盖 F13-F24
     0x81, 0x00, //   Input (Data, Array) —— 按键码
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8)
-    0x95, 0x08, //   Report Count (8)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
     0xC0, // End Collection
+    0x06, 0x00, 0xFF, // 以下为注入管道（厂商 TLC），见 injection_pipe!
+    0x09, 0x01, //
+    0xA1, 0x01, //
+    0x09, 0x01, //
+    0x15, 0x00, //
+    0x26, 0xFF, 0x00, //
+    0x75, 0x08, //
+    0x95, 0x08, //   Report Count (8) —— 键盘注入报告 8 字节
+    0x91, 0x02, //
+    0xC0, //
 ];
 
-/// 鼠标 HID 报告描述符：标准鼠标输入（4 字节）+ 厂商 4 字节输出管道（注入）
-pub static MOUSE_REPORT_DESCRIPTOR: [u8; 67] = [
+/// 鼠标 HID 报告描述符：鼠标 TLC（4 字节输入）+ 厂商 4 字节输出管道（注入）
+pub static MOUSE_REPORT_DESCRIPTOR: [u8; 73] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x02, // Usage (Mouse)
     0xA1, 0x01, // Collection (Application)
@@ -142,15 +169,38 @@ pub static MOUSE_REPORT_DESCRIPTOR: [u8; 67] = [
     0x95, 0x03, //     Report Count (3)
     0x81, 0x06, //     Input (Data, Variable, Relative) —— X/Y/滚轮
     0xC0, //   End Collection (Physical)
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8)
-    0x95, 0x04, //   Report Count (4)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
-    0xC0, // End Collection
+    0xC0, // End Collection (Application)
+    0x06, 0x00, 0xFF, // 以下为注入管道（厂商 TLC），见 injection_pipe!
+    0x09, 0x01, //
+    0xA1, 0x01, //
+    0x09, 0x01, //
+    0x15, 0x00, //
+    0x26, 0xFF, 0x00, //
+    0x75, 0x08, //
+    0x95, 0x04, //   Report Count (4) —— 鼠标注入报告 4 字节
+    0x91, 0x02, //
+    0xC0, //
 ];
+
+// 注入管道段的编译期形状自检：两条描述符的尾部必须与 injection_pipe! 一致
+const _: () = {
+    let kbd = &KEYBOARD_REPORT_DESCRIPTOR;
+    let pipe = injection_pipe!(0x08);
+    assert!(kbd.len() >= pipe.len());
+    let mut i = 0;
+    while i < pipe.len() {
+        assert!(kbd[kbd.len() - pipe.len() + i] == pipe[i]);
+        i += 1;
+    }
+    let mouse = &MOUSE_REPORT_DESCRIPTOR;
+    let pipe4 = injection_pipe!(0x04);
+    assert!(mouse.len() >= pipe4.len());
+    let mut j = 0;
+    while j < pipe4.len() {
+        assert!(mouse[mouse.len() - pipe4.len() + j] == pipe4[j]);
+        j += 1;
+    }
+};
 
 #[cfg(test)]
 mod tests {
@@ -223,7 +273,7 @@ mod tests {
     /// M5 回归：键盘描述符 Usage/Logical Max 须覆盖注入侧最大 usage（F24=0x73）
     #[test]
     fn keyboard_descriptor_covers_f24() {
-        assert_eq!(KEYBOARD_REPORT_DESCRIPTOR.len(), 60);
+        assert_eq!(KEYBOARD_REPORT_DESCRIPTOR.len(), 66);
         // Usage Maximum (0x29 0x73) 与 Logical Maximum (0x25 0x73)
         assert!(
             KEYBOARD_REPORT_DESCRIPTOR
@@ -251,6 +301,25 @@ mod tests {
     /// 鼠标描述符长度稳定（驱动 statics 与 hidclass 依赖其字节数）
     #[test]
     fn mouse_descriptor_length() {
-        assert_eq!(MOUSE_REPORT_DESCRIPTOR.len(), 67);
+        assert_eq!(MOUSE_REPORT_DESCRIPTOR.len(), 73);
+    }
+
+    /// 注入管道必须是**独立厂商 TLC**：键盘/鼠标 TLC 里的输出报告会被系统拒绝
+    /// （HidD_SetOutputReport/WriteFile 返回 ERROR_INVALID_FUNCTION，实测 Win10 19045）
+    #[test]
+    fn injection_pipe_is_separate_vendor_collection() {
+        for (desc, count) in [
+            (&KEYBOARD_REPORT_DESCRIPTOR[..], 0x08u8),
+            (&MOUSE_REPORT_DESCRIPTOR[..], 0x04u8),
+        ] {
+            let pipe = injection_pipe!(count);
+            assert_eq!(
+                &desc[desc.len() - pipe.len()..],
+                &pipe[..],
+                "描述符尾部应为厂商注入管道"
+            );
+            // 管道以 Usage Page 0xFF00 开头（厂商自定义页）
+            assert_eq!(&pipe[0..3], &[0x06, 0x00, 0xFF]);
+        }
     }
 }

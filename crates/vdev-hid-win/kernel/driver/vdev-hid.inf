@@ -1,9 +1,33 @@
 ;
-; vdev-hid.inf — vdev 虚拟键盘/鼠标（KMDF 内核 HID minidriver）
+; vdev-hid.inf — vdev 虚拟键盘 / 虚拟鼠标（KMDF + Virtual HID Framework）
 ;
-; 结构对照微软 vhidmini2 官方样例（KMDF 版）：MsHidKmdf.inf 自 build 22000 引入，
-; 由它安装系统 HidKmdf 功能驱动；本驱动经 .Filters 节（FilterPosition=Lower）
-; 挂为该设备下层过滤器，与驱动侧 WdfFdoInitSetFilter 相呼应。
+; 设备模型：
+;   Root\vdev-hid（vdev 虚拟键盘）与 Root\vdev-hid-mouse（vdev 虚拟鼠标）是本驱动建的
+;   两个根枚举设备，显示名与硬件 ID 见下；本驱动是它们的函数驱动（关联服务，
+;   AddService 带 flag = SPSVCINST_ASSOCSERVICE）。驱动在 EvtDevicePrepareHardware 里
+;   用 VhfCreate/VhfStart 各创建一个虚拟 HID 设备，由系统 VHF（vhf.sys）交给 hidclass
+;   枚举成真实 HID 设备；EvtDeviceReleaseHardware 里 VhfDelete 回收。
+;
+; 为什么不用 vhidmini2(KMDF) 的 mshidkmdf 路线（本机 Win10 19045 实测结论）：
+;   1) 该路线要 Include=MsHidKmdf.inf，而它只随 Windows 11（build 22000）提供；
+;      Win10 的 %SystemRoot%\inf 下没有该文件 → 安装报 0xE0000219
+;      （"Could not find include INF file \"MsHidKmdf.inf\"" → 无 ASSOCSERVICE）；
+;   2) 手工把系统自带的 mshidkmdf 声明成函数驱动或上层过滤器
+;      （AddFilter + FilterLevel=HIDClassLevel）同样不行：设备停在
+;      CM_PROB_FAILED_START + 0xC000009C；把本驱动整条从设备栈里摘掉后失败依旧。
+;   VHF 是微软为"创建虚拟 HID 设备"提供的官方框架，Win10 1607 起随系统提供
+;   （本机 vhf.sys = 10.0.19041.1），Win11 通用。
+;
+; 关键接线：设备必须把系统自带的 vhf.sys 挂成 LowerFilter（见下面的 LowerFilters
+; AddReg）——vhf.sys 是 VHF 的实现本体，VhfCreate/VhfStart 要有它在本设备栈里才能
+; 工作；缺这一条时 VhfCreate 直接返回 STATUS_INVALID_DEVICE_REQUEST(0xC0000010)，
+; 设备停在 CM_PROB_FAILED_START。系统 hidvhf.inf 的 [ControlFlags] 注释即此意：
+; "3rd-party INFs ... simply refer to it directly in their LowerFilters"。
+;
+; KMDF 版本不能取 Win11 基线：Win10 22H2 的 Wdf01000.sys 是 KMDF 1.31，
+; 声明 / 绑定 1.33（Win11 21H2 起）会让驱动加载直接失败
+; （事件日志：Driver Version: 1.33 / Kmdf Lib. Version: 1.31）。本驱动只用到
+; WdfSpinLock 等 1.15（Windows 10 首发）即存在的接口，与同机 ViGEmBus 同档。
 ;
 
 [Version]
@@ -12,7 +36,7 @@ Class = HIDClass
 ClassGuid = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
 Provider=%ManufacturerName%
 CatalogFile=vdev-hid.cat
-DriverVer = 08/22/2026,0.1.0.0
+DriverVer = 09/13/2026,0.2.0.1
 DriverPackageDisplayName=%DriverDisplayName%
 PnpLockdown=1
 
@@ -26,10 +50,9 @@ DefaultDestDir = 12 ; DIRID_DRIVERS
 vdev_hid.sys  = 1,,
 
 [Manufacturer]
-; TargetOS 装饰：最低 Windows 11（build 22000）——MsHidKmdf.inf 的引入版本
-%ManufacturerName%=Standard,NTamd64.10.0...22000
+%ManufacturerName%=Standard,NTamd64
 
-[Standard.NTamd64.10.0...22000]
+[Standard.NTamd64]
 %KbdName%=vdev_hid_kbd_Install, Root\vdev-hid
 %MouseName%=vdev_hid_mouse_Install, Root\vdev-hid-mouse
 
@@ -37,29 +60,21 @@ vdev_hid.sys  = 1,,
 
 [vdev_hid_kbd_Install.NT]
 CopyFiles=Drivers_Dir
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT
 
 [Drivers_Dir]
 vdev_hid.sys
 
 [vdev_hid_kbd_Install.NT.HW]
 AddReg = vdev_hid_kbd_HW
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT.HW
 
 [vdev_hid_kbd_HW]
-HKR,,Role,0x00010001,0 ; 0=键盘
+HKR,,Role,0x00010001,0 ; 0=键盘（驱动据此选报告描述符与 PID）
+; vhf.sys 作为本设备的下层过滤器（0x00010000 = REG_MULTI_SZ），VHF API 依赖它
+HKR,,"LowerFilters",0x00010000,"vhf"
 
 [vdev_hid_kbd_Install.NT.Services]
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT.Services
-; minidriver 服务 flag 0（非 SPSVCINST_ASSOCSERVICE）：关联服务由 Needs 继承的
-; mshidkmdf 承担（每设备 INF 恰有一个关联服务，对照 vhidmini2 官方样例）
-AddService = vdev_hid, 0x00000000, vdev_hid_Service_Inst
-
-[vdev_hid_kbd_Install.NT.Filters]
-AddFilter=vdev_hid,,vdev_hid_Filter_Install
+; 本驱动即本设备的关联服务（函数驱动）
+AddService = vdev_hid, %SPSVCINST_ASSOCSERVICE%, vdev_hid_Service_Inst
 
 [vdev_hid_kbd_Install.NT.Wdf]
 KmdfService = vdev_hid, vdev_hid_wdfsect
@@ -68,34 +83,22 @@ KmdfService = vdev_hid, vdev_hid_wdfsect
 
 [vdev_hid_mouse_Install.NT]
 CopyFiles=Drivers_Dir
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT
 
 [vdev_hid_mouse_Install.NT.HW]
 AddReg = vdev_hid_mouse_HW
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT.HW
 
 [vdev_hid_mouse_HW]
 HKR,,Role,0x00010001,1 ; 1=鼠标
+HKR,,"LowerFilters",0x00010000,"vhf"
 
 [vdev_hid_mouse_Install.NT.Services]
-Include=MsHidKmdf.inf
-Needs=MsHidKmdf.NT.Services
-; minidriver 服务 flag 0（非 SPSVCINST_ASSOCSERVICE）：关联服务由 Needs 继承的
-; mshidkmdf 承担（每设备 INF 恰有一个关联服务，对照 vhidmini2 官方样例）
-AddService = vdev_hid, 0x00000000, vdev_hid_Service_Inst
-
-[vdev_hid_mouse_Install.NT.Filters]
-AddFilter=vdev_hid,,vdev_hid_Filter_Install
+; 同键盘：本驱动即函数驱动
+AddService = vdev_hid, %SPSVCINST_ASSOCSERVICE%, vdev_hid_Service_Inst
 
 [vdev_hid_mouse_Install.NT.Wdf]
 KmdfService = vdev_hid, vdev_hid_wdfsect
 
-; ================= 过滤器 / 服务 / WDF =====================
-
-[vdev_hid_Filter_Install]
-FilterPosition=Lower
+; ================= 服务 / WDF =====================
 
 [vdev_hid_Service_Inst]
 DisplayName    = %ServiceDesc%
@@ -105,7 +108,7 @@ ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\vdev_hid.sys
 
 [vdev_hid_wdfsect]
-KmdfLibraryVersion = 1.33
+KmdfLibraryVersion = 1.15
 
 [Strings]
 ManufacturerName="vdev"
@@ -114,3 +117,4 @@ DiskName="vdev HID Installation Disk"
 KbdName="vdev 虚拟键盘"
 MouseName="vdev 虚拟鼠标"
 ServiceDesc="vdev HID Service"
+SPSVCINST_ASSOCSERVICE=0x00000002
