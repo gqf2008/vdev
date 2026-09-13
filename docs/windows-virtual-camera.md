@@ -4,7 +4,7 @@
 无需内核驱动、无需驱动签名），把跨进程推送的 BGRA 帧变成系统里的一个「视频捕获源」，
 任意 App（ffmpeg / OBS / Zoom / Teams / 微信等）都能把它当摄像头选。
 
-对应 macOS 版（`vdev-camera`，CMIOExtension）在 `docs/README.md` / `crates/vdev-camera`。
+对应 macOS 版在根 `README.md` 的「虚拟摄像头：CMIOExtension」章节；实现分散在 `crates/vdev-camera-ext`（CMIOExtension 扩展）与 `crates/vdev-camera`（共享帧生成核心）。
 
 ## 为什么选 DirectShow（而不是写驱动）
 

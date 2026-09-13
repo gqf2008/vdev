@@ -275,7 +275,7 @@ swift push_frames.swift screen [--display <id>] --fps 30  # 推屏幕（首次�
 swift push_frames.swift video /path/to/video.mp4 --fps 60 # 推视频文件（AVAssetReader 解码）
 ```
 
-设备侧滤镜（美颜/背景替换）配在**扩展进程**的环境变量里：`VDEV_FILTER="brightness,contrast,saturation,green,sharpen,beauty,whiten"`、`VDEV_BG=blur`（Vision 人像分割）；不配置则直通，零额外开销。组合玩法：`vdev screen create` 建一块虚拟屏，再 `swift push_frames.swift screen --display <虚拟屏ID>`，摄像头即显示虚拟屏内容，可再接 WebRTC/SFU 远程串流。
+设备侧滤镜（美颜/背景替换）配在**扩展进程**的环境变量里：`VDEV_FILTER="brightness,contrast,saturation,green,sharpen,beauty,whiten"`、`VDEV_BG=blur`（Vision 人像分割）；未配置则走零开销快返回、原样直通（宿主 App 推视频时也读同一变量并同样快返回；把变量设成进程级会让两侧各处理一次）。组合玩法：`vdev screen create` 建一块虚拟屏，再 `swift push_frames.swift screen --display <虚拟屏ID>`，摄像头即显示虚拟屏内容，可再接 WebRTC/SFU 远程串流。
 
 ## 7. 现状与局限
 

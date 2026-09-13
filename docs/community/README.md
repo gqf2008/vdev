@@ -12,7 +12,7 @@
 | 6 | [Windows 虚拟显示器](windows-virtual-display.md) | Windows x64 | IddCx UMDF 间接显示驱动 | bindgen 直取 WDK 头做绑定层、零初始化上下文的 UB 防御 |
 | 7 | [Windows 虚拟声卡](windows-virtual-audio.md) | Windows x64 | PortCls WaveRT（WDM 内核驱动） | no_std 内核音频驱动：7 个 BSOD 级踩坑实录与"编译过≠能跑"方法论 |
 | 8 | [Windows 虚拟 HID](windows-virtual-hid.md) | Windows x64 | KMDF HID minidriver | 硬件级键鼠注入：HID 三重契约（INF 接线 / IOCTL 契约 / 结构布局） |
-| 9 | [AI 虚拟麦克风](ai-virtual-mic.md) | macOS（可移植） | RNNoise + CoreAudio 客户端（用户态） | 物理麦克风 → 端侧降噪 → 注入 vdev 麦克风端点：SPSC 环、自适应干湿、延迟探针 |
+| 9 | [AI 虚拟麦克风](ai-virtual-mic.md) | macOS + Windows（Windows 真机验证中） | RNNoise + CoreAudio 客户端 / WASAPI 轮询 + 内核环回（用户态） | 物理麦克风 → 端侧降噪 → 注入 vdev 麦克风端点：SPSC 环、自适应干湿、延迟探针 |
 
 ## 阅读建议
 

@@ -2,7 +2,7 @@
 
 > 用 Rust 在 **macOS（Apple Silicon）** 与 **Windows（x64）** 上实现的虚拟设备集合——
 > 键盘/鼠标、摄像头、显示器、声卡，每个都让操作系统"相信"有一个真设备存在，
-> 可被任意 App 当真实硬件使用。**全 Rust**——macOS 绑定手写，Windows 驱动绑定由 WDK 头直出（bindgen）。
+> 可被任意 App 当真实硬件使用。**全 Rust**——macOS 绑定手写；Windows 侧绑定按组件区分：display / HID 由 WDK 头经 bindgen 生成，audio 为手写精简绑定。
 
 | 虚拟设备 | macOS（Apple Silicon） | Windows（x64） |
 |---|---|---|
@@ -36,13 +36,14 @@ Windows 侧的路线选择同理、但门槛分布不同：虚拟摄像头有用
 ## 仓库结构
 
 ```
-crates/                         # 主 workspace（macOS-only；根 Cargo.toml 成员，零仓库外依赖）
+crates/                         # 主 workspace（macOS-only；根 Cargo.toml 成员）
   vdev-hid/        虚拟键盘/鼠标：键码注入、文本输入、鼠标移动/点击/滚动（CGEventPost）
-  vdev-camera/     虚拟摄像头：Rust 帧生成核心（lib）+ CMIOExtension 全 Rust 扩展（vdev-camera-ext）
+  vdev-camera/     虚拟摄像头：Rust 帧生成核心（lib）
+  vdev-camera-ext/ 虚拟摄像头：CMIOExtension 全 Rust 扩展（手写 objc2 绑定 + FrameChannel + 设备侧滤镜）
   vdev-screen/     虚拟屏幕：CGVirtualDisplay 私有 API 封装
   vdev-audio/      虚拟声卡：CoreAudio HAL AudioServerPlugIn（输出环回输入，自研 BlackHole）
   vdev-host/       宿主进程 / 统一命令行入口（二进制名 vdev）
-  vdev-app/        macOS 宿主 App（Rust + Slint）
+  vdev-app/        macOS 宿主 App（Rust + Slint；唯一的 Git 依赖：gqf2008/slint-pixel）
   vdev-filter/     实时图像滤镜管线（美颜 / 背景替换，Vision）
   vdev-mic-agent/  AI 虚拟麦克风端侧链路：物理麦克风 → 降噪 → 注入 vdev 麦克风（用户态；macOS CoreAudio / Windows WASAPI 双后端）
 crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主仓库）
@@ -174,8 +175,12 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60
 
 #### 设备侧滤镜（美颜 / 背景替换）
 
-滤镜在**设备侧**做——虚拟摄像头对推来的帧自己成像，所以任何推帧方（宿主 App、
-`push_frames.swift`、外部桥）都得到同一套处理，推流方不必各自实现。
+**滤镜的权威路径在设备侧**——虚拟摄像头扩展对推来的帧自己成像，所以任何推帧方
+（宿主 App、`push_frames.swift`、外部桥）都得到同一套处理，推流方不必各自实现。
+宿主 App 自身在推视频时也会读同一个 `VDEV_FILTER` 并对帧做一次处理；**未配置时两侧都走
+零开销快返回**（`vdev_filter::FilterParams::is_noop`），不产生逐像素代价。
+注意：若把 `VDEV_FILTER` 设成进程级环境变量，宿主与扩展会各处理一次（视觉上滤镜强度翻倍）
+——只要生效一次的场景请把它配在**扩展进程**。
 参数配在**扩展进程的环境**里（见 `crates/vdev-camera-ext/src/filters.rs`）：
 
 ```bash
@@ -186,7 +191,7 @@ VDEV_BG=blur        # 开启背景模糊（Vision 人像分割）
 # green ≥0（0=关；绿幕抠像阈值） / sharpen 0..2 / beauty,whiten 0..1（0=关）
 ```
 
-没配任何滤镜时整段跳过，走原样直通路径（零额外开销）。
+没配任何滤镜时两侧都走零开销快返回，原样直通（无逐像素遍历）。
 
 ### 踩坑记录（已沉淀）
 
@@ -219,7 +224,7 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
 - App 音频推流已自动优先 vdev-audio（找不到再回退 BlackHole/VB-Cable）；
   App 状态面板会检测并显示虚拟声卡状态（刷新状态 / 启动时自动检测，
   CLI 验证：`/Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-audio`）。
-- 驱动技术点（macOS 26 踩坑，见 `docs/RESEARCH.md`）：
+- 驱动技术点（macOS 26 踩坑，见 `docs/community/macos-virtual-audio.md`）：
   - 产物必须是 **MH_BUNDLE**（`-Wl,-bundle`），cargo cdylib 默认 MH_DYLIB 会被 coreaudiod 跳过；
   - 必须 **Developer ID 签名**（adhoc 也被跳过）；
   - `AudioServerPlugInDriverRef` = `&interface_ptr`（工厂返回指针的指针），且 `QueryInterface`
@@ -228,7 +233,8 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
     timebase 换算——用纳秒会让 coreaudiod 认为时钟异常、IO 只跑几个周期就停；
   - 输出 IO 操作是 `kAudioServerPlugInIOOperationWriteMix`（`'rite'`），不是 `'writ'`；
   - 数组属性（`pfta`/`sfma`/`nsr#`/`ctrl`/`ownd`）在 inDataSize 不足时要**截断返回**而非报错；
-  - 必须实现 `bcls`/`clas`/`owne`/`ownd`/`lnam`/`lmod`/`lmak`/`ring`/`cstb`/`clkd` 等属性。
+  - 必须实现 `bcls`/`clas`/`stdv`/`ownd`/`lnam`/`lmod`/`lmak`/`ring`/`cstb`/`clkd` 等属性
+    （owner 属性 selector 是 `stdv`；旧文档写的 `owne` 是 macOS 26 上的错误值，变量名 `SEL_OWNE` 仅历史保留）。
 
 ## 权限说明（macOS）
 
@@ -243,25 +249,18 @@ make test         # 环回自测：播放 440Hz → 输出流，同时从输入�
 配合 aerodesk（str0m WebRTC SFU）把虚拟屏幕远程分发，完整链路已验证：
 虚拟屏(0x12) → 发布端采集(HEVC 1080p) → SFU 收流 → 观看端解码 327 帧。
 
-```bash
-# 1. 起本地 SFU + signal（aerodesk 仓库）
-cd /Volumes/Workspace/GitHub/aerodesk
-TURN_SECRET=devsecret ./target/release/aerodesk-sfu      # 3002 + 媒体 3478
-./target/release/aerodesk-signal                          # WS 3003 / WSS 3001
+> **版本随动提醒**：aerodesk 的信令栈正在从 JSON/WS 迁往 SIP 单栈，SFU/信令的端口与
+> `--signal` 取值会随其版本变化——**SFU/信令侧的拉起与 `aerodesk-agent` 参数请以 aerodesk
+> 仓库当时的 README 为准**。下面只固定 vdev 侧、与 aerodesk 无关的那一步。
 
-# 2. 建虚拟屏（保持进程；--hold 控制存活秒数）
+```bash
+# 1. 建虚拟屏（保持进程；--hold 控制存活秒数）
 cd ~/Documents/GitHub/vdev
 target/release/vdev screen create --width 1920 --height 1080 --name vdev-sfu-demo --hold 3600
 
-# 3. 发布端：--display 是索引（0=主屏），虚拟屏是第 2 个 → 1
-cd /Volumes/Workspace/GitHub/aerodesk
-cargo run -p aerodesk-agent -- --role publisher --encoder screen --display 1 \
-  --room vdev-demo --signal ws://127.0.0.1:3003/ws
-
-# 4. 观看端（另一终端）
-cargo run -p aerodesk-agent -- --role viewer --room vdev-demo --layer f \
-  --signal ws://127.0.0.1:3003/ws
-# 日志出现 RECEIVED/DECODED 即成功；浏览器可访问 https://<host>:3000
+# 2. 起 SFU + 信令，并按 aerodesk README 用 aerodesk-agent 发布/观看该虚拟屏：
+#    发布端 --display 取的是显示器索引（`vdev screen list` 给的是 CGDisplayID，
+#    不是索引；虚拟屏通常是第 2 个 → 索引 1）。
 ```
 
 要点：`vdev screen list` 给的是 CGDisplayID（十六进制），aerodesk `--display` 要的是
@@ -357,23 +356,27 @@ Topology：虚拟扬声器（render）把系统播放写入环形缓冲，虚拟
 
 - 报告描述符含厂商输出管道：用户态 `WriteFile` 即注入——键盘 8 字节报告（1 修饰键 + 6 按键）、
   鼠标 4 字节报告（键位 + X/Y + 滚轮，相对值）；经 manual 队列投递给 hidclass 作为真实 HID 消费。
-- 手写 `wdk-sys`（WDF/GPIO/SPB/USB…）内核绑定（vendor 目录，随仓）。
+- `wdk-sys`（WDF/GPIO/SPB/USB…）内核绑定：vendor 目录随仓，由 bindgen 生成。
 - CLI：`vdev-hid-win kernel install/status/uninstall` + `key/mouse` 注入命令。
 - 构建 + 报告格式单测通过（键→HID usage/修饰位/鼠标报告布局）；实测需开测试签名。
 
 ## Windows 通用：构建 / 签名 / 安装
 
 各 `*-win` crate 是**独立 workspace**（不与 macOS 主 workspace 混构）。构建前置：
-Visual Studio 2022（C++ 桌面负载）+ **WDK 10.0.26100**（`winget install Microsoft.WindowsWDK.10.0.26100`）
-+ LLVM（bindgen 用 libclang）+ Rust stable（MSVC target）。
+Rust stable（MSVC target）+ Visual Studio 2022（C++ 桌面负载）。**仅构建 display / audio / HID 的驱动**才额外需要
+**WDK 10.0.26100**（`winget install Microsoft.WindowsWDK.10.0.26100`）+ LLVM（bindgen 用 libclang）；
+camera-win / app-win 是纯用户态组件，不需要 WDK。
 
 ```powershell
 # 驱动签名：自签名代码签名证书（一次性）→ 签名 DLL/SYS + 生成 .cat
-New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=vdev Driver" `
+# Subject / FriendlyName 必须与 crates/*/scripts/stage-sign*.ps1 的选择条件一致
+$cert = New-SelfSignedCertificate -Type CodeSigningCert `
+  -Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
   -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
   -KeySpec Signature -KeyUsage DigitalSignature `
   -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
-# 把证书装进 TrustedPublisher + Root（管理员）
+# 导出 .cer 供 TrustedPublisher + Root 安装（管理员）
+Export-Certificate -Cert $cert -FilePath vdev-cert.cer
 certutil -addstore -f TrustedPublisher vdev-cert.cer
 certutil -addstore -f Root vdev-cert.cer
 
