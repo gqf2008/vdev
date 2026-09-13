@@ -214,7 +214,7 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         || ksdm.DataFormat.Specifier != KSDATAFORMAT_SPECIFIER_WAVEFORMATEX
         || ksdm.DataFormat.FormatSize < size_of::<KSDATAFORMAT_WAVEFORMATEX>() as u32
     {
-        DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+        DBG_LAST_STATUS.store(status_bits(STATUS_INVALID_PARAMETER), Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     let wf = &ksdm.WaveFormatEx;
@@ -230,21 +230,21 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         || wf.nChannels != 2
         || wf.nBlockAlign != 4
     {
-        DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+        DBG_LAST_STATUS.store(status_bits(STATUS_INVALID_PARAMETER), Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     // EXTENSIBLE 时 SubFormat 必须是 PCM（前面的 ksdm.DataFormat.SubFormat 检查对应
     // KSDATAFORMAT 的 SubFormat；这里再核对 WAVEFORMATEXTENSIBLE.SubFormat 偏移）
     if wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
         if ksdm.DataFormat.FormatSize < (size_of::<KSDATAFORMAT>() + 40) as u32 {
-            DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+            DBG_LAST_STATUS.store(status_bits(STATUS_INVALID_PARAMETER), Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         }
         let base = (data_format as *const u8).add(size_of::<KSDATAFORMAT>() + 24);
         // SAFETY: FormatSize >= 104 已校验，偏移 64+24=88 处为 SubFormat GUID
         let sub = unsafe { core::ptr::read_unaligned(base.cast::<GUID>()) };
         if sub != KSDATAFORMAT_SUBTYPE_PCM {
-            DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
+            DBG_LAST_STATUS.store(status_bits(STATUS_INVALID_PARAMETER), Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -254,7 +254,7 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         (*this).bytes_per_sec = wf.nSamplesPerSec * u32::from(wf.nBlockAlign);
     }
     dbg_inc(&DBG_SET_FORMAT_OK);
-    DBG_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+    DBG_LAST_STATUS.store(status_bits(STATUS_SUCCESS), Ordering::Relaxed);
     STATUS_SUCCESS
 }
 
@@ -527,6 +527,13 @@ pub struct MiniportWaveRT {
     ///  IMiniportAudioEngineNode → IPinCount，各两轮后停止，new_stream 恒 0）。
     pub pin_count_obj: SubObject,
     pub signal_proc_obj: SubObject,
+    /// 子对象：IMiniportAudioEngineNode（Windows 10 音频引擎）
+    pub engine_node_obj: SubObject,
+    /// 引擎通过 IMiniportAudioEngineNode::SetDeviceFormat 指定的设备格式（sysvad 的
+    /// m_pDeviceFormat 同款）：GetDeviceFormat / GetMixFormat 必须**原样回读**，
+    /// 否则引擎判定 AUDCLNT_E_UNSUPPORTED_FORMAT。
+    pub device_format: [u8; size_of::<KsDataFormatWaveFormatExtensible>()],
+    pub device_format_valid: bool,
 }
 
 /// COM 聚合子对象：首字段为该接口的 vtable 指针（引擎按各自的接口布局调用），
@@ -653,6 +660,564 @@ static SIGNAL_PROC_VTABLE: IMiniportAudioSignalProcessingVtbl =
         get_modes: signal_proc_get_modes,
     };
 
+// ============ IMiniportAudioEngineNode（Windows 10 音频引擎，sysvad 同款） ============
+//
+// 引擎 QI 该接口成功后才走"音频引擎"路径；配套的 KSNODETYPE_AUDIO_ENGINE 节点已在
+// 滤波器描述符里声明（PortCls 把 KSPROPSETID_AudioEngine 的属性请求转发到本接口）。
+// 槽序与签名严格对照 portcls.h `DECLARE_INTERFACE_(IMiniportAudioEngineNode, IUnknown)`。
+
+/// portcls.h `IID_IMiniportAudioEngineNode` = {2EBF536C-EF57-4C64-BEDC-25C1A6D668E6}
+static IID_IMINIPORT_AUDIO_ENGINE_NODE: GUID = GUID {
+    data1: 0x2ebf_536c,
+    data2: 0xef57,
+    data3: 0x4c64,
+    data4: [0xbe, 0xdc, 0x25, 0xc1, 0xa6, 0xd6, 0x68, 0xe6],
+};
+
+/// ksmedia.h `KSAUDIOENGINE_DESCRIPTOR`
+#[repr(C)]
+pub struct KsAudioEngineDescriptor {
+    host_pin_id: u32,
+    offload: u32,
+    loopback: u32,
+}
+/// ksmedia.h `KSAUDIOENGINE_BUFFER_SIZE_RANGE`
+#[repr(C)]
+pub struct KsAudioEngineBufferSizeRange {
+    min_buffer_bytes: u32,
+    max_buffer_bytes: u32,
+}
+/// ks.h `KSMULTIPLE_ITEM`
+#[repr(C)]
+pub struct KsMultipleItem {
+    size: u32,
+    count: u32,
+}
+/// ks.h `KSPROPERTY_STEPPING_LONG`
+#[repr(C)]
+pub struct KsPropertySteppingLong {
+    stepping_delta: u32,
+    reserved: u32,
+    min: i32,
+    max: i32,
+}
+
+#[allow(clippy::type_complexity)]
+#[repr(C)]
+pub struct IMiniportAudioEngineNodeVtbl {
+    pub query_interface: crate::com::PFN_QUERYINTERFACE,
+    pub add_ref: crate::com::PFN_ADDREF,
+    pub release: crate::com::PFN_RELEASE,
+    pub get_audio_engine_descriptor:
+        unsafe extern "system" fn(PVOID, u32, *mut KsAudioEngineDescriptor) -> NTSTATUS,
+    pub get_gfx_state: unsafe extern "system" fn(PVOID, u32, *mut i32) -> NTSTATUS,
+    pub set_gfx_state: unsafe extern "system" fn(PVOID, u32, i32) -> NTSTATUS,
+    pub get_engine_format_size: unsafe extern "system" fn(PVOID, u32, u32, *mut u32) -> NTSTATUS,
+    pub get_mix_format: unsafe extern "system" fn(PVOID, u32, PVOID, u32) -> NTSTATUS,
+    pub get_device_format: unsafe extern "system" fn(PVOID, u32, PVOID, u32) -> NTSTATUS,
+    pub set_device_format: unsafe extern "system" fn(PVOID, u32, PVOID, u32) -> NTSTATUS,
+    pub get_supported_device_formats: unsafe extern "system" fn(PVOID, u32, PVOID, u32) -> NTSTATUS,
+    pub get_device_channel_count: unsafe extern "system" fn(PVOID, u32, u32, *mut u32) -> NTSTATUS,
+    pub get_device_attribute_steppings:
+        unsafe extern "system" fn(PVOID, u32, u32, *mut KsPropertySteppingLong, u32) -> NTSTATUS,
+    pub get_device_channel_volume: unsafe extern "system" fn(PVOID, u32, u32, *mut i32) -> NTSTATUS,
+    pub set_device_channel_volume: unsafe extern "system" fn(PVOID, u32, u32, i32) -> NTSTATUS,
+    pub get_device_channel_mute: unsafe extern "system" fn(PVOID, u32, u32, *mut i32) -> NTSTATUS,
+    pub set_device_channel_mute: unsafe extern "system" fn(PVOID, u32, u32, i32) -> NTSTATUS,
+    pub get_device_channel_peak_meter:
+        unsafe extern "system" fn(PVOID, u32, u32, *mut i32) -> NTSTATUS,
+    pub get_buffer_size_range:
+        unsafe extern "system" fn(PVOID, u32, PVOID, *mut KsAudioEngineBufferSizeRange) -> NTSTATUS,
+}
+
+/// 滤波器里只有这一个节点
+const AUDIO_ENGINE_NODE_ID: u32 = 0;
+/// 无 offload / loopback pin 的哨兵值
+const PIN_ID_NONE: u32 = u32::MAX;
+/// 缓冲区时长上下限（毫秒）——sysvad 用 10/500
+const MIN_BUFFER_DURATION_MS: u32 = 10;
+const MAX_BUFFER_DURATION_MS: u32 = 500;
+
+fn host_pin_id(capture: bool) -> u32 {
+    if capture {
+        crate::endpoint_names::WAVE_CAPTURE_HOST_PIN
+    } else {
+        crate::endpoint_names::WAVE_RENDER_HOST_PIN
+    }
+}
+
+unsafe extern "system" fn ae_get_descriptor(
+    this: PVOID,
+    _node: u32,
+    desc: *mut KsAudioEngineDescriptor,
+) -> NTSTATUS {
+    if desc.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let capture = unsafe { (*sub_owner(this)).capture };
+    // SAFETY: desc 可写
+    unsafe {
+        core::ptr::write(
+            desc,
+            KsAudioEngineDescriptor {
+                host_pin_id: host_pin_id(capture),
+                offload: PIN_ID_NONE,
+                loopback: PIN_ID_NONE,
+            },
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_gfx_state(_this: PVOID, _node: u32, enable: *mut i32) -> NTSTATUS {
+    if enable.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // 不支持 GFX 卸载：恒为 FALSE
+    unsafe { core::ptr::write(enable, 0) };
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_set_gfx_state(_this: PVOID, _node: u32, _enable: i32) -> NTSTATUS {
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_engine_format_size(
+    _this: PVOID,
+    node: u32,
+    format_type: u32,
+    size: *mut u32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || size.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    let need = if format_type == 2 {
+        size_of::<KsMultipleItem>() + size_of::<KsDataFormatWaveFormatExtensible>()
+    } else {
+        size_of::<KsDataFormatWaveFormatExtensible>()
+    };
+    // SAFETY: size 可写
+    unsafe { core::ptr::write(size, need as u32) };
+    STATUS_SUCCESS
+}
+
+/// 把当前设备格式（引擎设置过就用它，否则用默认 48k/16bit/2ch）拷给调用方。
+/// sysvad 的 GetDeviceFormat / GetMixFormat 都是"回读 m_pDeviceFormat"，
+/// 不回读会让引擎判定 AUDCLNT_E_UNSUPPORTED_FORMAT（实测 0x88890008）。
+unsafe fn copy_device_format(this: PVOID, node: u32, out: *mut c_void, buf_size: u32) -> NTSTATUS {
+    let need = size_of::<KsDataFormatWaveFormatExtensible>();
+    if node != AUDIO_ENGINE_NODE_ID {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if out.is_null() || (buf_size as usize) < need {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 目标缓冲 >= need 字节；源为静态或本对象的 device_format 缓冲
+    unsafe {
+        let owner = sub_owner(this);
+        let src = if (*owner).device_format_valid {
+            core::ptr::addr_of!((*owner).device_format).cast::<u8>()
+        } else {
+            (&raw const DEVICE_FORMAT).cast::<u8>()
+        };
+        core::ptr::copy_nonoverlapping(src, out.cast::<u8>(), need);
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_mix_format(
+    this: PVOID,
+    node: u32,
+    out: *mut c_void,
+    buf_size: u32,
+) -> NTSTATUS {
+    dbg_inc(&DBG_AE_GET_MIX_FORMAT);
+    // 混音格式 = 引擎内部 float32（不是设备格式），见 MIX_FORMAT 注释
+    let _ = this;
+    let need = size_of::<KsDataFormatWaveFormatExtensible>();
+    if node != AUDIO_ENGINE_NODE_ID {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if out.is_null() || (buf_size as usize) < need {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 目标缓冲 >= need 字节；源为只读静态
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const MIX_FORMAT).cast::<u8>(),
+            out.cast::<u8>(),
+            need,
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_format(
+    this: PVOID,
+    node: u32,
+    out: *mut c_void,
+    buf_size: u32,
+) -> NTSTATUS {
+    dbg_inc(&DBG_AE_GET_DEVICE_FORMAT);
+    unsafe { copy_device_format(this, node, out, buf_size) }
+}
+
+unsafe extern "system" fn ae_set_device_format(
+    this: PVOID,
+    node: u32,
+    fmt: *mut c_void,
+    buf_size: u32,
+) -> NTSTATUS {
+    dbg_inc(&DBG_AE_SET_DEVICE_FORMAT);
+    if node != AUDIO_ENGINE_NODE_ID || fmt.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    // 契约对照官方 sysvad MiniportAudioEngineNode.cpp::SetDeviceFormat：
+    // 缓冲 < sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE) 时回 STATUS_BUFFER_TOO_SMALL（不落盘）。
+    // 回归：原来接受 84 字节并截断存储，回读给引擎的是残缺格式 → 引擎反复
+    // SetDeviceFormat/GetDeviceFormat 并最终判 AUDCLNT_E_UNSUPPORTED_FORMAT(0x88890008)。
+    let need = size_of::<KsDataFormatWaveFormatExtensible>();
+    if (buf_size as usize) < need {
+        DBG_AE_SET_STATUS.store(status_bits(STATUS_BUFFER_TOO_SMALL), Ordering::Relaxed);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // 记住引擎指定的设备格式（最多 104 字节），后续 GetDeviceFormat/GetMixFormat 原样回读
+    // SAFETY: 源缓冲至少 KSDATAFORMAT_WAVEFORMATEX；目标为本对象内固定 104 字节缓冲
+    unsafe {
+        let owner = sub_owner(this);
+        (*owner).device_format = [0u8; size_of::<KsDataFormatWaveFormatExtensible>()];
+        core::ptr::copy_nonoverlapping(
+            fmt.cast::<u8>(),
+            core::ptr::addr_of_mut!((*owner).device_format).cast::<u8>(),
+            need,
+        );
+        (*owner).device_format_valid = true;
+        // 记录引擎设进来的格式（KSDATAFORMAT 之后是 WAVEFORMATEX）
+        let wf = fmt.cast::<u8>().add(size_of::<KSDATAFORMAT>());
+        DBG_AE_STORED_TAG.store(
+            u32::from(core::ptr::read_unaligned(wf.cast::<u16>())),
+            Ordering::Relaxed,
+        );
+        DBG_AE_STORED_RATE.store(
+            core::ptr::read_unaligned(wf.add(4).cast::<u32>()),
+            Ordering::Relaxed,
+        );
+        DBG_AE_STORED_BITS.store(
+            u32::from(core::ptr::read_unaligned(wf.add(14).cast::<u16>())),
+            Ordering::Relaxed,
+        );
+    }
+    DBG_AE_SET_STATUS.store(status_bits(STATUS_SUCCESS), Ordering::Relaxed);
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_supported_device_formats(
+    _this: PVOID,
+    node: u32,
+    out: *mut c_void,
+    buf_size: u32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || out.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    let fmt_size = size_of::<KsDataFormatWaveFormatExtensible>();
+    let need = size_of::<KsMultipleItem>() + fmt_size;
+    // SAFETY: out 指向 KSMULTIPLE_ITEM
+    unsafe {
+        core::ptr::write(
+            out.cast::<KsMultipleItem>(),
+            KsMultipleItem {
+                size: need as u32,
+                count: 1,
+            },
+        );
+    }
+    if (buf_size as usize) < need {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 缓冲区 >= need 字节
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const DEVICE_FORMAT).cast::<u8>(),
+            out.cast::<u8>().add(size_of::<KsMultipleItem>()),
+            fmt_size,
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_channel_count(
+    _this: PVOID,
+    node: u32,
+    target_type: u32,
+    count: *mut u32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || count.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if target_type > 2 {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    // 设备格式是 2ch
+    unsafe { core::ptr::write(count, 2) };
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_attribute_steppings(
+    _this: PVOID,
+    node: u32,
+    _target_type: u32,
+    stepping: *mut KsPropertySteppingLong,
+    data_size: u32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || stepping.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    if (data_size as usize) < size_of::<KsPropertySteppingLong>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 缓冲足够
+    unsafe {
+        core::ptr::write(
+            stepping,
+            KsPropertySteppingLong {
+                stepping_delta: 1,
+                reserved: 0,
+                min: i32::MIN,
+                max: i32::MAX,
+            },
+        );
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_channel_volume(
+    _this: PVOID,
+    node: u32,
+    _channel: u32,
+    volume: *mut i32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || volume.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    // 0 = 0 dB（1/100 dB，正值表示衰减）
+    unsafe { core::ptr::write(volume, 0) };
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_set_device_channel_volume(
+    _this: PVOID,
+    node: u32,
+    _channel: u32,
+    _volume: i32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_channel_mute(
+    _this: PVOID,
+    node: u32,
+    _channel: u32,
+    mute: *mut i32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || mute.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    unsafe { core::ptr::write(mute, 0) };
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_set_device_channel_mute(
+    _this: PVOID,
+    node: u32,
+    _channel: u32,
+    _mute: i32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_device_channel_peak_meter(
+    _this: PVOID,
+    node: u32,
+    _channel: u32,
+    peak: *mut i32,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || peak.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    // -100 dB（1/100 dB 单位）
+    unsafe { core::ptr::write(peak, -10_000) };
+    STATUS_SUCCESS
+}
+
+unsafe extern "system" fn ae_get_buffer_size_range(
+    _this: PVOID,
+    node: u32,
+    format: PVOID,
+    range: *mut KsAudioEngineBufferSizeRange,
+) -> NTSTATUS {
+    if node != AUDIO_ENGINE_NODE_ID || format.is_null() || range.is_null() {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    // KSDATAFORMAT 之后是 WAVEFORMATEX，nAvgBytesPerSec 在 +8
+    let base = format.cast::<u8>();
+    // SAFETY: 调用方保证格式缓冲 >= KSDATAFORMAT_WAVEFORMATEX
+    let avg_bytes_per_sec =
+        unsafe { core::ptr::read_unaligned(base.add(size_of::<KSDATAFORMAT>() + 8).cast::<u32>()) };
+    let avg = if avg_bytes_per_sec == 0 {
+        192_000
+    } else {
+        avg_bytes_per_sec
+    };
+    // SAFETY: range 可写
+    unsafe {
+        core::ptr::write(
+            range,
+            KsAudioEngineBufferSizeRange {
+                min_buffer_bytes: avg * MIN_BUFFER_DURATION_MS / 1000,
+                max_buffer_bytes: avg * MAX_BUFFER_DURATION_MS / 1000,
+            },
+        );
+    }
+    STATUS_SUCCESS
+}
+
+static ENGINE_NODE_VTABLE: IMiniportAudioEngineNodeVtbl = IMiniportAudioEngineNodeVtbl {
+    query_interface: sub_qi,
+    add_ref: sub_addref,
+    release: sub_release,
+    get_audio_engine_descriptor: ae_tr_descriptor,
+    get_gfx_state: ae_tr_gfx_get,
+    set_gfx_state: ae_tr_gfx_set,
+    get_engine_format_size: ae_tr_format_size,
+    get_mix_format: ae_get_mix_format,
+    get_device_format: ae_get_device_format,
+    set_device_format: ae_set_device_format,
+    get_supported_device_formats: ae_tr_supported,
+    get_device_channel_count: ae_tr_channel_count,
+    get_device_attribute_steppings: ae_tr_steppings,
+    get_device_channel_volume: ae_tr_volume_get,
+    set_device_channel_volume: ae_tr_volume_set,
+    get_device_channel_mute: ae_tr_mute_get,
+    set_device_channel_mute: ae_tr_mute_set,
+    get_device_channel_peak_meter: ae_tr_peak,
+    get_buffer_size_range: ae_tr_buffer_range,
+};
+
+// ---- 各方法的计数 trampoline（记录调用次数与最后失败点）----
+
+unsafe extern "system" fn ae_tr_descriptor(
+    this: PVOID,
+    node: u32,
+    desc: *mut KsAudioEngineDescriptor,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_descriptor(this, node, desc) };
+    ae_tick(0, st);
+    st
+}
+unsafe extern "system" fn ae_tr_gfx_get(this: PVOID, node: u32, out: *mut i32) -> NTSTATUS {
+    let st = unsafe { ae_get_gfx_state(this, node, out) };
+    ae_tick(1, st);
+    st
+}
+unsafe extern "system" fn ae_tr_gfx_set(this: PVOID, node: u32, en: i32) -> NTSTATUS {
+    let st = unsafe { ae_set_gfx_state(this, node, en) };
+    ae_tick(2, st);
+    st
+}
+unsafe extern "system" fn ae_tr_format_size(
+    this: PVOID,
+    node: u32,
+    ty: u32,
+    size: *mut u32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_engine_format_size(this, node, ty, size) };
+    ae_tick(3, st);
+    st
+}
+unsafe extern "system" fn ae_tr_supported(
+    this: PVOID,
+    node: u32,
+    out: *mut c_void,
+    size: u32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_supported_device_formats(this, node, out, size) };
+    ae_tick(7, st);
+    st
+}
+unsafe extern "system" fn ae_tr_channel_count(
+    this: PVOID,
+    node: u32,
+    ty: u32,
+    count: *mut u32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_device_channel_count(this, node, ty, count) };
+    ae_tick(8, st);
+    st
+}
+unsafe extern "system" fn ae_tr_steppings(
+    this: PVOID,
+    node: u32,
+    ty: u32,
+    out: *mut KsPropertySteppingLong,
+    size: u32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_device_attribute_steppings(this, node, ty, out, size) };
+    ae_tick(9, st);
+    st
+}
+unsafe extern "system" fn ae_tr_volume_get(
+    this: PVOID,
+    node: u32,
+    ch: u32,
+    out: *mut i32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_device_channel_volume(this, node, ch, out) };
+    ae_tick(10, st);
+    st
+}
+unsafe extern "system" fn ae_tr_volume_set(this: PVOID, node: u32, ch: u32, v: i32) -> NTSTATUS {
+    let st = unsafe { ae_set_device_channel_volume(this, node, ch, v) };
+    ae_tick(11, st);
+    st
+}
+unsafe extern "system" fn ae_tr_mute_get(
+    this: PVOID,
+    node: u32,
+    ch: u32,
+    out: *mut i32,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_device_channel_mute(this, node, ch, out) };
+    ae_tick(12, st);
+    st
+}
+unsafe extern "system" fn ae_tr_mute_set(this: PVOID, node: u32, ch: u32, v: i32) -> NTSTATUS {
+    let st = unsafe { ae_set_device_channel_mute(this, node, ch, v) };
+    ae_tick(13, st);
+    st
+}
+unsafe extern "system" fn ae_tr_peak(this: PVOID, node: u32, ch: u32, out: *mut i32) -> NTSTATUS {
+    let st = unsafe { ae_get_device_channel_peak_meter(this, node, ch, out) };
+    ae_tick(14, st);
+    st
+}
+unsafe extern "system" fn ae_tr_buffer_range(
+    this: PVOID,
+    node: u32,
+    fmt: PVOID,
+    out: *mut KsAudioEngineBufferSizeRange,
+) -> NTSTATUS {
+    let st = unsafe { ae_get_buffer_size_range(this, node, fmt, out) };
+    ae_tick(15, st);
+    st
+}
+
 impl MiniportWaveRT {
     /// 创建小端口对象
     ///
@@ -692,11 +1257,18 @@ impl MiniportWaveRT {
                         vtbl: (&raw const SIGNAL_PROC_VTABLE).cast::<c_void>(),
                         owner: core::ptr::null_mut(),
                     },
+                    engine_node_obj: SubObject {
+                        vtbl: (&raw const ENGINE_NODE_VTABLE).cast::<c_void>(),
+                        owner: core::ptr::null_mut(),
+                    },
+                    device_format: [0u8; size_of::<KsDataFormatWaveFormatExtensible>()],
+                    device_format_valid: false,
                 },
             );
             // 回填子对象的 owner（主对象地址此时已确定）
             (*ptr.cast::<MiniportWaveRT>()).pin_count_obj.owner = ptr.cast::<MiniportWaveRT>();
             (*ptr.cast::<MiniportWaveRT>()).signal_proc_obj.owner = ptr.cast::<MiniportWaveRT>();
+            (*ptr.cast::<MiniportWaveRT>()).engine_node_obj.owner = ptr.cast::<MiniportWaveRT>();
         }
         ptr.cast::<MiniportWaveRT>()
     }
@@ -750,6 +1322,12 @@ unsafe extern "system" fn miniport_qi(
         } else if is_equal_guid(iid, &IID_IMINIPORT_AUDIO_SIGNAL_PROCESSING) {
             // 子对象：IMiniportAudioSignalProcessing（信号处理模式枚举）
             *obj = core::ptr::addr_of_mut!((*this).signal_proc_obj).cast::<c_void>();
+            interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
+            dbg_inc(&DBG_QI_OK);
+            STATUS_SUCCESS
+        } else if is_equal_guid(iid, &IID_IMINIPORT_AUDIO_ENGINE_NODE) {
+            // 子对象：IMiniportAudioEngineNode（Windows 10 音频引擎）
+            *obj = core::ptr::addr_of_mut!((*this).engine_node_obj).cast::<c_void>();
             interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
             dbg_inc(&DBG_QI_OK);
             STATUS_SUCCESS
@@ -822,7 +1400,7 @@ unsafe extern "system" fn miniport_data_range_intersection(
     DBG_RANGE_LAST_FSIZE.store(c.FormatSize, Ordering::Relaxed);
     DBG_RANGE_LAST_OUTLEN.store(out_len, Ordering::Relaxed);
     if c.MajorFormat != KSDATAFORMAT_TYPE_AUDIO || c.SubFormat != KSDATAFORMAT_SUBTYPE_PCM {
-        DBG_RANGE_LAST_STATUS.store(STATUS_NO_MATCH as u32, Ordering::Relaxed);
+        DBG_RANGE_LAST_STATUS.store(status_bits(STATUS_NO_MATCH), Ordering::Relaxed);
         return STATUS_NO_MATCH;
     }
     let needed = size_of::<KSDATAFORMAT>() + size_of::<WAVEFORMATEX>();
@@ -837,13 +1415,13 @@ unsafe extern "system" fn miniport_data_range_intersection(
     if out_len == 0 || out.is_null() {
         // SAFETY: 输出指针有效
         unsafe { *out_len_ret = needed as u32 };
-        DBG_RANGE_LAST_STATUS.store(STATUS_BUFFER_OVERFLOW as u32, Ordering::Relaxed);
+        DBG_RANGE_LAST_STATUS.store(status_bits(STATUS_BUFFER_OVERFLOW), Ordering::Relaxed);
         return STATUS_BUFFER_OVERFLOW;
     }
     if out_len < needed as u32 {
         // SAFETY: 输出指针有效
         unsafe { *out_len_ret = needed as u32 };
-        DBG_RANGE_LAST_STATUS.store(STATUS_BUFFER_TOO_SMALL as u32, Ordering::Relaxed);
+        DBG_RANGE_LAST_STATUS.store(status_bits(STATUS_BUFFER_TOO_SMALL), Ordering::Relaxed);
         return STATUS_BUFFER_TOO_SMALL;
     }
     let df = out as *mut KSDATAFORMAT;
@@ -1142,6 +1720,44 @@ struct KsDataFormatWaveFormatExtensible {
 const _: () = assert!(size_of::<WaveFormatExtensible>() == 40);
 const _: () = assert!(size_of::<KsDataFormatWaveFormatExtensible>() == 104);
 
+/// ksmedia.h `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` = {00000003-0000-0010-8000-00AA00389B71}
+static KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID {
+    data1: 0x0000_0003,
+    data2: 0x0000,
+    data3: 0x0010,
+    data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+};
+
+/// 音频引擎的**混音格式**（sysvad 的 m_pMixFormat 同款）：32bit IEEE float / 48k / 2ch。
+///
+/// 回归（实测 0x88890008 = AUDCLNT_E_UNSUPPORTED_FORMAT）：`IMiniportAudioEngineNode::GetMixFormat`
+/// 必须返回引擎内部处理用的 float32 格式；返回设备格式（16bit PCM）会被判"格式不支持"。
+/// 对照：本机 Realtek / ToDesk 端点的 GetMixFormat 均为 `0xFFFE / 48000|44100 / 32bit`。
+/// （设备格式仍是 16bit PCM —— 引擎负责在混音格式与设备格式之间转换。）
+static MIX_FORMAT: KsDataFormatWaveFormatExtensible = KsDataFormatWaveFormatExtensible {
+    data_format: KSDATAFORMAT {
+        FormatSize: size_of::<KsDataFormatWaveFormatExtensible>() as u32,
+        Flags: 0,
+        SampleSize: 0,
+        Reserved: 0,
+        MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+        SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+    },
+    wave: WaveFormatExtensible {
+        format_tag: 0xFFFE,
+        channels: 2,
+        samples_per_sec: 48_000,
+        avg_bytes_per_sec: 384_000, // 48000 * 2ch * 4B
+        block_align: 8,
+        bits_per_sample: 32,
+        cb_size: 22,
+        valid_bits_per_sample: 32,
+        channel_mask: 3,
+        sub_format: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+    },
+};
+
 /// 本驱动唯一支持的设备格式：48 kHz / 16 bit / 2ch PCM（与 AUDIO_DATA_RANGE 一致）
 static DEVICE_FORMAT: KsDataFormatWaveFormatExtensible = KsDataFormatWaveFormatExtensible {
     data_format: KSDATAFORMAT {
@@ -1321,6 +1937,46 @@ static DBG_PROPOSED_SET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_GET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_LAST_TAG: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_SET_OK: AtomicU32 = AtomicU32::new(0);
+/// 音频引擎节点方法调用计数（看引擎走的是哪条路）
+static DBG_AE_GET_MIX_FORMAT: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_GET_DEVICE_FORMAT: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_SET_DEVICE_FORMAT: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_SET_STATUS: AtomicU32 = AtomicU32::new(0);
+/// 引擎 SetDeviceFormat 设进来的格式（tag/rate/bits，看它想要什么）
+static DBG_AE_STORED_TAG: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_STORED_RATE: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_STORED_BITS: AtomicU32 = AtomicU32::new(0);
+/// 引擎节点方法全量计数（16 个方法各一个槽，按 vtable 顺序）
+static DBG_AE_CALLS: [AtomicU32; 16] = [
+    AtomicU32::new(0), // 0 GetAudioEngineDescriptor
+    AtomicU32::new(0), // 1 GetGfxState
+    AtomicU32::new(0), // 2 SetGfxState
+    AtomicU32::new(0), // 3 GetEngineFormatSize
+    AtomicU32::new(0), // 4 GetMixFormat
+    AtomicU32::new(0), // 5 GetDeviceFormat
+    AtomicU32::new(0), // 6 SetDeviceFormat
+    AtomicU32::new(0), // 7 GetSupportedDeviceFormats
+    AtomicU32::new(0), // 8 GetDeviceChannelCount
+    AtomicU32::new(0), // 9 GetDeviceAttributeSteppings
+    AtomicU32::new(0), // 10 GetDeviceChannelVolume
+    AtomicU32::new(0), // 11 SetDeviceChannelVolume
+    AtomicU32::new(0), // 12 GetDeviceChannelMute
+    AtomicU32::new(0), // 13 SetDeviceChannelMute
+    AtomicU32::new(0), // 14 GetDeviceChannelPeakMeter
+    AtomicU32::new(0), // 15 GetBufferSizeRange
+];
+
+/// 记录一次引擎节点方法调用（带 in-flight/失败标记方便定位）
+fn ae_tick(idx: usize, status: NTSTATUS) {
+    dbg_inc(&DBG_AE_CALLS[idx]);
+    if status < 0 {
+        DBG_AE_LAST_FAIL_IDX.store(idx as u32, Ordering::Relaxed);
+        DBG_AE_LAST_FAIL_STATUS.store(status_bits(status), Ordering::Relaxed);
+    }
+}
+
+static DBG_AE_LAST_FAIL_IDX: AtomicU32 = AtomicU32::new(u32::MAX);
+static DBG_AE_LAST_FAIL_STATUS: AtomicU32 = AtomicU32::new(0);
 // 数据范围求交失败的现场（引擎一直在问，但 314 次全 NO_MATCH/TOO_SMALL）
 static DBG_RANGE_LAST_MAJOR: AtomicU32 = AtomicU32::new(0);
 static DBG_RANGE_LAST_SUB: AtomicU32 = AtomicU32::new(0);
@@ -1342,6 +1998,11 @@ static DBG_QI_7: AtomicU32 = AtomicU32::new(0);
 static DBG_QI_OK: AtomicU32 = AtomicU32::new(0);
 static DBG_RANGE_OK_SEEN: AtomicU32 = AtomicU32::new(0);
 
+/// NTSTATUS(i32) → u32 位模式（诊断计数器用；避免 clippy::cast_sign_loss）
+const fn status_bits(s: NTSTATUS) -> u32 {
+    u32::from_ne_bytes(s.to_ne_bytes())
+}
+
 fn dbg_inc(counter: &AtomicU32) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -1355,7 +2016,7 @@ static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
 };
 const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
 /// 计数器快照长度：32 个 u32
-const DBG_STATS_LEN: usize = 33 * 4;
+const DBG_STATS_LEN: usize = 42 * 4;
 
 unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
     // SAFETY: PortCls 保证 req 有效
@@ -1364,8 +2025,8 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
         return STATUS_INVALID_PARAMETER;
     }
     if r.Verb & KSPROPERTY_TYPE_GET != 0 {
-        if (r.ValueSize as usize) < DBG_STATS_LEN {
-            r.ValueSize = DBG_STATS_LEN as ULONG;
+        if (r.ValueSize as usize) < DBG_STATS_LEN + 16 * 4 {
+            r.ValueSize = (DBG_STATS_LEN + 16 * 4) as ULONG;
             return STATUS_BUFFER_TOO_SMALL;
         }
         let vals = [
@@ -1402,14 +2063,30 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
             DBG_QI_7.load(Ordering::Relaxed),
             DBG_RANGE_OK_SEEN.load(Ordering::Relaxed),
             DBG_PROPOSED_SET_OK.load(Ordering::Relaxed),
+            DBG_AE_GET_MIX_FORMAT.load(Ordering::Relaxed),
+            DBG_AE_GET_DEVICE_FORMAT.load(Ordering::Relaxed),
+            DBG_AE_SET_DEVICE_FORMAT.load(Ordering::Relaxed),
+            DBG_AE_SET_STATUS.load(Ordering::Relaxed),
+            DBG_AE_STORED_TAG.load(Ordering::Relaxed),
+            DBG_AE_STORED_RATE.load(Ordering::Relaxed),
+            DBG_AE_STORED_BITS.load(Ordering::Relaxed),
+            DBG_AE_LAST_FAIL_IDX.load(Ordering::Relaxed),
+            DBG_AE_LAST_FAIL_STATUS.load(Ordering::Relaxed),
         ];
         // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
         unsafe {
             for (i, v) in vals.iter().enumerate() {
                 core::ptr::write_unaligned(r.Value.cast::<u32>().add(i), *v);
             }
+            // 16 个引擎节点方法计数接在结构体之后
+            for (i, c) in DBG_AE_CALLS.iter().enumerate() {
+                core::ptr::write_unaligned(
+                    r.Value.cast::<u32>().add(vals.len() + i),
+                    c.load(Ordering::Relaxed),
+                );
+            }
         }
-        r.ValueSize = DBG_STATS_LEN as ULONG;
+        r.ValueSize = (DBG_STATS_LEN + 16 * 4) as ULONG;
         return STATUS_SUCCESS;
     }
     STATUS_INVALID_PARAMETER
@@ -1423,22 +2100,57 @@ const PCFILTER_NODE: u32 = u32::MAX;
 /// KSPROPERTY_PIN_DATAINTERSECTION 以 0 长度缓冲询问"需要多大"时，PortCls/官方样例
 /// （sysvad minwavert.cpp）即用它 + `*ResultantFormatLength = requiredSize` 应答；
 /// 若这里回 STATUS_BUFFER_TOO_SMALL，调用方按硬失败处理、不会带足缓冲重试。
-const STATUS_BUFFER_OVERFLOW: NTSTATUS = 0x8000_0005u32 as i32;
+const STATUS_BUFFER_OVERFLOW: NTSTATUS = i32::from_ne_bytes(0x8000_0005u32.to_ne_bytes());
 
 /// wave 滤波器内部连接：host pin ↔ bridge pin（对照本机 ToDesk 虚拟声卡实测
 /// `KSPROPERTY_TOPOLOGY_CONNECTIONS` 返回 1 条连接；sysvad 是经
 /// KSNODETYPE_AUDIO_ENGINE 节点中转，本驱动不做音频引擎节点，直接相连）。
-static WAVE_RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
-    FromNode: PCFILTER_NODE,
-    FromNodePin: crate::endpoint_names::WAVE_RENDER_HOST_PIN,
-    ToNode: PCFILTER_NODE,
-    ToNodePin: crate::endpoint_names::WAVE_RENDER_BRIDGE_PIN,
-}];
-static WAVE_CAPTURE_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
-    FromNode: PCFILTER_NODE,
-    FromNodePin: crate::endpoint_names::WAVE_CAPTURE_BRIDGE_PIN,
-    ToNode: PCFILTER_NODE,
-    ToNodePin: crate::endpoint_names::WAVE_CAPTURE_HOST_PIN,
+// 更新（Win10 音频引擎节点）：按 sysvad speakerwavtable.h 的形状经
+// KSNODETYPE_AUDIO_ENGINE 节点中转 —— host pin → node 输入(pin 1)；node 输出(pin 0) → bridge pin。
+// 音频引擎节点是 Win10 端点"应用可用"的前提（引擎会 QI IMiniportAudioEngineNode）。
+static WAVE_RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 2] = [
+    PCCONNECTION_DESCRIPTOR {
+        FromNode: PCFILTER_NODE,
+        FromNodePin: crate::endpoint_names::WAVE_RENDER_HOST_PIN,
+        ToNode: 0, // KSNODE_WAVE_AUDIO_ENGINE
+        ToNodePin: 1,
+    },
+    PCCONNECTION_DESCRIPTOR {
+        FromNode: 0,
+        FromNodePin: 0,
+        ToNode: PCFILTER_NODE,
+        ToNodePin: crate::endpoint_names::WAVE_RENDER_BRIDGE_PIN,
+    },
+];
+static WAVE_CAPTURE_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 2] = [
+    PCCONNECTION_DESCRIPTOR {
+        FromNode: PCFILTER_NODE,
+        FromNodePin: crate::endpoint_names::WAVE_CAPTURE_BRIDGE_PIN,
+        ToNode: 0,
+        ToNodePin: 1,
+    },
+    PCCONNECTION_DESCRIPTOR {
+        FromNode: 0,
+        FromNodePin: 0,
+        ToNode: PCFILTER_NODE,
+        ToNodePin: crate::endpoint_names::WAVE_CAPTURE_HOST_PIN,
+    },
+];
+
+/// ksmedia.h `KSNODETYPE_AUDIO_ENGINE` = {35CAF6E4-F3B3-4168-BB4B-55E77A461C7E}
+static KSNODETYPE_AUDIO_ENGINE: GUID = GUID {
+    data1: 0x35ca_f6e4,
+    data2: 0xf3b3,
+    data3: 0x4168,
+    data4: [0xbb, 0x4b, 0x55, 0xe7, 0x7a, 0x46, 0x1c, 0x7e],
+};
+/// 音频引擎节点（AutomationTable 留空：PortCls 把 KSPROPSETID_AudioEngine 属性转发到
+/// miniport 的 IMiniportAudioEngineNode 接口，sysvad 同款）
+static WAVE_NODES: [PCNODE_DESCRIPTOR; 1] = [PCNODE_DESCRIPTOR {
+    Flags: 0,
+    AutomationTable: core::ptr::null(),
+    Type: &raw const KSNODETYPE_AUDIO_ENGINE,
+    Name: core::ptr::null(),
 }];
 
 /// render 小端口 pin 表（2 pin，对照 ToDesk 虚拟声卡逐 pin 实测值 / sysvad speakerwavtable.h）
@@ -1548,9 +2260,9 @@ static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
     PinCount: PINS_RENDER.len() as u32,
     Pins: PINS_RENDER.as_ptr(),
-    NodeSize: 0,
-    NodeCount: 0,
-    Nodes: core::ptr::null(),
+    NodeSize: size_of::<PCNODE_DESCRIPTOR>() as u32,
+    NodeCount: WAVE_NODES.len() as u32,
+    Nodes: WAVE_NODES.as_ptr(),
     ConnectionCount: WAVE_RENDER_CONNECTIONS.len() as u32,
     Connections: WAVE_RENDER_CONNECTIONS.as_ptr(),
     CategoryCount: FILTER_CATEGORIES.len() as u32,
@@ -1565,9 +2277,9 @@ static FILTER_DESC_CAPTURE: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
     PinCount: PINS_CAPTURE.len() as u32,
     Pins: PINS_CAPTURE.as_ptr(),
-    NodeSize: 0,
-    NodeCount: 0,
-    Nodes: core::ptr::null(),
+    NodeSize: size_of::<PCNODE_DESCRIPTOR>() as u32,
+    NodeCount: WAVE_NODES.len() as u32,
+    Nodes: WAVE_NODES.as_ptr(),
     ConnectionCount: WAVE_CAPTURE_CONNECTIONS.len() as u32,
     Connections: WAVE_CAPTURE_CONNECTIONS.as_ptr(),
     CategoryCount: FILTER_CATEGORIES.len() as u32,
