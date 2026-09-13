@@ -521,7 +521,137 @@ pub struct MiniportWaveRT {
     pub adapter: PVOID,
     pub device_object: PDEVICE_OBJECT,
     pub capture: bool,
+    /// 子对象（COM 聚合）：IPinCount / IMiniportAudioSignalProcessing
+    /// 引擎（audiodg）会 QI 这两个接口，返回 E_NOINTERFACE 时端点初始化会中途停下
+    /// （真机 QI 探针实测：IMiniportWaveRT → IMiniportAudioSignalProcessing →
+    ///  IMiniportAudioEngineNode → IPinCount，各两轮后停止，new_stream 恒 0）。
+    pub pin_count_obj: SubObject,
+    pub signal_proc_obj: SubObject,
 }
+
+/// COM 聚合子对象：首字段为该接口的 vtable 指针（引擎按各自的接口布局调用），
+/// 第二字段回指主 miniport 对象以便转发 IUnknown。
+#[repr(C)]
+pub struct SubObject {
+    pub vtbl: *const c_void,
+    pub owner: *mut MiniportWaveRT,
+}
+
+/// portcls.h `IID_IPinCount` = {5DADB7DC-A2CB-4540-A4A8-425EE4AE9051}
+static IID_IPINCOUNT: GUID = GUID {
+    data1: 0x5dad_b7dc,
+    data2: 0xa2cb,
+    data3: 0x4540,
+    data4: [0xa4, 0xa8, 0x42, 0x5e, 0xe4, 0xae, 0x90, 0x51],
+};
+/// portcls.h `IID_IMiniportAudioSignalProcessing` = {B532678C-BE50-472D-9973-8A6F16594989}
+static IID_IMINIPORT_AUDIO_SIGNAL_PROCESSING: GUID = GUID {
+    data1: 0xb532_678c,
+    data2: 0xbe50,
+    data3: 0x472d,
+    data4: [0x99, 0x73, 0x8a, 0x6f, 0x16, 0x59, 0x49, 0x89],
+};
+/// ksmedia.h `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` = {C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}
+static AUDIO_SIGNALPROCESSINGMODE_DEFAULT: GUID = GUID {
+    data1: 0xc18e_2f7e,
+    data2: 0x933d,
+    data3: 0x4965,
+    data4: [0xb7, 0xd1, 0x1e, 0xef, 0x22, 0x8d, 0x2a, 0xf3],
+};
+
+/// portcls.h `IPinCount`：PinCount(PinId, Necessary, Current, Possible, GlobalCurrent, GlobalPossible)
+#[repr(C)]
+pub struct IPinCountVtbl {
+    pub query_interface: crate::com::PFN_QUERYINTERFACE,
+    pub add_ref: crate::com::PFN_ADDREF,
+    pub release: crate::com::PFN_RELEASE,
+    pub pin_count:
+        unsafe extern "system" fn(PVOID, u32, *mut u32, *mut u32, *mut u32, *mut u32, *mut u32),
+}
+
+/// portcls.h `IMiniportAudioSignalProcessing`：GetModes(Pin, GUID* Modes, ULONG* NumModes)
+#[repr(C)]
+pub struct IMiniportAudioSignalProcessingVtbl {
+    pub query_interface: crate::com::PFN_QUERYINTERFACE,
+    pub add_ref: crate::com::PFN_ADDREF,
+    pub release: crate::com::PFN_RELEASE,
+    pub get_modes: unsafe extern "system" fn(PVOID, u32, *mut GUID, *mut u32) -> NTSTATUS,
+}
+
+unsafe extern "system" fn sub_owner(this: PVOID) -> *mut MiniportWaveRT {
+    // SAFETY: 子对象首字段是 vtable 指针，第二字段是 owner
+    unsafe { (*(this as *const SubObject)).owner }
+}
+
+unsafe extern "system" fn sub_qi(this: PVOID, iid: *const GUID, obj: *mut *mut c_void) -> NTSTATUS {
+    let owner = unsafe { sub_owner(this) };
+    // SAFETY: owner 为主 miniport 对象
+    unsafe { miniport_qi(owner.cast(), iid, obj) }
+}
+
+unsafe extern "system" fn sub_addref(this: PVOID) -> u32 {
+    let owner = unsafe { sub_owner(this) };
+    // SAFETY: owner 为主 miniport 对象
+    unsafe { miniport_addref(owner.cast()) }
+}
+
+unsafe extern "system" fn sub_release(this: PVOID) -> u32 {
+    let owner = unsafe { sub_owner(this) };
+    // SAFETY: owner 为主 miniport 对象
+    unsafe { miniport_release(owner.cast()) }
+}
+
+/// IPinCount::PinCount —— 不改动任何计数（沿用过滤器描述符里声明的实例数：
+/// host pin 1/1、bridge pin 0/0）。方法返回 void。
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn pin_count_impl(
+    _this: PVOID,
+    _pin: u32,
+    _necessary: *mut u32,
+    _current: *mut u32,
+    _possible: *mut u32,
+    _global_current: *mut u32,
+    _global_possible: *mut u32,
+) {
+}
+
+/// IMiniportAudioSignalProcessing::GetModes —— 只支持一种模式：DEFAULT。
+/// 约定：`*num` 进入时为缓冲可容纳的 GUID 数；不足则回所需数量 + BUFFER_TOO_SMALL。
+unsafe extern "system" fn signal_proc_get_modes(
+    _this: PVOID,
+    _pin: u32,
+    modes: *mut GUID,
+    num: *mut u32,
+) -> NTSTATUS {
+    if num.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let cap = unsafe { *num };
+    if modes.is_null() || cap == 0 {
+        unsafe { *num = 1 };
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 调用方保证 modes 至少可容纳 *num 个 GUID
+    unsafe {
+        core::ptr::write(modes, AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+        *num = 1;
+    }
+    STATUS_SUCCESS
+}
+
+static PIN_COUNT_VTABLE: IPinCountVtbl = IPinCountVtbl {
+    query_interface: sub_qi,
+    add_ref: sub_addref,
+    release: sub_release,
+    pin_count: pin_count_impl,
+};
+static SIGNAL_PROC_VTABLE: IMiniportAudioSignalProcessingVtbl =
+    IMiniportAudioSignalProcessingVtbl {
+        query_interface: sub_qi,
+        add_ref: sub_addref,
+        release: sub_release,
+        get_modes: signal_proc_get_modes,
+    };
 
 impl MiniportWaveRT {
     /// 创建小端口对象
@@ -553,10 +683,22 @@ impl MiniportWaveRT {
                     adapter,
                     device_object,
                     capture,
+                    // owner 先填空，分配完成后回填自身地址（子对象需要回指主对象）
+                    pin_count_obj: SubObject {
+                        vtbl: (&raw const PIN_COUNT_VTABLE).cast::<c_void>(),
+                        owner: core::ptr::null_mut(),
+                    },
+                    signal_proc_obj: SubObject {
+                        vtbl: (&raw const SIGNAL_PROC_VTABLE).cast::<c_void>(),
+                        owner: core::ptr::null_mut(),
+                    },
                 },
             );
+            // 回填子对象的 owner（主对象地址此时已确定）
+            (*ptr.cast::<MiniportWaveRT>()).pin_count_obj.owner = ptr.cast::<MiniportWaveRT>();
+            (*ptr.cast::<MiniportWaveRT>()).signal_proc_obj.owner = ptr.cast::<MiniportWaveRT>();
         }
-        ptr as *mut MiniportWaveRT
+        ptr.cast::<MiniportWaveRT>()
     }
 
     /// 设置配对小端口（环回）
@@ -596,6 +738,18 @@ unsafe extern "system" fn miniport_qi(
             || is_equal_guid(iid, &IID_IMiniportWaveRT)
         {
             *obj = this.cast();
+            interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
+            dbg_inc(&DBG_QI_OK);
+            STATUS_SUCCESS
+        } else if is_equal_guid(iid, &IID_IPINCOUNT) {
+            // 子对象：IPinCount（引擎端点初始化会 QI）
+            *obj = core::ptr::addr_of_mut!((*this).pin_count_obj).cast::<c_void>();
+            interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
+            dbg_inc(&DBG_QI_OK);
+            STATUS_SUCCESS
+        } else if is_equal_guid(iid, &IID_IMINIPORT_AUDIO_SIGNAL_PROCESSING) {
+            // 子对象：IMiniportAudioSignalProcessing（信号处理模式枚举）
+            *obj = core::ptr::addr_of_mut!((*this).signal_proc_obj).cast::<c_void>();
             interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
             dbg_inc(&DBG_QI_OK);
             STATUS_SUCCESS
