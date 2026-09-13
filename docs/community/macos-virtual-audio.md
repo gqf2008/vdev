@@ -214,7 +214,7 @@ if last_output - in_sample_time > rate {
 
 ## 七、构建与运行
 
-依赖只有 Rust 工具链；安装需要管理员权限（osascript 提权，含 `killall coreaudiod`）：
+`make` 环回自测除 Rust 工具链外还需要 `ffmpeg` 与 `python3`（见 `test_loopback.sh`）；安装需要管理员权限（osascript 提权，含 `killall coreaudiod`）：
 
 ```bash
 cd crates/vdev-audio
@@ -256,4 +256,4 @@ Windows 侧的对应实现（PortCls/WaveRT 内核驱动 `vdev-audio-win`）见�
 2. **隔离验证优先于装机实测**。一个 dlopen 加载测试（工厂 → QueryInterface → Initialize → 属性全查询 → StartIO → IO 回调）能在不碰 coreaudiod 的情况下覆盖 90% 的正确性，剩下的 10% 才值得冒"系统音频服务损坏、重启电脑"的风险。
 3. **对宿主保持敬畏**。coreaudiod 不会告诉你哪里错了——它只会沉默、空转或停摆。错误码、属性、时钟语义这些"官面契约"，一个字节都不能凭印象写。
 
-仓库与完整代码：[gqf2008/vdev](https://github.com/gqf2008/vdev)（`crates/vdev-audio`，约 2700 行 Rust 含驱动、CLI 与测试）。系列其余五篇见 `docs/community/`。
+仓库与完整代码：[gqf2008/vdev](https://github.com/gqf2008/vdev)（`crates/vdev-audio`，约 2700 行 Rust 含驱动、CLI 与测试）。系列其余八篇见 `docs/community/`。

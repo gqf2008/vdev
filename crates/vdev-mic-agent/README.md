@@ -31,8 +31,9 @@ proposal, and produces **numerically identical audio** (100 % of samples within
 ```bash
 cargo test -p vdev-mic-agent          # 41 unit tests on macOS (metrics, mixer, ring, frames, latency, stats, wavio)
 
-# D3-D4 lives behind CoreAudio; this only type-checks the macOS backend
-cargo check -p vdev-mic-agent --target x86_64-apple-darwin
+# D3-D4 macOS backend: build the binary (a plain `cargo check` will NOT catch
+# FFI link errors — AudioUnit symbols must resolve against AudioToolbox)
+cargo build --release -p vdev-mic-agent
 
 # Windows live path: same checks against the WASAPI backend (see below)
 cargo check  -p vdev-mic-agent --target x86_64-pc-windows-msvc
@@ -80,9 +81,11 @@ requirement for every denoise path: `run`, `bench`, and `live` (denoise and
 `--probe acoustic`) print a load error and exit when `librnnoise` is missing.
 The one exception is `live --probe digital`, the digital loopback probe, which
 needs no backend and runs without it. `librnnoise-0.dll` /
-`librnnoise.dylib` is resolved in order: `--dll <path>`, `$RNNOISE_DLL`, next to
-the executable, then a `third_party/` tree walked up to 5 levels — so
-`crates/vdev-mic-agent/third_party/native/` works from a workspace build, and
+`librnnoise.dylib` is resolved in order: `--dll <path>`, a non-empty
+`$RNNOISE_DLL`, then each executable ancestor directory up to 5 levels — for
+each level the directory itself first, then its vendored sub-paths
+(`third_party/native/`, `third_party/`, …) — and finally the current directory.
+So `crates/vdev-mic-agent/third_party/native/` works from a workspace build, and
 the sibling tree works from the demo checkout. It is git-ignored: build it from
 [xiph/rnnoise](https://github.com/xiph/rnnoise) or take the MSYS2 `ucrt64`
 package (the archive's `third_party/FETCH.md` has the exact steps).

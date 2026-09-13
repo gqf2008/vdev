@@ -1,10 +1,11 @@
 //! The agent pipeline: capture -> denoise -> inject.
 //!
-//! In the real product these are three threads/queues (CoreAudio/WASAPI capture
-//! callback -> ring buffer -> denoise worker -> ring buffer -> virtual-mic
-//! render callback). For D1-D2 the capture is a WAV and the injection is a WAV,
-//! but the denoise stage is the same code path: one 480-sample frame in, one
-//! 480-sample frame out, timed per call.
+//! In the live path (`platform/`) the denoise runs **inline** in the capture
+//! callback/thread: capture -> `FrameAssembler` -> `Core::on_frame` (RNNoise +
+//! dry/wet) -> one SPSC ring -> render. There is no separate denoise worker
+//! thread. For D1-D2 the capture is a WAV and the injection is a WAV, but the
+//! denoise stage is the same code path: one 480-sample frame in, one 480-sample
+//! frame out, timed per call.
 //!
 //! ## Dry/wet mixing needs delay compensation
 //!

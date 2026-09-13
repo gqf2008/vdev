@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
     about = "End-side AI microphone front-end for vdev -- D1-D2 offline harness",
     long_about = "capture -> RNNoise denoise -> inject, with per-frame timing.\n\
                   D1-D2 wires capture and injection to WAV files. D3-D4 (`live`) drives\n\
-                  the same core from real CoreAudio callbacks, and measures the\n\
-                  buffering a WAV harness cannot see (`live --probe`)."
+                  the same core from real audio callbacks (CoreAudio on macOS, WASAPI\n\
+                  polling on Windows), and measures the buffering a WAV harness\n\
+                  cannot see (`live --probe`)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,8 +46,9 @@ enum Cmd {
     /// Compare two WAVs sample by sample (used to cross-check against the C and
     /// Python harnesses -- same DLL, same frames, so they should agree exactly).
     Diff(DiffArgs),
-    /// Drive the same core from real CoreAudio devices: capture -> denoise ->
-    /// inject, optionally in latency-probe mode. macOS only in this build.
+    /// Drive the same core from real audio devices: capture -> denoise ->
+    /// inject, optionally in latency-probe mode. CoreAudio on macOS, WASAPI
+    /// polling on Windows.
     Live(LiveArgs),
 }
 

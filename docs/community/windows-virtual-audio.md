@@ -14,7 +14,7 @@ vdev 的 `vdev-audio-win` 选了第三条。语义上等同 macOS 侧的自研 B
 
 内核路线的成本要提前认清：任何一次野指针、池越界、错误的 IRQL 假设，代价都不是段错误而是 **BSOD**；内核环境没有 CRT、没有堆抽象、不能 panic 展开，大量用户态习得的"防御性编程"在这里直接失效。本文第 5 节的六个案例，全部是独立审查在这个驱动里真实抓出来的 blocker——修复前的代码，以当时状态加载几乎必蓝屏。
 
-顺带澄清一个仓库里的措辞：README 把它称作 "KMDF 内核驱动"，但代码实际**没有用任何 WDF 框架**——`driver/src/lib.rs` 的模块注释写得很清楚：手写精简绑定路线，跳过 WDF 的函数表机制，驱动入口直接调 PortCls 的初始化/子设备注册函数。它是一个纯 WDM 风格的 PortCls 小端口驱动。
+顺带澄清一个仓库里的措辞：本文早期草稿沿用设计文档把它称作 "KMDF 内核驱动"，但代码实际**没有用任何 WDF 框架**——`driver/src/lib.rs` 的模块注释写得很清楚：手写精简绑定路线，跳过 WDF 的函数表机制，驱动入口直接调 PortCls 的初始化/子设备注册函数。它是一个纯 WDM 风格的 PortCls 小端口驱动。
 
 ## 二、PortCls/WaveRT 最小知识
 
@@ -55,7 +55,7 @@ PnP 子系统为设备调 `AddDevice`，我们在里面用 `PcAddAdapterDevice` 
 - 默认（无 `kernel`）：普通 cdylib，纯逻辑模块（环形缓冲、位置数学、拓扑描述符、端点常量）无条件编译，`cargo test` 在 macOS 宿主就能跑；
 - `--features kernel`：`no_std` 生效，链接 `ntoskrnl`/`portcls`/`ks` 等，产出真正的 `.sys`。
 
-链接脚本在 `driver/build.rs`：`/ENTRY:DriverEntry`、`/SUBSYSTEM:NATIVE`、`/DRIVER:WDM`，并用三个 `/NODEFAULTLIB` 排除 `libcmt`/`libucrt`/`libvcruntime`——内核没有用户态 CRT。同时开 `/INTEGRITYCHECK` 强制 PE 校验和（内核映像加载要求）。workspace 的 dev/release profile 都设了 `panic = "abort"`；`no_std` 下还要自己提供 panic handler，本驱动的选择很直接（lib.rs:110-119）：落一条 `kdbg!` 日志后 `KeBugCheckEx(0xDEAD_DEAD, …)`——内核里 panic 就该干脆地蓝屏，而不是把系统挂在未定义状态。
+链接脚本在 `driver/build.rs`：`/ENTRY:DriverEntry`、`/SUBSYSTEM:NATIVE`、`/DRIVER:WDM`，并用三个 `/NODEFAULTLIB` 排除 `libcmt`/`libucrt`/`libvcruntime`——内核没有用户态 CRT。同时开 `/INTEGRITYCHECK` 强制 PE 校验和（内核映像加载要求）。workspace 的 dev/release profile 都设了 `panic = "abort"`；`no_std` 下还要自己提供 panic handler，本驱动的选择很直接（lib.rs:110-119）：**直接** `KeBugCheckEx(0xDEAD_DEAD, …)`——内核里 panic 就该干脆地蓝屏，而不是把系统挂在未定义状态（`kdbg!` 默认编译为空，不要把「会先落日志」当既成事实）。
 
 关于"要不要自己补运行时符号"：这里要如实说——**本驱动没有提供 `memcmp/memcpy` 之类的 shim**。`no_std` + `panic=abort` 之后，core 库剩下的链接期依赖只有一个：一个返回 0 的空函数 `__CxxFrameHandler3`（lib.rs:122-126），用于满足链接器对 MSVC 异常处理器的引用。（同一仓库的 display 驱动在 bindgen 场景确实踩过 `memcmp/memcpy` 签名校验的坑，那是另一条链路的故事。）
 
@@ -229,7 +229,7 @@ CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 f
 方法论的沉淀就三条：
 
 1. **官方样例与 WDK 头文件是唯一权威。** sysvad 的安装顺序、连接表条目、端点拓扑，逐行照抄不丢人；结构布局、GUID、NTSTATUS、vtable 槽序，逐字段对照头文件，注释里写明行号来源。
-2. **把"内核才能验证的"压缩到最小，其余全部下沉为宿主可测。** 纯数学抽模块（`position.rs`）、纯常量抽模块（`endpoint_names.rs`）、布局断言进 `#[cfg(test)]`——本驱动最终有九个测试模块可以在 macOS 宿主跑，其中两个（回绕性质测试、NTSTATUS/GUID 值回归）正是案例二和案例五的疫苗。静态描述符这类"数据即 ABI"的东西，再加一层描述符自洽性断言（计数、越界、DataFlow 方向）。
+2. **把"内核才能验证的"压缩到最小，其余全部下沉为宿主可测。** 纯数学抽模块（`position.rs`）、纯常量抽模块（`endpoint_names.rs`）、布局断言进 `#[cfg(test)]`——本驱动最终有 6 个驱动测试模块（含 CLI 共 7 个）可以在 macOS 宿主跑，其中两个（回绕性质测试、NTSTATUS/GUID 值回归）正是案例二和案例五的疫苗。静态描述符这类"数据即 ABI"的东西，再加一层描述符自洽性断言（计数、越界、DataFlow 方向）。
 3. **装上 Driver Verifier 再上真机。** special pool + DDI compliance 会把池越界和 IRQL 违规在第一时间变成可定位的 bugcheck，而不是等池损坏在别处爆炸。这一步是我们接下来真机验证的第一件事。
 
 内核驱动的世界没有"先跑起来再说"。每一个凭记忆写出的字节，最终都会以蓝屏的形式找你复核。

@@ -66,7 +66,7 @@ vdev-mic-agent live --probe digital --seconds 30   # 注入链路自检：无麦
 
 - [AI 虚拟麦克风](ai-virtual-mic.md)（本功能：SPSC 环、自适应干湿、chirp+NCC 延迟探针）
 - [macOS 虚拟声卡](macos-virtual-audio.md) / [Windows 虚拟声卡](windows-virtual-audio.md)（注入所依赖的两块虚拟设备）
-- 其余七篇：macOS 摄像头/键鼠/虚拟屏、Windows 摄像头/显示器/HID —— 见[系列索引](README.md)
+- 其余六篇：macOS 摄像头/键鼠/虚拟屏、Windows 摄像头/显示器/HID —— 见[系列索引](README.md)
 
 ## 状态与边界（如实）
 

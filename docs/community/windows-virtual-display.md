@@ -237,4 +237,4 @@ vdev-display-win.exe uninstall
 2. **失败路径才是 UB 的老家**——"初始化失败后框架仍触发清理"这种跨框架的失败序，要在数据表示层（零值合法化）而非调用顺序上解决；
 3. **从未真实编译过的代码等于没写过**——宏体、feature 门控、平台专属包，都需要一条真实触达的构建路径，哪怕先是顾问 job。
 
-Windows 侧的虚拟摄像头（DirectShow 用户态、免签名）、虚拟声卡（KMDF PortCls/WaveRT）与内核 HID 驱动的姊妹篇见仓库 `docs/` 与 README。如果这篇文章帮你少踩一个坑，欢迎到 [vdev](https://github.com/gqf2008/vdev) 点个 star。
+Windows 侧的虚拟摄像头（DirectShow 用户态、免签名）、虚拟声卡（WDM PortCls/WaveRT，不使用 WDF）与内核 HID 驱动的姊妹篇见仓库 `docs/` 与 README。如果这篇文章帮你少踩一个坑，欢迎到 [vdev](https://github.com/gqf2008/vdev) 点个 star。

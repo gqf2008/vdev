@@ -14,7 +14,7 @@
 
 vdev 的选择写在根 README 里：**虚拟 HID 用 CGEventPost 用户态注入**——键鼠和摄像头、声卡、虚拟屏一样，本质上不需要"驱动"，Quartz 事件服务在用户态就给了完整的合成与监听入口。代价是合成事件终究是"会话层"的：它过不了登录窗口，也进不了 Secure Input 域（见第八节）。
 
-`vdev-hid` crate 一共只有两个源文件（`keycodes.rs` + `lib.rs`，合计约 400 行），唯一的外部依赖是 `cgevents`（一个经 Swift 桥调用 CoreGraphics 的 Rust crate）。就这 400 行，实现了键码注入、文本输入、鼠标移动/点击/滚动、全局事件监听四件事。本文把它拆开讲透。
+`vdev-hid` crate 一共只有两个源文件（`keycodes.rs` + `lib.rs`，合计约 400 行），依赖只有两个：`cgevents`（经 Swift 桥调用 CoreGraphics 的 Rust crate）与 `anyhow`。就这 400 行，实现了键码注入、文本输入、鼠标移动/点击/滚动、全局事件监听四件事。本文把它拆开讲透。
 
 ## 二、Quartz Event Services 最小知识
 

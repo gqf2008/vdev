@@ -66,7 +66,7 @@ RNNoise 对**每一帧**都做衰减，包括本来就很干净的帧。把一�
 1. **噪声底**：只用手头 VAD 概率低于 0.30 的非语音帧更新，且"跌得快、涨得慢"（`floor_fall` 0.50 对 `floor_rise` 0.01）的最小值统计跟踪器——长句子永远抬不高噪声底；
 2. **语音电平**：只对语音帧做一阶平滑（系数 0.02）。
 
-两者相除得到长期 SNR，送进 25 dB 中心、±2 dB 迟滞、10 dB 线性斜坡的闸门：高于闸门旁路模型（`min_wet` = 0），低于"闸门 − 斜坡"全湿（`max_wet` = 1），wet 比值本身再用不对称的一阶系数（attack 0.20 / release 0.01）平滑。所有时间常数都以数百毫秒计——逐帧 SNR 会在每个 10 ms 边界上翻转增益，听感上是可闻的抽吸；要回答的是"这个房间吵不吵"，那是房间的属性，不是帧的属性。
+两者相除得到长期 SNR，送进 25 dB 中心、±2 dB 迟滞、10 dB 线性斜坡的闸门：高于闸门旁路模型（`min_wet` = 0），低于"闸门 − 斜坡"全湿（`max_wet` = 1），wet 比值本身再用不对称的一阶系数（attack 0.20 / release 0.01）平滑。时间尺度按估计器分层：快的一侧是噪声底跌落（`floor_fall` 0.50，约十几毫秒）与 wet 上升（attack 0.20，约 45~50 ms），慢的一侧是噪声底抬升（`floor_rise` 0.01）、语音电平平滑（0.02）与 wet 回落（release 0.01），后三者才到数百毫秒至秒级。这种不对称是刻意的——逐帧 SNR 会在每个 10 ms 边界上翻转增益，听感上是可闻的抽吸；要回答的是"这个房间吵不吵"，那是房间的属性，不是帧的属性。
 
 ```rust
 // crates/vdev-mic-agent/src/mixer.rs（AdaptiveMixer::update 内）
@@ -102,7 +102,7 @@ let target = if snr_db >= gate {
 
 ### 3.4 引擎前瞻与缓冲预算：20 ms + 10 ms 的口径
 
-延迟预算要分开两笔账。**算法账**：RNNoise 的前瞻固定 2 帧 = 960 样本 = 20.0 ms（互相关实测，不是拍脑袋），干路延迟线是补偿不是新增——它把干信号对齐到模型前瞻，混合输出不会更慢。**缓冲账**：设备缓冲默认 512 帧 @48 kHz（约 10.7 ms），`FrameAssembler` 是纯重分帧、贡献 0 样本延迟，插件侧的环由数字探针实测。合起来，项目的口径从早期"端到端 < 20 ms"修订为**"算法 ≤ 20 ms + 缓冲 ≤ 10 ms"**——前者是模型的物理下界，后者才是工程上要压的数。
+延迟预算要分开两笔账。**算法账**：RNNoise 的前瞻固定 2 帧 = 960 样本 = 20.0 ms（互相关实测，不是拍脑袋），干路延迟线是补偿不是新增——它把干信号对齐到模型前瞻，混合输出不会更慢。**缓冲账**：设备缓冲默认 512 帧 @48 kHz（约 10.7 ms），`FrameAssembler` 是纯重分帧、贡献 0 样本延迟，插件侧的环由数字探针实测。合起来，项目的口径从早期"端到端 < 20 ms"修订为**"算法 20 ms + 缓冲约 11 ms"**——前者是模型的物理下界，后者才是工程上要压的数。
 
 ## 四、实测数据
 
@@ -121,13 +121,13 @@ let target = if snr_db >= gate {
 
 降噪质量（SI-SDR，对干净参考）：干净输入全湿 14.72 dB → 自适应闸门 **30.57 dB**；+30 dB 输入 14.14 dB → 26.29 dB；+10 dB 11.04 → 11.57 dB；+5 dB 与 0 dB 闸门维持全湿（7.79 / 2.49 dB），不牺牲嘈杂场景。干湿混合不做延迟补偿的代价同样触目：50/50 无补偿 −7.7 dB，补偿后纯旁路 26.29 dB。
 
-与 C/Python 参考实现的逐采样比对（18.06 s 文件，866 880 样本）：bit-exact 49.91%，**1 LSB 内 100%**，平均误差 0.5009 LSB，最大 1.0 LSB。那 0.5 LSB 的均值纯属浮点转 int16 的舍入方向差异（libsndfile 与 `hound`+`round()` 对正半值处理不同），DSP 本身完全一致。另注明：逐帧 CPU 占比一列在 macOS 上印 `n/a`——`cpu_seconds()` 目前是 `GetProcessTimes` 的 Windows 实现，macOS 返回 0.0，与其印出无意义的 0%，不如如实说没测。
+与 C/Python 参考实现的逐采样比对（18.06 s 文件，866 880 样本）：bit-exact 49.91%，**1 LSB 内 100%**，平均误差 0.5009 LSB，最大 1.0 LSB。那 0.5 LSB 的均值纯属浮点转 int16 的舍入方向差异（libsndfile 与 `hound`+`round()` 对正半值处理不同），DSP 本身完全一致。另注明：逐帧 CPU 占比一列在 macOS 上印 `n/a`——`cpu_seconds()` 目前是 `GetProcessTimes` 的 Windows 实现，macOS 返回 0.0，与其印出无意义的 0%，不如如实说没测（离线 `run`/`bench` 与 `live` 报告都按这一口径处理）。
 
 ## 五、踩坑实录
 
 合入前的独立审查（提交 `49e3547`，3 blocker + 6 major + 卫生批全清）留下了几个教科书级案例，全部有一个共同点：**编译过、单测绿、跑起来静默错**。
 
-**坑 1：每样本状态机"先自增后判 ==0"，打点分支永不可达。** 声学探针原来的播放回调里，位置变量先 `pos += 1` 再判 `pos == 0` 打时间戳——判定永远为假，标记间隔计数器又不参与选路，标记背靠背连播，延迟测量必然 0 检出。27 项单测全绿照样漏：逐帧数值断言型单测只覆盖"单个状态下的输出值"，不覆盖"事件顺序"；而 platform 层的 FFI 回调状态机恰恰是单测最难触达的地方。修复把状态机抽成纯函数 `SpeakerCtx::next`，遵循"先判定/打点、后自增/推进"的书写顺序，并补回调序列模拟测试——把回调逐样本喂假 buffer，断言打点次数、位置与静音期长度：
+**坑 1：每样本状态机"先自增后判 ==0"，打点分支永不可达。** 声学探针原来的播放回调里，位置变量先 `pos += 1` 再判 `pos == 0` 打时间戳——判定永远为假，标记间隔计数器又不参与选路，标记背靠背连播，延迟测量必然 0 检出。27 项单测全绿照样漏：逐帧数值断言型单测只覆盖"单个状态下的输出值"，不覆盖"事件顺序"；而 platform 层的 FFI 回调状态机恰恰是单测最难触达的地方。修复把标记发射器写成一个无状态依赖的纯推进函数 `MarkerEmitter::next`（每次调用吐一个样本并报告"本样本是否为标记起点"），遵循"先判定/打点、后自增/推进"的书写顺序；渲染侧另有一个纯函数 `SpeakerCtx::next`（返回 `(样本, Option<Instant>)`，在首样本取墙钟）。回归测试逐样本驱动这些纯函数——不是把假 buffer 喂给 FFI 回调——断言打点次数、位置与静音期长度：
 
 ```rust
 // crates/vdev-mic-agent/src/platform/macos.rs（MarkerEmitter::next，修复后）
@@ -186,7 +186,7 @@ target/release/vdev-mic-agent live --probe digital --seconds 30 --report /tmp/di
 target/release/vdev-mic-agent live --probe acoustic --seconds 30 --report /tmp/acoustic.json
 ```
 
-关于 `librnnoise`：它通过 `libloading` **运行时**加载、从不参与链接——不是为了让程序缺库也能跑（所有降噪路径缺库即报错退出，唯一例外是不需要后端的 `--probe digital`），而是打包上的取舍：现成的 MinGW 构建 `librnnoise-0.dll` 配 GNU 导入库，MSVC 链接器吃不下，让用户自己用 dlltool 重造 `.lib` 是零收益的负担。解析顺序：`--dll <path>` → 环境变量 `RNNOISE_DLL` → 可执行文件向上 5 级祖先目录中的 `third_party/` 树（workspace 构建时命中 `crates/vdev-mic-agent/third_party/native/`）→ 当前目录；候选名覆盖 `librnnoise-0.dll`/`rnnoise.dll`/`librnnoise.dll`/`librnnoise.dylib`。该目录是 git-ignored 的，库可从 [xiph/rnnoise](https://github.com/xiph/rnnoise) 自建，或直接取 MSYS2 `ucrt64` 包（archive 仓库的 `third_party/FETCH.md` 有精确步骤）。加载时会校验 `rnnoise_get_frame_size()` 必须 == 480，否则拒绝启动——platform 层的缓冲与重分帧都按 480 硬编码，错的帧长意味着越界或流失步。
+关于 `librnnoise`：它通过 `libloading` **运行时**加载、从不参与链接——不是为了让程序缺库也能跑（所有降噪路径缺库即报错退出，唯一例外是不需要后端的 `--probe digital`），而是打包上的取舍：现成的 MinGW 构建 `librnnoise-0.dll` 配 GNU 导入库，MSVC 链接器吃不下，让用户自己用 dlltool 重造 `.lib` 是零收益的负担。解析顺序：显式 `--dll <path>` → 存在且非空的 `$RNNOISE_DLL` → 从可执行文件所在目录起向上最多 5 级祖先目录，**每一级先查该祖先目录本身、再查其下的若干 vendored 子路径**（`third_party/native/`、`third_party/` 等；workspace 构建时命中 `crates/vdev-mic-agent/third_party/native/`）→ 当前目录；候选名覆盖 `librnnoise-0.dll`/`rnnoise.dll`/`librnnoise.dll`/`librnnoise.dylib`。该目录是 git-ignored 的，库可从 [xiph/rnnoise](https://github.com/xiph/rnnoise) 自建，或直接取 MSYS2 `ucrt64` 包（archive 仓库的 `third_party/FETCH.md` 有精确步骤）。加载时会校验 `rnnoise_get_frame_size()` 必须 == 480，否则拒绝启动——platform 层的缓冲与重分帧都按 480 硬编码，错的帧长意味着越界或流失步。
 
 ## 七、Windows 通路：WASAPI 轮询 + 内核环回，驱动零改动
 
@@ -206,7 +206,7 @@ physical mic ──▶ WASAPI shared capture ──▶ FrameAssembler ──▶ 
 
 其余差异都是这条调度模型的推论：
 
-- **Marker 时间戳**：macOS 在渲染回调里打点（队列深度为 0）；Windows 写入时记 `now + padding × 帧时长`——估算这段音频真实到达扬声器的时刻，渲染队列延迟计入探针报告的 `interpretation` 说明。
+- **Marker 时间戳**：macOS 在渲染回调里打点（队列深度为 0）；Windows 写入时记 `now + (pending 帧数 + marker 在本次写入块内的样本偏移) × 帧时长`——不只算队列深度，还要加上标记落在块内第几个样本，才是这段音频真实到达扬声器的时刻；渲染队列延迟计入探针报告的 `interpretation` 说明。
 - **pending 队列**：macOS 双回调共享、要 `Arc<Mutex>`；Windows 单线程轮询，裸 `VecDeque` 就够。
 - **`injected` 计数**：macOS 报告恒为 0（`mark_injected` 从未被调）；Windows 实际累计每个 marker 的启动数。
 - **采样率门**：macOS 由 AUHAL 把客户端格式转成 48 kHz；WASAPI shared 引擎**只混音不重采样**，mix format 采样率跟着端点默认格式走。所以 `check_mix_format` 对非 48 kHz / 非 32-bit float 的端点显式报错，并给出可行动的修复（控制面板把该设备默认格式改成 48000 Hz，或 `--input`/`--vdev` 换端点）——宁可拒绝也不塞进一个没验证过的重采样器。
@@ -234,12 +234,12 @@ cargo test -p vdev-mic-agent
 
 ## 八、现状与局限
 
-如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时 macOS 实跑 41 项通过，另有 5 项 Windows 后端单测仅随 Windows 目标编译）；macOS live 已可用，Windows live 门禁已绿、真机音频行为待验证。** macOS 侧还欠的是探针的真机数字：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；Windows 侧需要装了 `vdev-audio-win`（测试签名）的真机确认 loopback 与 padding 行为；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS + Windows 双后端（Windows 门禁绿、真机待验证，见第七节）；`cpu_seconds()` 是 Windows 实现，macOS 的 CPU 列印 `n/a`。已知的"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。Windows 侧还有三条 v1 边界：无重采样（端点默认格式非 48 kHz 直接拒绝并给出修复指引）、无设备热拔插/格式变化恢复（运行中拔设备以带上下文的错误退出）、只走 shared + 轮询（无独占模式与事件驱动，40 ms 端点缓冲是延迟与抖动免疫的折中，计入探针 `interpretation`）。
+如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时 macOS 实跑 41 项通过，另有 5 项 Windows 后端单测仅随 Windows 目标编译）；macOS live 已可用，Windows live 门禁已绿、真机音频行为待验证。** macOS 侧还欠的是探针的真机数字：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；Windows 侧需要装了 `vdev-audio-win`（测试签名）的真机确认 loopback 与 padding 行为；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS + Windows 双后端（Windows 门禁绿、真机待验证，见第七节）；`cpu_seconds()` 是 Windows 实现，macOS 的 CPU 列印 `n/a`（离线与 `live` 报告同口径）。已知的"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。Windows 侧还有三条 v1 边界：无重采样（端点默认格式非 48 kHz 直接拒绝并给出修复指引）、无设备热拔插/格式变化恢复（运行中拔设备以带上下文的错误退出）、只走 shared + 轮询（无独占模式与事件驱动，40 ms 端点缓冲是延迟与抖动免疫的折中，计入探针 `interpretation`）。
 
 往前看还有四件事：双平台探针的真机延迟实测；AEC（本方案没有扬声器回传路径，真正的免提场景需要虚拟扬声器提供的远端参考，排二期，可复用 vox-seat）；引擎分层（DeepFilterNet3 约 9 倍 CPU 换明显更好的音质，档位是产品决策不是代码决策）；以及主观盲听 A/B——目前所有数字都是客观指标，欠听众一个裁决。
 
 ## 九、写在最后
 
-vdev 系列此前的每一篇都在回答"怎么用 Rust 造一个虚拟设备"；这一篇回答的是它的下一问："造出来之后，往里面喂什么。"答案是：喂一条结构上和产品形态完全一致的端侧 AI 链——离线阶段就把算法、指标、跨实现一致性钉死，实时阶段只解决文件回答不了的缓冲、调度与实时纪律。等 D3–D4 的真机数字出来，"算法 ≤ 20 ms + 缓冲 ≤ 10 ms"这行口径就会被两条探针的实测值检验或修正。
+vdev 系列此前的每一篇都在回答"怎么用 Rust 造一个虚拟设备"；这一篇回答的是它的下一问："造出来之后，往里面喂什么。"答案是：喂一条结构上和产品形态完全一致的端侧 AI 链——离线阶段就把算法、指标、跨实现一致性钉死，实时阶段只解决文件回答不了的缓冲、调度与实时纪律。等 D3–D4 的真机数字出来，"算法 20 ms + 缓冲约 11 ms"这行口径就会被两条探针的实测值检验或修正。
 
 方案文档、原始测量数据与 A/B 音频在 archive 仓库 `vdev-ai-virtual-mic-2026-09` 目录，上游 issue 是 [gqf2008/vdev#10](https://github.com/gqf2008/vdev/issues/10)。如果你在做会议、推流或语音 Agent，欢迎在 issue 区聊聊你的延迟预算与降噪档位需求。

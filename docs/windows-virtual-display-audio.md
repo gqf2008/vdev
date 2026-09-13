@@ -1,6 +1,6 @@
 # Windows 虚拟显示器 + 虚拟声卡（内核驱动路线，Rust）
 
-> 状态：虚拟显示器（IddCx UMDF）代码已交付（issue #3，PR 待合）；虚拟声卡待实现。用户已拍板：接受开测试签名 + 装 WDK，走内核驱动路线；
+> 状态：虚拟显示器（IddCx UMDF）与虚拟声卡（PortCls/WaveRT WDM）代码均已合入 main、构建与门禁通过，真机安装验证进行中。用户已拍板：接受开测试签名 + 装 WDK，走内核驱动路线；
 > 实现语言必须 Rust（C/C++ 能实现的 Rust 一样可以实现）。
 
 ## 1. 目标与验收标准
@@ -24,7 +24,7 @@ Windows **没有**用户态虚拟显示器/声卡官方 API，两条路线都必
 | 设备 | 驱动类型 | 内核？ | 签名要求 | Rust 可行性 |
 |---|---|---|---|---|
 | 虚拟显示器 | **IddCx（Indirect Display Driver Class eXtension）** | **UMDF 用户态驱动** | 驱动包签名；自签名证书装进 TrustedPublisher+Root 即可（**可能无需开测试签名**） | ✅ 有完整 Rust 参考（virtual-display-rs） |
-| 虚拟声卡 | **PortCls 音频 miniport（WaveRT + Topology）** | **KMDF 内核驱动** | **必须测试签名**（`bcdedit /set testsigning on` + 重启）或正式签名 | ⚠️ 无现成 Rust 参考，按 AudioMirror(C++)/sysvad 结构移植 |
+| 虚拟声卡 | **PortCls 音频 miniport（WaveRT + Topology）** | **WDM 内核驱动（PortCls，不使用 WDF）** | **必须测试签名**（`bcdedit /set testsigning on` + 重启）或正式签名 | ⚠️ 无现成 Rust 参考，按 AudioMirror(C++)/sysvad 结构移植 |
 
 关键认知：
 - **虚拟显示器 = IddCx UMDF**：MS 官方 IndirectDisplay 示例就是 UMDF（用户态）。驱动以 DLL 形式被
@@ -58,15 +58,15 @@ Windows **没有**用户态虚拟显示器/声卡官方 API，两条路线都必
 crates/vdev-display-win/
   wdf-umdf-sys/     # bindgen：UMDF + IddCx 绑定（MIT，保留版权声明）
   wdf-umdf/         # 安全封装：WDF 对象/回调 + IddCx 调用（MIT，保留版权声明）
-  driver/           # 驱动 DLL（cdylib）：DriverEntry、callbacks、context、swap-chain、IOCTL IPC
+  driver/           # 驱动 DLL（cdylib）：DriverEntry、callbacks、context、swap-chain、命名管道 IPC
     vdev-display.inf
-  cli/              # vdev-display-win.exe：install/uninstall/list/add/remove/setmode/status
+  cli/              # vdev-display-win.exe：install/uninstall/list/add/remove/remove-all/set-mode/status
   Cargo.toml        # 独立 workspace（依赖 windows crate + bindgen，与主 workspace 隔离）
 ```
 
 - 驱动 DLL 名 `vdev_display.dll`，硬件 ID `Root\vdev-display`，设备名「vdev 虚拟显示器」。
-- IPC 通道（driver-ipc）：沿用 virtual-display-rs 的 IOCTL 设计（Named Pipe 或 DeviceIoControl），
-  宿主 CLI/GUI 用它增删虚拟屏、设分辨率。
+- IPC 通道（driver-ipc）：**命名管道**（`\\.\pipe\vdev-display`，见 `driver/src/ipc.rs`），
+  宿主 CLI/GUI 用它增删虚拟屏、设分辨率。早期设计里的 DeviceIoControl/IOCTL 方案未采用。
 - 宿主集成：`vdev-app-win` GUI 增加「虚拟显示器」页（安装/卸载/增删屏/分辨率/状态），
   与摄像头页同风格；CLI 同时提供无 GUI 操作。
 - 默认行为：OS 渲染到虚拟屏（开箱即用，用户可扩展桌面/镜像）。
@@ -85,9 +85,8 @@ crates/vdev-display-win/
 - 生成自签名代码签名证书（`New-SelfSignedCertificate -Type CodeSigningCert`，
   或参考 virtual-display-rs 的 makecert 流程），签名驱动 DLL + 生成 `.cat`（可先用 inf2cat），
   把证书装进 **TrustedPublisher + Root**。
-- 创建设备节点：`nefcon`（nefarius，virtual-display-rs 同款）：
-  `nefconc.exe --create-device-node --class-name Display --class-guid {4d36e968-...} --hardware-id Root\vdev-display`
-  再 `--install-driver --inf-path vdev-display.inf`。
+- 创建设备节点与安装驱动：由 CLI 用 SetupAPI 完成（`cli/src/install.rs`），
+  `vdev-display-win.exe install --inf-dir <驱动目录>` 一步到位，不需要外部 `nefcon`。
 - 若 UMDF 加载仍被签名策略拦：再开测试签名（见 §5）。
 
 ### 3.6 风险
@@ -101,10 +100,10 @@ crates/vdev-display-win/
 
 ### 4.1 原理
 
-- KMDF 驱动，PortCls（端口类）加载我们的 **WaveRT miniport + Topology miniport**。
+- **WDM 驱动**（不用 WDF/KMDF），PortCls（端口类）加载我们的 **WaveRT miniport + Topology miniport**。
 - 虚拟**扬声器**（WaveRT render）把系统播放的音频写入**环形缓冲**；虚拟**麦克风**（WaveRT capture）
   从同一环形缓冲读出 → 输出环回输入（AudioMirror 语义，等价 macOS 自研 BlackHole）。
-- 宿主可从用户态向环形缓冲注入音频（推流），或从环形缓冲抓取（采集）。
+- 环回（render → capture）纯内核内完成，**不提供用户态注入/采集接口**；消费方（如 vdev-mic-agent）按普通 WASAPI 客户端写入 render 端点即可。
 
 ### 4.2 参考项目
 
@@ -117,10 +116,10 @@ crates/vdev-display-win/
 
 ```
 crates/vdev-audio-win/
-  wdk-audio-sys/    # bindgen：wdm/portcls/ks 绑定（内核）
   driver/           # vdev_audio.sys：DriverEntry + MiniportWaveRT + MiniportTopology + RingBuffer
+    src/sys/        # 手写精简 WDM/PortCls/KS 绑定（不生成独立 *-sys crate）
     vdev-audio.inf
-  cli/              # vdev-audio-win.exe：install/uninstall/status/注入/采集
+  cli/              # vdev-audio-win.exe：install/uninstall/status
 ```
 
 - 设备名「vdev 虚拟声卡」，端点「vdev 扬声器」/「vdev 麦克风」。
@@ -165,10 +164,10 @@ bcdedit /set testsigning on
 1. [x] 环境：装 WDK 10.0.26100 + LLVM(libclang)（winget，提权）；生成自签名证书并装入 TrustedPublisher+Root
 2. [x] 虚拟显示器驱动移植（wdf-umdf-sys + wdf-umdf + driver + CLI），构建出 vdev_display.dll（fmt/clippy/test 全绿）
 3. [ ] 虚拟显示器安装/枚举/多屏/分辨率实测（代码就绪，等用户点 UAC 完成安装验证）
-4. [ ] 虚拟显示器 GUI 集成（vdev-app-win 新增页）
+4. [~] 虚拟显示器 GUI：基础页已集成（状态/安装/卸载/添加 1920x1080/移除全部）；单屏删除与 set-mode 待实现
 5. [x] 开测试签名（bcdedit /set testsigning on，待重启生效）
 6. [x] 虚拟声卡驱动（手写 WDM/PortCls 绑定 + AdapterCommon + WaveRT miniport + 环回流 + INF + CLI），构建出 vdev_audio.sys（门禁全绿）
-7. [ ] 虚拟声卡安装/环回/注入实测（等重启后测试签名生效）
+7. [ ] 虚拟声卡安装/环回实测（等重启后测试签名生效；无用户态注入接口，由 WASAPI 客户端写 render 端点驱动）
 8. [x] 虚拟声卡 GUI 集成（vdev-app-win 新增声卡 Tab）
-9. [ ] 审查、合并、清理、沉淀 LESSON
+9. [x] 审查、合并、清理、沉淀 LESSON
 

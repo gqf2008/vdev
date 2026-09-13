@@ -12,7 +12,7 @@
 
 第三条路线的工程量最大（内核驱动、签名门槛），但只有它给出"真实设备级"的仿真：Raw Input 按设备枚举时能看到它，面向 HID 设备的诊断工具能看到它，事件来源与物理输入同源。需要说明的是，这种"难以与物理设备区分"的特性同样处于反作弊等输入审计系统的关注范围内——本文只讨论它在自动化测试、远控、无障碍等正当场景下的技术实现，请遵守目标软件的服务条款。
 
-vdev 的内核路线（仓库内叫"路线 B"）以微软官方样例 **vhidmini2** 为蓝本，用 Rust 手写 WDK 绑定完成，驱动与 CLI 全在一个 crate（`crates/vdev-hid-win`）。下文所有 IOCTL 值、结构体布局、INF 段名均出自该仓库源码，文末附踩坑实录。
+vdev 的内核路线（仓库内叫"路线 B"）以微软官方样例 **vhidmini2** 为蓝本。工程分两个 crate：用户态 CLI `vdev-hid-win`（`crates/vdev-hid-win`）与内核驱动 `vdev-hid-driver`（独立 workspace `crates/vdev-hid-win/kernel`）；内核绑定是 vendored、由 bindgen 生成的路由（`kernel/vendor/wdk-sys`）。下文所有 IOCTL 值、结构体布局、INF 段名均出自该仓库源码，文末附踩坑实录。
 
 ## 2. HID 协议最小知识
 
@@ -260,4 +260,4 @@ vdev-hid-win kernel uninstall
 
 方法论只有一句话：**移植内核驱动以官方样例（vhidmini2）与 WDK 头文件为唯一权威，逐字段对照，禁止按理解重写**；数值类修复做三角验证（双代头文件 + 官方样例源码，必要时加 ReactOS 实现），审查意见与记忆给出的值一律重新溯源。以及验收标准：设备管理器出现节点只是入场券，链路验收必须走到"HidD 枚举可见 + WriteFile 注入生效"。
 
-仓库地址：[gqf2008/vdev](https://github.com/gqf2008/vdev)，本文涉及代码集中在 `crates/vdev-hid-win`（内核驱动 `kernel/driver`、CLI `src/`、INF 与签名脚本）。系列其余五篇（macOS 摄像头/声卡、Windows 摄像头/显示器/声卡）见仓库 docs 目录。
+仓库地址：[gqf2008/vdev](https://github.com/gqf2008/vdev)，本文涉及代码集中在 `crates/vdev-hid-win`（内核驱动 `kernel/driver`、CLI `src/`、INF 与签名脚本）。系列其余八篇（macOS 摄像头/声卡/键鼠/虚拟屏、Windows 摄像头/显示器/声卡、AI 虚拟麦克风）见仓库 docs 目录。

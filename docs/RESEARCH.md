@@ -5,7 +5,7 @@
 ## 1. 虚拟 HID
 
 - **方案**：CGEventPost（Quartz Event Services）合成键盘/鼠标/滚轮事件。
-- **Rust crate**：[cgevents](https://github.com/doom-fish/cgevents-rs)（0.4，纯 Rust 绑定，零 Swift）。
+- **Rust crate**：[cgevents](https://github.com/doom-fish/cgevents-rs)（0.10.1；经 Swift bridge 调用 CoreGraphics，运行期需要 Swift 运行时）。
 - 注入不需要辅助功能权限；拦截（CGEventTap）需要。
 - 替代路线：DriverKit `IOUserHIDDevice`（C++ only，Rust 需 C ABI 桥，后续再说）。
 
@@ -25,7 +25,7 @@
 
 - **形态**：System Extension（`CMIOExtensionProvider`），随宿主 App 安装，用户手动批准。
 - **语言**：Swift / ObjC（`CMIOExtension.framework`，macOS 13+）。
-- **Rust 策略**：extension provider 薄壳调 Rust 静态库（C ABI），与 DAL 相同的「薄壳 + Rust 核心」结构。
+- **Rust 策略**：现状是 **100% Rust**——`vdev-camera-ext` 直接产出 Rust 二进制实现 `CMIOExtensionProvider`，不再需要 Swift/ObjC 薄壳，也不需要 xcodebuild（早期「薄壳 + Rust 静态库」方案已淘汰）。
 - **参考**：Apple 官方示例（WWDC22 "Create a camera extension with Core Media IO"）、obs-mac-virtualcam 的
   `mac-virtualcam` extension 实现。
 

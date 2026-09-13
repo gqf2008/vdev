@@ -1,10 +1,10 @@
 //! Single-producer / single-consumer sample ring.
 //!
-//! The real agent has three threads:
+//! In the live path the denoise is inline, so there is a single hand-off ring
+//! between the capture side and the render side:
 //!
 //! ```text
-//!   CoreAudio capture callback ──push──▶ [capture ring] ──pop──▶ denoise worker
-//!   denoise worker ──push──▶ [render ring] ──pop──▶ CoreAudio playback callback
+//!   capture callback ──denoise inline──▶ push ──▶ [render ring] ──pop──▶ render callback
 //! ```
 //!
 //! The audio callbacks run on a real-time thread owned by coreaudiod: they may
