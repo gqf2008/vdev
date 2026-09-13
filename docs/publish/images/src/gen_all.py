@@ -270,7 +270,50 @@ def _gen_windows():
     windows_camera(); windows_display(); windows_hid()
 
 
+
+
+# ---------------------------------------------------------------- AI 虚拟麦克风
+def ai_virtual_mic():
+    from figlib import canvas as _cv
+    W, H = 1200, 820
+    img, d = _cv(W, H)
+    title(d, W, "端侧 AI 麦克风：一条全程本地的降噪链路",
+          "物理麦克风 → 端侧降噪 → 注入虚拟麦克风端点；全程本地推理，不上传一个字节")
+
+    steps(d, 70, 140, 620, 82, 26, [
+        ("物理麦克风（48 kHz）", "任意会议软件的输入源"),
+        ("FrameAssembler：重分帧到 480 样本", "设备块长任意，模型只认 480"),
+        ("RNNoise 降噪（libloading 运行时加载）", "单流状态仅 32 688 B"),
+        ("自适应干湿混合（VAD 门控 + 迟滞闸门）", "干净麦克风绕过模型，不被模型伤害"),
+        ("虚拟麦克风端点（vdev-audio / vdev-audio-win）", "会议软件把它当选麦克风"),
+    ], [(BLUE_BG, BLUE), (BLUE_BG, BLUE), (GREEN_BG, GREEN), (AMBER_BG, AMBER), (GREEN_BG, GREEN)])
+
+    card_fit(d, 730, 140, 400, 300, "为什么干净麦克风要绕过模型",
+         "RNNoise 对每一帧都做衰减，包括本来就很干净的帧。\n\n"
+         "把一段干净录音全湿推过去，SI-SDR 反而从 329 dB 掉到 14.7 dB——"
+         "听感上是淡淡的金属染色，收益为零。\n\n"
+         "所以加一条闸门：噪声底与语音电平两个慢估计器算出长期 SNR，"
+         "高于闸门就旁路模型，低于闸门才全湿。",
+         RED_BG, RED, bs=17)
+
+    card_fit(d, 730, 460, 400, 250, "延迟怎么测：不靠加总和",
+         "两条探针把标记埋进音频，用归一化互相关（NCC）在整个链路里找它：\n\n"
+         "· 数字探针：注进虚拟输出流，在输入流里找（不含模型）\n"
+         "· 声学探针：物理扬声器播 chirp，房间 + 物理麦当信道\n\n"
+         "阈值：数字 0.60、声学 0.35。",
+         PURPLE_BG, PURPLE, bs=17)
+
+    rbox(d, (70, 700, 1130, 790), GRAY_BG, BORDER, 2)
+    d.text((98, 716), "实测口径（i7-11700 / Win10，48 kHz，480 样本帧）", font=font(21, True), fill=INK, anchor="la")
+    d.multiline_text((98, 748), wrap(
+        "单帧 0.078 ms（p99 0.135 ms，占 10 ms 预算 1.4%）　·　实时 CPU 0.78% 单核\n"
+        "算法延迟 960 样本 = 20.0 ms　·　与 C/Python 参考实现 1 LSB 内一致", 17, 1032),
+        font=font(17), fill=INK, anchor="la", spacing=7)
+    save(img, "macos-mic-01-chain.png")
+
+
 if __name__ == "__main__":
     print("生成中：")
     macos_camera(); macos_audio(); macos_hid(); macos_display()
     _gen_windows()
+    ai_virtual_mic()

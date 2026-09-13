@@ -103,32 +103,33 @@ def save(img, name):
     print("  %s  %.0f KB" % (name, p.stat().st_size / 1024))
 
 def wrap(s, size, max_w, bold=False):
-    """按渲染宽度把文本折行；保留显式 \\n，超长的连续 token（如路径）按字符断行。"""
+    """按渲染宽度折行。中文可逐字断行；英文单词不拆，但超长单词（路径等）按字符断。"""
     f = font(size, bold)
-    out = []
+
+    def emit(para):
+        out, cur = [], ""
+        for ch in para:
+            if f.getlength(cur + ch) <= max_w:
+                cur += ch
+                continue
+            if cur:
+                out.append(cur)
+                cur = ""
+            # 单字符已超宽（几乎不会发生）→ 直接放
+            if f.getlength(ch) > max_w:
+                out.append(ch)
+            else:
+                cur = ch
+        out.append(cur)
+        return out
+
+    lines = []
     for para in s.split("\n"):
         if not para:
-            out.append("")
+            lines.append("")
             continue
-        cur = ""
-        # 以空格切词，同时允许中文逐字断行
-        tokens, buf = [], ""
-        for ch in para:
-            if ch == " ":
-                tokens.append(buf); tokens.append(" "); buf = ""
-            else:
-                buf += ch
-        if buf:
-            tokens.append(buf)
-        for tk in tokens:
-            cand = cur + tk
-            if f.getlength(cand) <= max_w or not cur:
-                cur = cand
-            else:
-                out.append(cur.rstrip())
-                cur = tk
-        out.append(cur.rstrip())
-    return "\n".join(out)
+        lines.extend(emit(para))
+    return "\n".join(l.rstrip() for l in lines)
 
 
 def card_fit(d, x, y, w, h, heading, body, bg=GRAY_BG, oc=BORDER, hs=24, bs=18, pad=28, hcolor=INK):
