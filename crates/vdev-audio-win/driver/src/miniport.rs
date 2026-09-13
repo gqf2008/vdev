@@ -207,14 +207,32 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         return STATUS_INVALID_PARAMETER;
     }
     let wf = &ksdm.WaveFormatEx;
+    // ksmedia.h：引擎按设备格式开流时可能用 WAVE_FORMAT_PCM(0x0001) 或
+    // WAVE_FORMAT_EXTENSIBLE(0xFFFE)（后者 cbSize=22，SubFormat 仍是 PCM）。
+    // 只认 PCM 会让"设备格式是 EXTENSIBLE"的端点开流被拒——实测表现为
+    // IAudioClient::GetMixFormat 报 0x80070491、端点虽在但应用不可用。
     const WAVE_FORMAT_PCM: u16 = 0x0001;
-    if wf.wFormatTag != WAVE_FORMAT_PCM
+    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+    if (wf.wFormatTag != WAVE_FORMAT_PCM && wf.wFormatTag != WAVE_FORMAT_EXTENSIBLE)
         || wf.nSamplesPerSec != 48_000
         || wf.wBitsPerSample != 16
         || wf.nChannels != 2
         || wf.nBlockAlign != 4
     {
         return STATUS_INVALID_PARAMETER;
+    }
+    // EXTENSIBLE 时 SubFormat 必须是 PCM（前面的 ksdm.DataFormat.SubFormat 检查对应
+    // KSDATAFORMAT 的 SubFormat；这里再核对 WAVEFORMATEXTENSIBLE.SubFormat 偏移）
+    if wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
+        if ksdm.DataFormat.FormatSize < (size_of::<KSDATAFORMAT>() + 40) as u32 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let base = (data_format as *const u8).add(size_of::<KSDATAFORMAT>() + 24);
+        // SAFETY: FormatSize >= 104 已校验，偏移 64+24=88 处为 SubFormat GUID
+        let sub = unsafe { core::ptr::read_unaligned(base.cast::<GUID>()) };
+        if sub != KSDATAFORMAT_SUBTYPE_PCM {
+            return STATUS_INVALID_PARAMETER;
+        }
     }
     // SAFETY: 单线程初始化（PortCls 串行调用）
     unsafe {
@@ -862,6 +880,173 @@ static PIN_MEDIUMS: [KSPIN_MEDIUM; 1] = [KSPIN_MEDIUM {
 /// 「vdev 扬声器/麦克风」）就不会出现。常量与宿主单测见 endpoint_names.rs。
 static FILTER_CATEGORIES: [GUID; 4] = crate::endpoint_names::WAVE_CATEGORIES;
 
+// ============ 滤波器级属性：预设格式（KSPROPERTY_PIN_PROPOSEDATAFORMAT/2） ============
+//
+// 音频引擎（audiodg/EndpointBuilder）在端点初始化时要用这两个属性**向驱动定设备格式**；
+// 驱动不实现时端点能建出来、但拿不到设备格式（实测：MMDevices 里缺
+// PKEY_AudioEngine_DeviceFormat，应用侧 IAudioClient::GetMixFormat 报 0x80070491，
+// 端点不可用）。同机 ToDesk 虚拟声卡实现了 PROPOSEDATAFORMAT2（探针返回 87/50，
+// 表示属性存在但请求不完整），vdev 原实现返回 1168「属性不存在」。sysvad 的
+// speakertoptable.h / minwavert.cpp 同款：PROPOSEDATAFORMAT(SET) + PROPOSEDATAFORMAT2(GET)。
+
+use crate::topology::{PCAUTOMATION_TABLE, PCPROPERTY_ITEM, PCPROPERTY_REQUEST};
+
+/// ks.h KSPROPSETID_Pin = 8C134960-51AD-11CF-878A-94F801C10000
+static KSPROPSETID_PIN: GUID = GUID {
+    data1: 0x8c13_4960,
+    data2: 0x51ad,
+    data3: 0x11cf,
+    data4: [0x87, 0x8a, 0x94, 0xf8, 0x01, 0xc1, 0x00, 0x00],
+};
+const KSPROPERTY_PIN_PROPOSEDATAFORMAT: ULONG = 14;
+const KSPROPERTY_PIN_PROPOSEDATAFORMAT2: ULONG = 15;
+const KSPROPERTY_TYPE_GET: ULONG = 0x0000_0001;
+const KSPROPERTY_TYPE_SET: ULONG = 0x0000_0002;
+const KSPROPERTY_TYPE_BASICSUPPORT: ULONG = 0x0000_0200;
+
+/// mmreg.h WAVEFORMATEXTENSIBLE（pack(2)：GUID 落 offset 24，整块 40 字节）
+#[repr(C, packed(2))]
+#[derive(Clone, Copy)]
+struct WaveFormatExtensible {
+    format_tag: u16,
+    channels: u16,
+    samples_per_sec: u32,
+    avg_bytes_per_sec: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+    cb_size: u16,
+    valid_bits_per_sample: u16,
+    channel_mask: u32,
+    sub_format: GUID,
+}
+
+/// ksmedia.h KSDATAFORMAT_WAVEFORMATEXTENSIBLE（64 + 40 = 104 字节）
+#[repr(C)]
+struct KsDataFormatWaveFormatExtensible {
+    data_format: KSDATAFORMAT,
+    wave: WaveFormatExtensible,
+}
+
+// 布局回归（编译期）：设备格式必须是 ksmedia.h 的 104 字节布局，
+// 引擎按该布局解析；WAVEFORMATEXTENSIBLE 若忘了 pack(2) 会变成 44 字节（108 total）。
+const _: () = assert!(size_of::<WaveFormatExtensible>() == 40);
+const _: () = assert!(size_of::<KsDataFormatWaveFormatExtensible>() == 104);
+
+/// 本驱动唯一支持的设备格式：48 kHz / 16 bit / 2ch PCM（与 AUDIO_DATA_RANGE 一致）
+static DEVICE_FORMAT: KsDataFormatWaveFormatExtensible = KsDataFormatWaveFormatExtensible {
+    data_format: KSDATAFORMAT {
+        FormatSize: size_of::<KsDataFormatWaveFormatExtensible>() as u32,
+        Flags: 0,
+        SampleSize: 0,
+        Reserved: 0,
+        MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+        SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
+        Specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+    },
+    wave: WaveFormatExtensible {
+        format_tag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+        channels: 2,
+        samples_per_sec: 48_000,
+        avg_bytes_per_sec: 192_000,
+        block_align: 4,
+        bits_per_sample: 16,
+        cb_size: 22,
+        valid_bits_per_sample: 16,
+        channel_mask: 3,
+        sub_format: KSDATAFORMAT_SUBTYPE_PCM,
+    },
+};
+
+/// 预设格式属性处理器：GET 回设备格式；SET 只接受本驱动支持的 PCM 形状；
+/// BASICSUPPORT 回四种 verb 位（PortCls 会用它应答 KSPROPERTY_TYPE_BASICSUPPORT）。
+unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
+    // SAFETY: PortCls 保证 req 及其字段有效
+    let r = unsafe { &mut *req };
+    if r.PropertyItem.is_null() || r.Value.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let verb = r.Verb;
+
+    if verb & KSPROPERTY_TYPE_BASICSUPPORT != 0 {
+        if r.ValueSize < 4 {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        // SAFETY: ValueSize >= 4
+        unsafe {
+            core::ptr::write(
+                r.Value.cast::<u32>(),
+                KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+            );
+        }
+        r.ValueSize = 4;
+        return STATUS_SUCCESS;
+    }
+
+    let need = size_of::<KsDataFormatWaveFormatExtensible>() as u32;
+    if verb & KSPROPERTY_TYPE_GET != 0 {
+        if r.ValueSize < need {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        // SAFETY: 目标缓冲区 >= need 字节；源为只读静态（DEVICE_FORMAT 永不改写）
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&raw const DEVICE_FORMAT).cast::<u8>(),
+                r.Value.cast::<u8>(),
+                need as usize,
+            );
+        }
+        r.ValueSize = need;
+        return STATUS_SUCCESS;
+    }
+
+    if verb & KSPROPERTY_TYPE_SET != 0 {
+        // 接受引擎提出的任何 PCM 形状（WAVEFORMATEX 或 WAVEFORMATEXTENSIBLE）：
+        // 设备格式由本驱动的数据范围/INF OEMFormat 决定，这里拒绝只会让引擎判定
+        // "设备不可用"（实测：严格只收 16bit/48k 时端点仍拿不到设备格式）。
+        // 真正的播放/录音格式校验在下游 stream_set_format / data_range_intersection。
+        if r.ValueSize < 16 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let p = r.Value.cast::<u8>();
+        // SAFETY: ValueSize >= 16，逐字段 read_unaligned 不要求对齐
+        let tag = unsafe { core::ptr::read_unaligned(p.cast::<u16>()) };
+        return if tag == 1 || tag == 0xFFFE {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_PARAMETER
+        };
+    }
+
+    STATUS_INVALID_PARAMETER
+}
+
+static WAVE_PROPERTY_ITEMS: [PCPROPERTY_ITEM; 2] = [
+    PCPROPERTY_ITEM {
+        Set: &KSPROPSETID_PIN,
+        Id: KSPROPERTY_PIN_PROPOSEDATAFORMAT,
+        Flags: KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+        Handler: wave_format_property_handler,
+    },
+    PCPROPERTY_ITEM {
+        Set: &KSPROPSETID_PIN,
+        Id: KSPROPERTY_PIN_PROPOSEDATAFORMAT2,
+        Flags: KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+        Handler: wave_format_property_handler,
+    },
+];
+static WAVE_AUTOMATION: PCAUTOMATION_TABLE = PCAUTOMATION_TABLE {
+    PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
+    PropertyCount: WAVE_PROPERTY_ITEMS.len() as ULONG,
+    Properties: WAVE_PROPERTY_ITEMS.as_ptr(),
+    MethodItemSize: 0,
+    MethodCount: 0,
+    Methods: core::ptr::null(),
+    EventItemSize: 0,
+    EventCount: 0,
+    Events: core::ptr::null(),
+    Reserved: 0,
+};
+
 /// portcls.h:1509 `PCFILTER_NODE` = ks.h:922 `KSFILTER_NODE` = `(ULONG)-1`
 /// （同 topology.rs 的本地常量；滤波器内部连接的端点之一）
 const PCFILTER_NODE: u32 = u32::MAX;
@@ -983,7 +1168,9 @@ static PINS_CAPTURE: [PCPIN_DESCRIPTOR; 2] = [
 /// render 过滤器描述符（B6：字段集与 portcls.h 一致，Version=0，类别数组指针）
 static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0,
-    AutomationTable: core::ptr::null(),
+    // 滤波器级属性表：KSPROPERTY_PIN_PROPOSEDATAFORMAT / 2（音频引擎定设备格式用）
+    AutomationTable: &WAVE_AUTOMATION as *const PCAUTOMATION_TABLE
+        as *const crate::sys::types::PCAUTOMATION_TABLE,
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
     PinCount: PINS_RENDER.len() as u32,
     Pins: PINS_RENDER.as_ptr(),
@@ -999,7 +1186,8 @@ static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
 /// capture 过滤器描述符
 static FILTER_DESC_CAPTURE: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0,
-    AutomationTable: core::ptr::null(),
+    AutomationTable: &WAVE_AUTOMATION as *const PCAUTOMATION_TABLE
+        as *const crate::sys::types::PCAUTOMATION_TABLE,
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
     PinCount: PINS_CAPTURE.len() as u32,
     Pins: PINS_CAPTURE.as_ptr(),
