@@ -1079,11 +1079,34 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
         let tag = unsafe { core::ptr::read_unaligned(p.add(tag_off).cast::<u16>()) };
         dbg_inc(&DBG_PROPOSED_SET);
         DBG_PROPOSED_LAST_TAG.store(u32::from(tag), Ordering::Relaxed);
-        return if tag == 1 || tag == 0xFFFE {
-            STATUS_SUCCESS
+        if tag != 1 && tag != 0xFFFE {
+            return STATUS_INVALID_PARAMETER;
+        }
+        // KSPROPERTY_PIN_PROPOSEDATAFORMAT / 2 的 Value 是**输入输出**缓冲：驱动必须把
+        // "实际会用的格式"写回去（引擎据此定设备格式）。只回 success 不回填时，引擎读到
+        // 的还是它自己提的形状、于是反复重试（真机计数器实测 prop_set=2070 且循环不止）。
+        let base = if tag_off == 0 {
+            // 裸 WAVEFORMATEX：就地升级为 KSDATAFORMAT_WAVEFORMATEXTENSIBLE（若缓冲够）
+            if r.ValueSize < need {
+                return STATUS_SUCCESS; // 缓冲太小：接受但不回填（引擎会另取设备格式）
+            }
+            0usize
         } else {
-            STATUS_INVALID_PARAMETER
+            tag_off - size_of::<KSDATAFORMAT>()
         };
+        if (r.ValueSize as usize) >= base + need as usize {
+            // SAFETY: 目标缓冲 >= base + 104 字节
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&raw const DEVICE_FORMAT).cast::<u8>(),
+                    p.add(base),
+                    need as usize,
+                );
+            }
+            r.ValueSize = (base as u32) + need;
+        }
+        dbg_inc(&DBG_PROPOSED_SET_OK);
+        return STATUS_SUCCESS;
     }
 
     STATUS_INVALID_PARAMETER
@@ -1143,6 +1166,7 @@ static DBG_RANGE_OK: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_SET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_GET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_SET_OK: AtomicU32 = AtomicU32::new(0);
 // 数据范围求交失败的现场（引擎一直在问，但 314 次全 NO_MATCH/TOO_SMALL）
 static DBG_RANGE_LAST_MAJOR: AtomicU32 = AtomicU32::new(0);
 static DBG_RANGE_LAST_SUB: AtomicU32 = AtomicU32::new(0);
@@ -1177,7 +1201,7 @@ static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
 };
 const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
 /// 计数器快照长度：32 个 u32
-const DBG_STATS_LEN: usize = 32 * 4;
+const DBG_STATS_LEN: usize = 33 * 4;
 
 unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
     // SAFETY: PortCls 保证 req 有效
@@ -1223,6 +1247,7 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
             DBG_QI_6.load(Ordering::Relaxed),
             DBG_QI_7.load(Ordering::Relaxed),
             DBG_RANGE_OK_SEEN.load(Ordering::Relaxed),
+            DBG_PROPOSED_SET_OK.load(Ordering::Relaxed),
         ];
         // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
         unsafe {
