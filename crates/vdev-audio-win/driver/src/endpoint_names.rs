@@ -5,6 +5,27 @@
 //! 一致」「pin 编号与 filter 布局一致」是纯逻辑断言，必须在 macOS 宿主跑通
 //!（adapter 模块被 kernel feature 门控，宿主 cargo test 编译不到）。
 
+use crate::sys::portcls::{
+    KSCATEGORY_AUDIO, KSCATEGORY_CAPTURE, KSCATEGORY_REALTIME, KSCATEGORY_RENDER,
+};
+use crate::sys::types::GUID;
+
+/// wave 滤波器在 `PCFILTER_DESCRIPTOR.Categories` 里登记的 KS 类别（播放侧）。
+///
+/// 回归：原实现只登记 `KSCATEGORY_AUDIO`。PortCls 在 `PcRegisterSubdevice` 时
+/// **按该数组逐类别**用子设备名作 reference string 注册设备接口并创建符号链接
+/// `\\?\<实例ID>#{类别}\<子设备名>`；音频端点构建器正是打开
+/// `KSCATEGORY_RENDER` / `KSCATEGORY_CAPTURE` 下的符号链接来枚举端点的。
+/// 只登记 AUDIO 时这些链接不存在（实测 CreateFile = ERROR_PATH_NOT_FOUND），
+/// 结果：设备管理器里有「vdev 虚拟声卡」，但控制面板/音频设置里没有任何端点。
+/// 类别集合对照 sysvad（`PCFILTER_DESCRIPTOR.Categories = NULL` 的默认集合
+/// 即 audio/render/capture）与本机实测可用的 ToDesk 虚拟声卡。
+pub const WAVE_CATEGORIES_RENDER: [GUID; 3] =
+    [KSCATEGORY_AUDIO, KSCATEGORY_REALTIME, KSCATEGORY_RENDER];
+/// wave 滤波器在 `PCFILTER_DESCRIPTOR.Categories` 里登记的 KS 类别（录音侧）。
+pub const WAVE_CATEGORIES_CAPTURE: [GUID; 3] =
+    [KSCATEGORY_AUDIO, KSCATEGORY_REALTIME, KSCATEGORY_CAPTURE];
+
 /// 子设备名（UTF-16，NUL 结尾；PcRegisterSubdevice 要求）
 pub const WAVE_CAPTURE_NAME: &[u16] = &[
     0x57, 0x61, 0x76, 0x65, 0x43, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x30, 0x00,
@@ -115,5 +136,40 @@ mod tests {
         assert_eq!(WAVE_PIN, 0);
         assert_eq!(TOPO_RENDER_FROM_WAVE_PIN, 0);
         assert_eq!(TOPO_CAPTURE_TO_WAVE_PIN, 1);
+    }
+
+    /// 类别 GUID 字面值逐字节核对（防抄错），并保证播放/录音两侧都带上
+    /// 各自类别 + AUDIO + REALTIME。
+    ///
+    /// 回归：原实现只登记 KSCATEGORY_AUDIO，导致 KSCATEGORY_RENDER/CAPTURE
+    /// 下没有子设备符号链接、音频端点不出现（详见 WAVE_CATEGORIES_RENDER 注释）。
+    #[test]
+    fn wave_filter_categories_cover_render_and_capture() {
+        assert_eq!(
+            KSCATEGORY_RENDER.data1, 0x65e8_773e,
+            "KSCATEGORY_RENDER 字面值（ks.h）"
+        );
+        assert_eq!(KSCATEGORY_CAPTURE.data1, 0x65e8_773d);
+        assert_eq!(
+            KSCATEGORY_REALTIME.data1, 0xeb11_5ffc,
+            "KSCATEGORY_REALTIME 字面值（ksmedia.h）"
+        );
+        assert_eq!(KSCATEGORY_AUDIO.data1, 0x6994_ad04);
+
+        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_RENDER));
+        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_AUDIO));
+        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_REALTIME));
+        assert!(
+            !WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_CAPTURE),
+            "播放滤波器不得登记为录音类别"
+        );
+
+        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_CAPTURE));
+        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_AUDIO));
+        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_REALTIME));
+        assert!(
+            !WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_RENDER),
+            "录音滤波器不得登记为播放类别"
+        );
     }
 }

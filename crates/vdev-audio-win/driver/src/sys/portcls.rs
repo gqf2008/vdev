@@ -63,6 +63,40 @@ pub const KSCATEGORY_AUDIO: GUID = GUID {
     data3: 0x11d0,
     data4: [0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
 };
+/// ks.h：`KSCATEGORY_RENDER {65E8773E-8F56-11D0-A3B9-00A0C9223196}`
+///
+/// 音频端点构建器（AudioEndpointBuilder）按该类别下的设备接口枚举播放端点，
+/// wave 滤波器必须把它列进 `PCFILTER_DESCRIPTOR.Categories`。
+pub const KSCATEGORY_RENDER: GUID = GUID {
+    data1: 0x65e8_773e,
+    data2: 0x8f56,
+    data3: 0x11d0,
+    data4: [0xa3, 0xb9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
+};
+/// ks.h：`KSCATEGORY_CAPTURE {65E8773D-8F56-11D0-A3B9-00A0C9223196}`
+pub const KSCATEGORY_CAPTURE: GUID = GUID {
+    data1: 0x65e8_773d,
+    data2: 0x8f56,
+    data3: 0x11d0,
+    data4: [0xa3, 0xb9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
+};
+/// ksmedia.h：`KSCATEGORY_REALTIME {EB115FFC-10C8-4964-831D-6DCB02E6F23F}`
+///
+/// WaveRT 低延迟通路（audio engine）用的类别；对照本机可用的 ToDesk 虚拟声卡
+/// 与 VB-Audio 虚拟声卡 INF，wave 子设备同样登记该类别。
+pub const KSCATEGORY_REALTIME: GUID = GUID {
+    data1: 0xeb11_5ffc,
+    data2: 0x10c8,
+    data3: 0x4964,
+    data4: [0x83, 0x1d, 0x6d, 0xcb, 0x02, 0xe6, 0xf2, 0x3f],
+};
+/// ksmedia.h：`KSCATEGORY_TOPOLOGY {DDA54A40-1E4C-11D1-A050-405705C10000}`
+pub const KSCATEGORY_TOPOLOGY: GUID = GUID {
+    data1: 0xdda5_4a40,
+    data2: 0x1e4c,
+    data3: 0x11d1,
+    data4: [0xa0, 0x50, 0x40, 0x57, 0x05, 0xc1, 0x00, 0x00],
+};
 /// portcls.h：注销子设备经 port 对象的 IUnregisterSubdevice 接口
 /// （不存在平面导出 PcUnregisterSubdevice）
 pub const IID_IUnregisterSubdevice: GUID = GUID {

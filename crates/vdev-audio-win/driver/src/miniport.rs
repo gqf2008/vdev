@@ -829,7 +829,11 @@ static PIN_MEDIUMS: [KSPIN_MEDIUM; 1] = [KSPIN_MEDIUM {
 }];
 
 /// 过滤器注册类别（替代已删除的 IoRegisterDeviceInterface 块，minor a）
-static FILTER_CATEGORIES: [GUID; 1] = [KSCATEGORY_AUDIO];
+/// 回归：类别集合必须含 KSCATEGORY_RENDER/CAPTURE（不能只登记 AUDIO），
+/// 否则 PortCls 不会为播放/录音类别创建子设备符号链接，音频端点（控制面板
+/// 「vdev 扬声器/麦克风」）就不会出现。常量与宿主单测见 endpoint_names.rs。
+static FILTER_CATEGORIES_RENDER: [GUID; 3] = crate::endpoint_names::WAVE_CATEGORIES_RENDER;
+static FILTER_CATEGORIES_CAPTURE: [GUID; 3] = crate::endpoint_names::WAVE_CATEGORIES_CAPTURE;
 
 /// render 端点 pin：DataFlow=OUT / Communication=SINK / Category=KSNODETYPE_SPEAKER
 /// （B6：KSPIN_DESCRIPTOR 按 ks.h 布局按值内嵌于 PCPIN_DESCRIPTOR）
@@ -886,8 +890,8 @@ static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Nodes: core::ptr::null(),
     ConnectionCount: 0,
     Connections: core::ptr::null(),
-    CategoryCount: 1,
-    Categories: FILTER_CATEGORIES.as_ptr(),
+    CategoryCount: FILTER_CATEGORIES_RENDER.len() as u32,
+    Categories: FILTER_CATEGORIES_RENDER.as_ptr(),
 };
 
 /// capture 过滤器描述符
@@ -902,6 +906,6 @@ static FILTER_DESC_CAPTURE: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Nodes: core::ptr::null(),
     ConnectionCount: 0,
     Connections: core::ptr::null(),
-    CategoryCount: 1,
-    Categories: FILTER_CATEGORIES.as_ptr(),
+    CategoryCount: FILTER_CATEGORIES_CAPTURE.len() as u32,
+    Categories: FILTER_CATEGORIES_CAPTURE.as_ptr(),
 };
