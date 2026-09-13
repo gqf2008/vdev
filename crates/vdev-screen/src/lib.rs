@@ -48,10 +48,13 @@ impl Default for CreateOptions {
 /// 一个已创建的虚拟显示器。Drop 时自动销毁。
 pub struct VirtualDisplay {
     pub display_id: u32,
-    _mode: Retained<AnyObject>,
-    _descriptor: Retained<AnyObject>,
-    _settings: Retained<AnyObject>,
+    // 字段按声明序析构（Rust 保证），因此 display 放最前：先拆屏，再释放
+    // settings/descriptor/mode——与创建顺序严格互逆。若把 display 放最后，
+    // 中间对象会先于 display 释放，等于把生命周期赌在 CG 内部是否持有拷贝上。
     _display: Retained<AnyObject>,
+    _settings: Retained<AnyObject>,
+    _descriptor: Retained<AnyObject>,
+    _mode: Retained<AnyObject>,
 }
 
 impl VirtualDisplay {
