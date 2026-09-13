@@ -10,7 +10,7 @@ use crate::sys::portcls::{
 };
 use crate::sys::types::GUID;
 
-/// wave 滤波器在 `PCFILTER_DESCRIPTOR.Categories` 里登记的 KS 类别（播放侧）。
+/// wave 滤波器在 `PCFILTER_DESCRIPTOR.Categories` 里登记的 KS 类别。
 ///
 /// 回归：原实现只登记 `KSCATEGORY_AUDIO`。PortCls 在 `PcRegisterSubdevice` 时
 /// **按该数组逐类别**用子设备名作 reference string 注册设备接口并创建符号链接
@@ -18,13 +18,15 @@ use crate::sys::types::GUID;
 /// `KSCATEGORY_RENDER` / `KSCATEGORY_CAPTURE` 下的符号链接来枚举端点的。
 /// 只登记 AUDIO 时这些链接不存在（实测 CreateFile = ERROR_PATH_NOT_FOUND），
 /// 结果：设备管理器里有「vdev 虚拟声卡」，但控制面板/音频设置里没有任何端点。
-/// 类别集合对照 sysvad（`PCFILTER_DESCRIPTOR.Categories = NULL` 的默认集合
-/// 即 audio/render/capture）与本机实测可用的 ToDesk 虚拟声卡。
-pub const WAVE_CATEGORIES_RENDER: [GUID; 3] =
-    [KSCATEGORY_AUDIO, KSCATEGORY_REALTIME, KSCATEGORY_RENDER];
-/// wave 滤波器在 `PCFILTER_DESCRIPTOR.Categories` 里登记的 KS 类别（录音侧）。
-pub const WAVE_CATEGORIES_CAPTURE: [GUID; 3] =
-    [KSCATEGORY_AUDIO, KSCATEGORY_REALTIME, KSCATEGORY_CAPTURE];
+/// 集合取四个类别（AUDIO + REALTIME + RENDER + CAPTURE）**两侧一致**：本机 ToDesk
+/// 虚拟声卡的 wave 滤波器实测（IOCTL_KS_PROPERTY KSPROPERTY_TOPOLOGY_CATEGORIES）
+/// 返回值就是这四个；sysvad 用 `Categories = NULL` 取默认集合（audio/render/capture）。
+pub const WAVE_CATEGORIES: [GUID; 4] = [
+    KSCATEGORY_AUDIO,
+    KSCATEGORY_REALTIME,
+    KSCATEGORY_RENDER,
+    KSCATEGORY_CAPTURE,
+];
 
 /// 子设备名（UTF-16，NUL 结尾；PcRegisterSubdevice 要求）
 pub const WAVE_CAPTURE_NAME: &[u16] = &[
@@ -42,14 +44,23 @@ pub const TOPOLOGY_RENDER_NAME: &[u16] = &[
     0x00,
 ]; // "TopologyRender-0"
 
-// 物理（filter 间）连接的 pin 编号。本驱动 wave 小端口每 filter 仅 1 个 pin
-//（render pin0 DataFlow=OUT / capture pin0 DataFlow=IN，见 miniport.rs），
-// 连接即挂在其上；topology 小端口 2 pin（topology.rs 对照 sysvad *toptable.h）：
+// 物理（filter 间）连接的 pin 编号。**连接必须挂在 bridge pin 上，不能挂在 host pin 上**
+// —— 回归：原实现 wave 小端口每 filter 只有 1 个 pin，且把物理连接挂在这个 host pin 上，
+// 实测（Win10 19045，同机可用的 ToDesk 虚拟声卡逐 pin 对比，见 PR #12）端点不出现；
+// ToDesk/sysvad 的形状是「host pin（Communication=SINK，给客户端开流）+ bridge pin
+// （Communication=NONE，与 topology 物理相连）」两个 pin。
+// wave 小端口 pin 布局（miniport.rs）：
+//   render：pin0 = host（DataFlow IN / SINK）  pin1 = bridge（DataFlow OUT / NONE）
+//   capture：pin0 = bridge（DataFlow IN / NONE） pin1 = host（DataFlow OUT / SINK）
+// topology 小端口 2 pin（topology.rs 对照 sysvad *toptable.h）：
 //   render：pin0 = KSPIN_TOPO_WAVEOUT_SOURCE（自 wave 汇入，DataFlow IN）
 //   capture：pin1 = KSPIN_TOPO_BRIDGE（桥接出至 wave，DataFlow OUT）
 // 数据流方向与 sysvad ConnectTopologies 两条连接一致：
 //   render 路径：wave → topology；capture 路径：topology → wave。
-pub const WAVE_PIN: u32 = 0;
+pub const WAVE_RENDER_HOST_PIN: u32 = 0;
+pub const WAVE_RENDER_BRIDGE_PIN: u32 = 1;
+pub const WAVE_CAPTURE_BRIDGE_PIN: u32 = 0;
+pub const WAVE_CAPTURE_HOST_PIN: u32 = 1;
 pub const TOPO_RENDER_FROM_WAVE_PIN: u32 = 0;
 pub const TOPO_CAPTURE_TO_WAVE_PIN: u32 = 1;
 
@@ -129,17 +140,26 @@ mod tests {
     }
 
     /// 物理连接 pin 编号与 miniport/topology 的 filter 布局一致
-    ///（wave 每 filter 1 pin；topology render pin0 自 wave 汇入、
-    /// capture pin1 桥接出至 wave——对照 sysvad *toptable.h）
+    ///（wave 每 filter 2 pin：host + bridge，连接只许挂 bridge；
+    /// topology render pin0 自 wave 汇入、capture pin1 桥接出至 wave
+    /// ——对照 sysvad *wavtable.h / *toptable.h）
     #[test]
     fn physical_connection_pins() {
-        assert_eq!(WAVE_PIN, 0);
+        // render：host=0（SINK，开流用）、bridge=1（物理连接）
+        assert_eq!(WAVE_RENDER_HOST_PIN, 0);
+        assert_eq!(WAVE_RENDER_BRIDGE_PIN, 1);
+        // capture：bridge=0（物理连接）、host=1（SINK，开流用）
+        assert_eq!(WAVE_CAPTURE_BRIDGE_PIN, 0);
+        assert_eq!(WAVE_CAPTURE_HOST_PIN, 1);
         assert_eq!(TOPO_RENDER_FROM_WAVE_PIN, 0);
         assert_eq!(TOPO_CAPTURE_TO_WAVE_PIN, 1);
+        // 回归：bridge pin 与 host pin 不能是同一个
+        assert_ne!(WAVE_RENDER_BRIDGE_PIN, WAVE_RENDER_HOST_PIN);
+        assert_ne!(WAVE_CAPTURE_BRIDGE_PIN, WAVE_CAPTURE_HOST_PIN);
     }
 
-    /// 类别 GUID 字面值逐字节核对（防抄错），并保证播放/录音两侧都带上
-    /// 各自类别 + AUDIO + REALTIME。
+    /// 类别 GUID 字面值逐字节核对（防抄错），并保证两侧都带上
+    /// AUDIO + REALTIME + RENDER + CAPTURE（与 ToDesk 虚拟声卡实测一致）。
     ///
     /// 回归：原实现只登记 KSCATEGORY_AUDIO，导致 KSCATEGORY_RENDER/CAPTURE
     /// 下没有子设备符号链接、音频端点不出现（详见 WAVE_CATEGORIES_RENDER 注释）。
@@ -156,20 +176,14 @@ mod tests {
         );
         assert_eq!(KSCATEGORY_AUDIO.data1, 0x6994_ad04);
 
-        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_RENDER));
-        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_AUDIO));
-        assert!(WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_REALTIME));
-        assert!(
-            !WAVE_CATEGORIES_RENDER.contains(&KSCATEGORY_CAPTURE),
-            "播放滤波器不得登记为录音类别"
-        );
-
-        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_CAPTURE));
-        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_AUDIO));
-        assert!(WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_REALTIME));
-        assert!(
-            !WAVE_CATEGORIES_CAPTURE.contains(&KSCATEGORY_RENDER),
-            "录音滤波器不得登记为播放类别"
-        );
+        for cat in [
+            KSCATEGORY_AUDIO,
+            KSCATEGORY_REALTIME,
+            KSCATEGORY_RENDER,
+            KSCATEGORY_CAPTURE,
+        ] {
+            assert!(WAVE_CATEGORIES.contains(&cat), "wave 滤波器类别集合缺一项");
+        }
+        assert_eq!(WAVE_CATEGORIES.len(), 4);
     }
 }

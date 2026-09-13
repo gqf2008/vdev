@@ -763,6 +763,21 @@ static KSDATAFORMAT_SPECIFIER_WAVEFORMATEX: GUID = GUID {
     data3: 0x11ce,
     data4: [0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
 };
+/// ksmedia.h KSDATAFORMAT_SUBTYPE_ANALOG = 6dba3190-67bd-11cf-a0f7-0020afd156e4
+/// （bridge pin 的 subformat；对照 sysvad speakertoptable.h 与 ToDesk 虚拟声卡实测）
+static KSDATAFORMAT_SUBTYPE_ANALOG: GUID = GUID {
+    data1: 0x6dba_3190,
+    data2: 0x67bd,
+    data3: 0x11cf,
+    data4: [0xa0, 0xf7, 0x00, 0x20, 0xaf, 0xd1, 0x56, 0xe4],
+};
+/// ks.h KSDATAFORMAT_SPECIFIER_NONE = 0f6417d6-c318-11d0-a43f-00a0c9223196
+static KSDATAFORMAT_SPECIFIER_NONE: GUID = GUID {
+    data1: 0x0f64_17d6,
+    data2: 0xc318,
+    data3: 0x11d0,
+    data4: [0xa4, 0x3f, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
+};
 static KSINTERFACESETID_STANDARD: GUID = GUID {
     data1: 0x1a87_66a0,
     data2: 0x62ce,
@@ -816,6 +831,19 @@ unsafe impl Sync for SyncDataRanges {}
 
 static DATA_RANGES: SyncDataRanges = SyncDataRanges([&raw const AUDIO_DATA_RANGE.DataRange]);
 
+/// bridge pin 的数据范围：TYPE_AUDIO / SUBTYPE_ANALOG / SPECIFIER_NONE
+/// （对照 sysvad speakertoptable.h 与 ToDesk 虚拟声卡 wave 滤波器 pin1 实测值）
+static AUDIO_BRIDGE_RANGE: KSDATARANGE = KSDATARANGE {
+    FormatSize: size_of::<KSDATARANGE>() as u32,
+    Flags: 0,
+    SampleSize: 0,
+    Reserved: 0,
+    MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
+    SubFormat: KSDATAFORMAT_SUBTYPE_ANALOG,
+    Specifier: KSDATAFORMAT_SPECIFIER_NONE,
+};
+static BRIDGE_DATA_RANGES: SyncDataRanges = SyncDataRanges([&raw const AUDIO_BRIDGE_RANGE]);
+
 static PIN_INTERFACES: [KSPIN_INTERFACE; 1] = [KSPIN_INTERFACE {
     Set: KSINTERFACESETID_STANDARD,
     Id: KSINTERFACE_STANDARD_STREAMING,
@@ -832,66 +860,140 @@ static PIN_MEDIUMS: [KSPIN_MEDIUM; 1] = [KSPIN_MEDIUM {
 /// 回归：类别集合必须含 KSCATEGORY_RENDER/CAPTURE（不能只登记 AUDIO），
 /// 否则 PortCls 不会为播放/录音类别创建子设备符号链接，音频端点（控制面板
 /// 「vdev 扬声器/麦克风」）就不会出现。常量与宿主单测见 endpoint_names.rs。
-static FILTER_CATEGORIES_RENDER: [GUID; 3] = crate::endpoint_names::WAVE_CATEGORIES_RENDER;
-static FILTER_CATEGORIES_CAPTURE: [GUID; 3] = crate::endpoint_names::WAVE_CATEGORIES_CAPTURE;
+static FILTER_CATEGORIES: [GUID; 4] = crate::endpoint_names::WAVE_CATEGORIES;
 
-/// render 端点 pin：DataFlow=OUT / Communication=SINK / Category=KSNODETYPE_SPEAKER
-/// （B6：KSPIN_DESCRIPTOR 按 ks.h 布局按值内嵌于 PCPIN_DESCRIPTOR）
-static PINS_RENDER: [PCPIN_DESCRIPTOR; 1] = [PCPIN_DESCRIPTOR {
-    MaxGlobalInstanceCount: 1,
-    MaxFilterInstanceCount: 1,
-    MinFilterInstanceCount: 0,
-    AutomationTable: core::ptr::null(),
-    KsPinDescriptor: KSPIN_DESCRIPTOR {
-        InterfacesCount: 1,
-        Interfaces: PIN_INTERFACES.as_ptr(),
-        MediumsCount: 1,
-        Mediums: PIN_MEDIUMS.as_ptr(),
-        DataRangesCount: 1,
-        DataRanges: DATA_RANGES.0.as_ptr(),
-        DataFlow: KSPIN_DATAFLOW_OUT,
-        Communication: KSPIN_COMMUNICATION_SINK,
-        Category: &raw const KSNODETYPE_SPEAKER,
-        Name: core::ptr::null(),
-        Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
-    },
+/// portcls.h:1509 `PCFILTER_NODE` = ks.h:922 `KSFILTER_NODE` = `(ULONG)-1`
+/// （同 topology.rs 的本地常量；滤波器内部连接的端点之一）
+const PCFILTER_NODE: u32 = u32::MAX;
+
+/// wave 滤波器内部连接：host pin ↔ bridge pin（对照本机 ToDesk 虚拟声卡实测
+/// `KSPROPERTY_TOPOLOGY_CONNECTIONS` 返回 1 条连接；sysvad 是经
+/// KSNODETYPE_AUDIO_ENGINE 节点中转，本驱动不做音频引擎节点，直接相连）。
+static WAVE_RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
+    FromNode: PCFILTER_NODE,
+    FromNodePin: crate::endpoint_names::WAVE_RENDER_HOST_PIN,
+    ToNode: PCFILTER_NODE,
+    ToNodePin: crate::endpoint_names::WAVE_RENDER_BRIDGE_PIN,
+}];
+static WAVE_CAPTURE_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
+    FromNode: PCFILTER_NODE,
+    FromNodePin: crate::endpoint_names::WAVE_CAPTURE_BRIDGE_PIN,
+    ToNode: PCFILTER_NODE,
+    ToNodePin: crate::endpoint_names::WAVE_CAPTURE_HOST_PIN,
 }];
 
-/// capture 端点 pin：DataFlow=IN / Communication=SOURCE / Category=KSNODETYPE_MICROPHONE
-static PINS_CAPTURE: [PCPIN_DESCRIPTOR; 1] = [PCPIN_DESCRIPTOR {
-    MaxGlobalInstanceCount: 1,
-    MaxFilterInstanceCount: 1,
-    MinFilterInstanceCount: 0,
-    AutomationTable: core::ptr::null(),
-    KsPinDescriptor: KSPIN_DESCRIPTOR {
-        InterfacesCount: 1,
-        Interfaces: PIN_INTERFACES.as_ptr(),
-        MediumsCount: 1,
-        Mediums: PIN_MEDIUMS.as_ptr(),
-        DataRangesCount: 1,
-        DataRanges: DATA_RANGES.0.as_ptr(),
-        DataFlow: KSPIN_DATAFLOW_IN,
-        Communication: KSPIN_COMMUNICATION_SOURCE,
-        Category: &raw const KSNODETYPE_MICROPHONE,
-        Name: core::ptr::null(),
-        Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
+/// render 小端口 pin 表（2 pin，对照 ToDesk 虚拟声卡逐 pin 实测值 / sysvad speakerwavtable.h）
+///
+/// - pin0 = host：DataFlow=**IN**（数据流入滤波器）/ Communication=SINK / Category=KSNODETYPE_SPEAKER
+///   / 实例数 1 —— 客户端与 audio engine 开流用的那一端。
+/// - pin1 = bridge：DataFlow=OUT / Communication=NONE / Category=KSNODETYPE_SPEAKER
+///   / 桥接数据范围 —— **物理连接（wave→topology）挂在这里**。
+///
+/// 回归：原实现只有 1 个 pin（DataFlow=OUT + SINK + 物理连接挂其上），实测端点不出现。
+static PINS_RENDER: [PCPIN_DESCRIPTOR; 2] = [
+    PCPIN_DESCRIPTOR {
+        MaxGlobalInstanceCount: 1,
+        MaxFilterInstanceCount: 1,
+        MinFilterInstanceCount: 0,
+        AutomationTable: core::ptr::null(),
+        KsPinDescriptor: KSPIN_DESCRIPTOR {
+            InterfacesCount: 1,
+            Interfaces: PIN_INTERFACES.as_ptr(),
+            MediumsCount: 1,
+            Mediums: PIN_MEDIUMS.as_ptr(),
+            DataRangesCount: 1,
+            DataRanges: DATA_RANGES.0.as_ptr(),
+            DataFlow: KSPIN_DATAFLOW_IN,
+            Communication: KSPIN_COMMUNICATION_SINK,
+            Category: &raw const KSNODETYPE_SPEAKER,
+            Name: core::ptr::null(),
+            Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
+        },
     },
-}];
+    PCPIN_DESCRIPTOR {
+        MaxGlobalInstanceCount: 0,
+        MaxFilterInstanceCount: 0,
+        MinFilterInstanceCount: 0,
+        AutomationTable: core::ptr::null(),
+        KsPinDescriptor: KSPIN_DESCRIPTOR {
+            InterfacesCount: 0,
+            Interfaces: core::ptr::null(),
+            MediumsCount: 0,
+            Mediums: core::ptr::null(),
+            DataRangesCount: 1,
+            DataRanges: BRIDGE_DATA_RANGES.0.as_ptr(),
+            DataFlow: KSPIN_DATAFLOW_OUT,
+            Communication: KSPIN_COMMUNICATION_NONE,
+            Category: &raw const KSNODETYPE_SPEAKER,
+            Name: core::ptr::null(),
+            Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
+        },
+    },
+];
+
+/// capture 小端口 pin 表（2 pin，对照 ToDesk 虚拟声卡逐 pin 实测值 / sysvad micarraywavtable.h）
+///
+/// - pin0 = bridge：DataFlow=IN / Communication=NONE / Category=KSNODETYPE_MICROPHONE
+///   / 桥接数据范围 —— **物理连接（topology→wave）挂在这里**。
+/// - pin1 = host：DataFlow=**OUT**（数据流出滤波器）/ Communication=SINK / Category=KSNODETYPE_MICROPHONE
+///   / 实例数 1 —— 开流用的那一端。
+///
+/// 回归：原实现只有 1 个 pin（DataFlow=IN + Communication=SOURCE），实测端点不出现。
+static PINS_CAPTURE: [PCPIN_DESCRIPTOR; 2] = [
+    PCPIN_DESCRIPTOR {
+        MaxGlobalInstanceCount: 0,
+        MaxFilterInstanceCount: 0,
+        MinFilterInstanceCount: 0,
+        AutomationTable: core::ptr::null(),
+        KsPinDescriptor: KSPIN_DESCRIPTOR {
+            InterfacesCount: 0,
+            Interfaces: core::ptr::null(),
+            MediumsCount: 0,
+            Mediums: core::ptr::null(),
+            DataRangesCount: 1,
+            DataRanges: BRIDGE_DATA_RANGES.0.as_ptr(),
+            DataFlow: KSPIN_DATAFLOW_IN,
+            Communication: KSPIN_COMMUNICATION_NONE,
+            Category: &raw const KSNODETYPE_MICROPHONE,
+            Name: core::ptr::null(),
+            Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
+        },
+    },
+    PCPIN_DESCRIPTOR {
+        MaxGlobalInstanceCount: 1,
+        MaxFilterInstanceCount: 1,
+        MinFilterInstanceCount: 0,
+        AutomationTable: core::ptr::null(),
+        KsPinDescriptor: KSPIN_DESCRIPTOR {
+            InterfacesCount: 1,
+            Interfaces: PIN_INTERFACES.as_ptr(),
+            MediumsCount: 1,
+            Mediums: PIN_MEDIUMS.as_ptr(),
+            DataRangesCount: 1,
+            DataRanges: DATA_RANGES.0.as_ptr(),
+            DataFlow: KSPIN_DATAFLOW_OUT,
+            Communication: KSPIN_COMMUNICATION_SINK,
+            Category: &raw const KSNODETYPE_MICROPHONE,
+            Name: core::ptr::null(),
+            Reserved: KSPIN_DESCRIPTOR_TAIL { Reserved: 0 },
+        },
+    },
+];
 
 /// render 过滤器描述符（B6：字段集与 portcls.h 一致，Version=0，类别数组指针）
 static FILTER_DESC_RENDER: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0,
     AutomationTable: core::ptr::null(),
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
-    PinCount: 1,
+    PinCount: PINS_RENDER.len() as u32,
     Pins: PINS_RENDER.as_ptr(),
     NodeSize: 0,
     NodeCount: 0,
     Nodes: core::ptr::null(),
-    ConnectionCount: 0,
-    Connections: core::ptr::null(),
-    CategoryCount: FILTER_CATEGORIES_RENDER.len() as u32,
-    Categories: FILTER_CATEGORIES_RENDER.as_ptr(),
+    ConnectionCount: WAVE_RENDER_CONNECTIONS.len() as u32,
+    Connections: WAVE_RENDER_CONNECTIONS.as_ptr(),
+    CategoryCount: FILTER_CATEGORIES.len() as u32,
+    Categories: FILTER_CATEGORIES.as_ptr(),
 };
 
 /// capture 过滤器描述符
@@ -899,13 +1001,13 @@ static FILTER_DESC_CAPTURE: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0,
     AutomationTable: core::ptr::null(),
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as u32,
-    PinCount: 1,
+    PinCount: PINS_CAPTURE.len() as u32,
     Pins: PINS_CAPTURE.as_ptr(),
     NodeSize: 0,
     NodeCount: 0,
     Nodes: core::ptr::null(),
-    ConnectionCount: 0,
-    Connections: core::ptr::null(),
-    CategoryCount: FILTER_CATEGORIES_CAPTURE.len() as u32,
-    Categories: FILTER_CATEGORIES_CAPTURE.as_ptr(),
+    ConnectionCount: WAVE_CAPTURE_CONNECTIONS.len() as u32,
+    Connections: WAVE_CAPTURE_CONNECTIONS.as_ptr(),
+    CategoryCount: FILTER_CATEGORIES.len() as u32,
+    Categories: FILTER_CATEGORIES.as_ptr(),
 };

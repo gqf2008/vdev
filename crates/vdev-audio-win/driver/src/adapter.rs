@@ -281,7 +281,8 @@ pub unsafe fn create(device: PDEVICE_OBJECT) -> *mut AdapterCommon {
 // 宿主 #[test] 可校验其与 INF 模板/pin 布局的一致性）
 use crate::endpoint_names::{
     TOPO_CAPTURE_TO_WAVE_PIN, TOPO_RENDER_FROM_WAVE_PIN, TOPOLOGY_CAPTURE_NAME,
-    TOPOLOGY_RENDER_NAME, WAVE_CAPTURE_NAME, WAVE_PIN, WAVE_RENDER_NAME,
+    TOPOLOGY_RENDER_NAME, WAVE_CAPTURE_BRIDGE_PIN, WAVE_CAPTURE_NAME, WAVE_RENDER_BRIDGE_PIN,
+    WAVE_RENDER_NAME,
 };
 
 /// 安装一个端点（port + miniport + PcRegisterSubdevice）
@@ -454,7 +455,7 @@ unsafe fn teardown_endpoints(this: *mut AdapterCommon) {
             pc_unregister_physical_connection(
                 adapter.device_object,
                 adapter.speaker_port,
-                WAVE_PIN,
+                WAVE_RENDER_BRIDGE_PIN,
                 adapter.topo_speaker_port,
                 TOPO_RENDER_FROM_WAVE_PIN,
             )
@@ -469,7 +470,7 @@ unsafe fn teardown_endpoints(this: *mut AdapterCommon) {
                 adapter.topo_mic_port,
                 TOPO_CAPTURE_TO_WAVE_PIN,
                 adapter.mic_port,
-                WAVE_PIN,
+                WAVE_CAPTURE_BRIDGE_PIN,
             )
         };
         adapter.phys_capture_connected = false;
@@ -548,7 +549,7 @@ pub unsafe fn install_virtual_cable(this: *mut AdapterCommon) -> NTSTATUS {
     let st = PcRegisterPhysicalConnection(
         (*this).device_object,
         (*this).speaker_port,
-        WAVE_PIN,
+        WAVE_RENDER_BRIDGE_PIN,
         (*this).topo_speaker_port,
         TOPO_RENDER_FROM_WAVE_PIN,
     );
@@ -563,7 +564,7 @@ pub unsafe fn install_virtual_cable(this: *mut AdapterCommon) -> NTSTATUS {
         (*this).topo_mic_port,
         TOPO_CAPTURE_TO_WAVE_PIN,
         (*this).mic_port,
-        WAVE_PIN,
+        WAVE_CAPTURE_BRIDGE_PIN,
     );
     if st < 0 {
         unsafe { teardown_endpoints(this) };
