@@ -9,18 +9,18 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DI_REMOVEDEVICE_GLOBAL, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE,
-    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, DIIRFLAG_FORCE_INF, DiInstallDriverW,
-    GUID_DEVCLASS_HIDCLASS, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
-    SP_CLASSINSTALL_HEADER, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SP_REMOVEDEVICE_PARAMS,
-    SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
-    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
-    SetupDiOpenDeviceInfoW, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+    CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW,
+    CR_SUCCESS, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    DIIRFLAG_FORCE_INF, DiInstallDriverW, GUID_DEVCLASS_HIDCLASS, SETUP_DI_GET_CLASS_DEVS_FLAGS,
+    SETUP_DI_REGISTRY_PROPERTY, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SPDRP_DRIVER,
+    SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
+    SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+    SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDeviceInfoW,
+    SetupDiSetDeviceRegistryPropertyW,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid,
+    HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid, HidD_SetFeature,
 };
 use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
@@ -142,34 +142,39 @@ fn remove_all_nodes() -> Result<usize> {
             to_remove.push(info);
         }
     }
+    // 用配置管理器（CfgMgr）移除整棵子树：DIF_REMOVE 那条路在本机不可用——
+    // SetupDiSetDeviceInstallParamsW 强转 SP_REMOVEDEVICE_PARAMS 报 0x800706F8，
+    // 改 SetupDiSetClassInstallParamsW 后同样失败（实测），而 pnputil /remove-device
+    // 能删掉同样的节点。CM_Query_And_Remove_SubTreeW 是 neflib/nefcon 同款做法。
+    let mut removed = 0usize;
     for info in &mut to_remove {
-        // DIF_REMOVE 的参数是**类安装参数**（SP_REMOVEDEVICE_PARAMS），必须走
-        // SetupDiSetClassInstallParamsW。此前误用 SetupDiSetDeviceInstallParamsW 并把
-        // 16 字节的 SP_REMOVEDEVICE_PARAMS 强转成 SP_DEVINSTALL_PARAMS_W：后者 cbSize
-        // 是 200+ 字节，SetupAPI 校验 cbSize 后直接返回 ERROR_INVALID_USER_BUFFER
-        // (0x800706F8)，导致 uninstall 恒失败、有残留节点时 install 也起不来。
-        let params = SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-            Scope: DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            SetupDiSetClassInstallParamsW(
-                devs,
-                Some(info),
-                Some(&params.ClassInstallHeader),
-                std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-            )
+        let mut id_buf = [0u16; 512];
+        // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+        let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+        if cr != CR_SUCCESS {
+            bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
         }
-        .context("SetupDiSetClassInstallParamsW failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        let mut devinst = 0u32;
+        // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+        let cr = unsafe {
+            CM_Locate_DevNodeW(
+                &mut devinst,
+                PCWSTR(id_buf.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        if cr != CR_SUCCESS {
+            bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
+        }
+        // SAFETY: devinst 有效；不关心 veto 详情
+        let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        if cr != CR_SUCCESS {
+            bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
+        }
+        removed += 1;
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(to_remove.len())
+    Ok(removed)
 }
 
 /// 创建并注册一个设备节点（硬件 ID 由 INF 模型行匹配到对应安装节，
@@ -496,6 +501,10 @@ pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
 }
 
 /// 向指定 HID 接口路径写入一份输出报告
+///
+/// 通道优先级：Feature 报告（`HidD_SetFeature`，带/不带 Report ID 前缀各试一次）→
+/// 输出报告（`WriteFile`）。键盘/鼠标顶层集合的输出报告会被系统拒绝
+/// （ERROR_INVALID_FUNCTION），Feature 报告是这条链路上真正可行的注入通道。
 fn write_report_to(path: &str, report: &[u8]) -> Result<()> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let handle = unsafe {
@@ -513,10 +522,25 @@ fn write_report_to(path: &str, report: &[u8]) -> Result<()> {
     if handle == INVALID_HANDLE_VALUE {
         bail!("打开 vdev 虚拟 HID 设备失败（设备可能未安装或已被占用）");
     }
-    let mut written = 0u32;
-    let ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) };
+
+    // 1) Feature 报告：hidclass 对 VHF 设备把 Report ID 计入报告长度，先试带前缀
+    let mut framed = Vec::with_capacity(report.len() + 1);
+    framed.push(0u8);
+    framed.extend_from_slice(report);
+    let mut ok =
+        unsafe { HidD_SetFeature(handle, framed.as_ptr().cast(), framed.len() as u32) }.as_bool();
+    // 2) Feature 报告：不带前缀
+    if !ok {
+        ok = unsafe { HidD_SetFeature(handle, report.as_ptr().cast(), report.len() as u32) }
+            .as_bool();
+    }
+    // 3) 兜底：输出报告
+    if !ok {
+        let mut written = 0u32;
+        ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) }.is_ok();
+    }
     unsafe { CloseHandle(handle) }.ok();
-    if ok.is_err() {
+    if !ok {
         bail!("写入 HID 报告失败：{}", windows::core::Error::from_win32());
     }
     Ok(())

@@ -346,9 +346,11 @@ unsafe extern "C" fn evt_prepare_hardware(
     config.ReportDescriptorLength = descriptor.len() as USHORT;
     config.ReportDescriptor = descriptor.as_ptr().cast_mut();
     config.VhfClientContext = role.as_context();
-    // 只注册 WriteReport：用户态写厂商输出报告即注入。
+    // 注册 Feature 报告的 SetFeature：用户态 HidD_SetFeature 写厂商 Feature 报告即注入。
+    // 不注册 WriteReport/Output：系统对键盘/鼠标 TLC 的输出报告写入一律拒绝
+    // （ERROR_INVALID_FUNCTION），Output 报告在本机型上不可用。
     // 不注册 EvtVhfReadyForNextReadReport → 走 VHF 默认缓冲策略，提交无时序约束。
-    config.EvtVhfAsyncOperationWriteReport = Some(evt_vhf_write_report);
+    config.EvtVhfAsyncOperationSetFeature = Some(evt_vhf_report_in);
 
     let mut vhf: VHFHANDLE = core::ptr::null_mut();
     // SAFETY: config 有效；描述符为静态数据，生命周期覆盖 VhfCreate/VhfStart 全程
@@ -397,14 +399,18 @@ unsafe extern "C" fn evt_self_managed_io_cleanup(device: WDFDEVICE) {
 
 // ---------------- 注入：写厂商输出报告 → 交回输入报告 ----------------
 
-/// VHF WriteReport 回调：hidclass 收到 HID 客户端的输出报告（来自用户态 WriteFile）。
+/// VHF Feature 报告回调（SetFeature）：hidclass 收到 HID 客户端设置的 Feature 报告
+/// （用户态 `HidD_SetFeature`）。
 ///
 /// 本驱动把这份字节原样当**输入报告**投递（键盘 8 字节 / 鼠标 4 字节，与报告描述符里
-/// 8/4 字节的厂商输出管道一一对应），于是系统把注入当成真实键鼠输入。
+/// 8/4 字节的厂商 Feature 管道一一对应），于是系统把注入当成真实键鼠输入。
+///
+/// 缓冲可能带 1 字节 Report ID 前缀（hidclass 对 VHF 设备的 `FeatureReportByteLength`
+/// 会把 ID 计入），故取**尾部 size 字节**作为报告体。
 ///
 /// # Safety
 /// 由 VHF 调用：`operation` 为本次操作句柄，`packet` 指向 VHF 提供的传输包。
-unsafe extern "C" fn evt_vhf_write_report(
+unsafe extern "C" fn evt_vhf_report_in(
     context: PVOID,
     operation: VHFOPERATIONHANDLE,
     _operation_context: PVOID,
@@ -438,14 +444,17 @@ unsafe fn submit_as_input_report(context: PVOID, packet: wdk_sys::PHID_XFER_PACK
     if buffer.is_null() || length < size {
         return STATUS_INVALID_BUFFER_SIZE;
     }
+    // 报告体取尾部 size 字节（兼容带 Report ID 前缀的缓冲）
+    // SAFETY: 已确认 buffer 至少 length >= size 字节可读
+    let body = unsafe { buffer.add(length - size) };
     let handle = vhf_handle(role);
     if handle.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let mut report = [0u8; KBD_REPORT_SIZE];
-    // SAFETY: buffer 至少 length >= size 字节可读
+    // SAFETY: body 指向至少 size 字节可读的区域
     unsafe {
-        core::ptr::copy_nonoverlapping(buffer, report.as_mut_ptr(), size);
+        core::ptr::copy_nonoverlapping(body, report.as_mut_ptr(), size);
     }
     let mut xfer = HID_XFER_PACKET {
         reportBuffer: report.as_mut_ptr(),
