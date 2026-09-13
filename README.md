@@ -397,14 +397,18 @@ bcdedit /set testsigning on
 - [ ] `vdev-app-win` 宿主 GUI 集成页完善（虚拟显示器页；声卡页已有）
 
 CI（`.github/workflows/ci.yml`，push main + PR 触发）：
-- **硬门禁**：macOS 主 workspace（fmt/check/test/clippy -D warnings）；Windows 用户态五个
-  独立 workspace（camera-win / hid-win / app-win / audio-win / display-win 用户态包）各自的
-  fmt/check/clippy（test 按包有则跑）；主 workspace 成员 `vdev-mic-agent` 也在 windows-latest
-  上原生 fmt/check/clippy/test（纯 Rust 依赖 + `cfg(windows)` 的 windows 0.58，仓库根 `-p` 选包）。
-- **顾问 job（continue-on-error，红不阻塞）**：`windows-driver-wdk`——依赖 WDK 的驱动构建
-  （display-win 的 driver + wdf-umdf-sys bindgen、hid-win/kernel 的 wdk-build）。托管 runner
-  上 winget 装 WDK + LLVM 的组合未实测（wdk-build 可能还需 EWDK/WDKContentRoot），替代路径为
-  Windows 真机本地构建；稳定转绿后可去掉 continue-on-error 升级为硬门禁。
+- **硬门禁**（红即阻塞）：
+  - macOS 主 workspace：fmt / check / test / clippy `-D warnings` / **`cargo build --workspace --release`**。
+    最后一步不能省——check/test/clippy 都不做最终链接，FFI 声明错框架（如 AudioUnit 符号挂在
+    CoreAudio 上）只有真 build 二进制才在 ld 阶段报未定义符号。
+  - Windows 用户态五个独立 workspace（camera-win / hid-win / app-win / audio-win / display-win
+    用户态包）各自的 fmt/check/clippy（test 按包有则跑）；主 workspace 成员 `vdev-mic-agent` 也在
+    windows-latest 上原生 fmt/check/clippy/test（纯 Rust 依赖 + `cfg(windows)` 的 windows 0.58，
+    仓库根 `-p` 选包）。
+  - `windows-driver-wdk`：依赖 WDK 的驱动构建（display-win 的 driver + wdf-umdf-sys bindgen、
+    hid-win/kernel 的 wdk-build）。托管 runner 上 winget 装 WDK 10.0.26100 + LLVM 的组合已连续
+    实测可用，且历史红灯都是真实驱动编译错误，2026-09-13 起由顾问 job 升为硬门禁（替代路径仍是
+    Windows 真机本地构建）。
 
 ---
 

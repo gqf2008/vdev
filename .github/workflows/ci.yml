@@ -3,21 +3,24 @@
 # 门禁语义（看 CI 前先读本注释：红不等于阻塞，先区分硬门禁与顾问 job）：
 #
 # - 硬门禁（红即阻塞）：
-#   * macos：仓库根主 workspace（fmt / check / test / clippy -D warnings）。
+#   * macos：仓库根主 workspace（fmt / check / test / clippy -D warnings /
+#     build --release）。**最后一步的 build 不可省**：check/test/clippy 都不做
+#     最终链接，FFI 声明错框架（如把 AudioUnit 符号挂在 CoreAudio 上）只有真
+#     build 二进制才在 ld 阶段报未定义符号——vdev-mic-agent 就踩过这个盲区。
 #   * windows-user 矩阵：五个 Windows 独立 workspace 的用户态门禁——
 #     vdev-camera-win / vdev-hid-win / vdev-app-win / vdev-audio-win /
 #     vdev-display-win（只测 WDK-free 的用户态包）；外加主 workspace 成员
 #     vdev-mic-agent（仓库根 -p 选包，纯 Rust 依赖，Windows 宿主直接构建）。
-#
-# - 顾问 job（continue-on-error，红不阻塞合并，但必须人工读日志跟进）：
 #   * windows-driver-wdk：依赖 WDK 的驱动构建——vdev-display-win 的 driver +
 #     wdf-umdf-sys（bindgen 需 LLVM + WDK 注册表探测）与 vdev-hid-win/kernel
-#     （wdk-build，KMDF）。在 GitHub 托管 runner 上「winget 装
-#     Microsoft.WindowsWDK.10.0.26100 + LLVM」的组合未实测过，wdk-build 可能
-#     还需要 EWDK 或额外环境变量（如 WDKContentRoot）；因此先以 continue-on-error
-#     运行。替代路径：Windows 真机本地构建（见 README「Windows 通用：构建 /
-#     签名 / 安装」）。若某天该 job 稳定转绿，删除 continue-on-error 即升级为
-#     硬门禁；不许静默放弃。
+#     （wdk-build，KMDF）。2026-09-13 起由顾问 job 升为硬门禁：托管 runner 上
+#     「winget 装 Microsoft.WindowsWDK.10.0.26100 + LLVM」的组合已连续 8 次
+#     实测可用，且此前两次红灯都是真实驱动编译错误（E0133/E0716）——即该 job
+#     要抓的目标，不是环境抖动。替代路径仍是 Windows 真机本地构建（见 README
+#     「Windows 通用：构建 / 签名 / 安装」）。
+#
+# - 环境安装步骤仍保留 `exit 0` + ::warning::：WDK/LLVM 装不上时后续 cargo
+#   check 会以真实错误变红，不需要额外断言（见 RULE_规则可执行性.md）。
 
 name: CI
 
@@ -54,6 +57,10 @@ jobs:
         run: cargo test --workspace
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # 最终链接门禁：check/test/clippy 都跳过 ld，只有 build 会暴露 FFI 框架
+      # 声明错误（vdev-mic-agent 的 AudioToolbox 事故就是从这个盲区漏出去的）。
+      - name: build --release（最终链接）
+        run: cargo build --workspace --release
 
   windows-user:
     name: Windows 用户态 ${{ matrix.name }}
@@ -111,11 +118,10 @@ jobs:
         run: cargo clippy ${{ matrix.pkgs }} --all-targets -- -D warnings
         working-directory: ${{ matrix.dir }}
 
-  # 顾问 job（continue-on-error）：原因与替代路径见文件头注释。
+  # 硬门禁：原因与升级依据见文件头注释。
   windows-driver-wdk:
-    name: Windows driver（WDK，顾问）
+    name: Windows driver（WDK）
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -128,7 +134,7 @@ jobs:
         shell: pwsh
         run: |
           winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
-          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::WDK winget 安装失败 (exit=$LASTEXITCODE)，后续 check 预计因缺 WDK 失败"; }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::WDK winget 安装失败 (exit=$LASTEXITCODE)，后续 check 会因缺 WDK 变红"; }
           # runner 镜像可能已预装 LLVM：winget 对已安装包返回非 0，先 list 再决定装不装
           winget list --id LLVM.LLVM --exact > $null
           if ($LASTEXITCODE -ne 0) { winget install --id LLVM.LLVM --exact --silent --accept-package-agreements --accept-source-agreements; }
