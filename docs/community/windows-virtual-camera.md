@@ -1,6 +1,7 @@
 # 用纯 Rust 写一个 Windows 虚拟摄像头：DirectShow 源过滤器全解析
 
 > 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
+> 代码引用约定：本文所有 `文件:行号` 均相对**仓库根**（如 `crates/.../foo.rs:12`），行号为写作时基线；代码演进后行号会漂移，按符号名搜索为准。
 
 虚拟摄像头是虚拟设备里最"平易近人"的一种：它不要求理解内核电源管理，也不要求签发驱动包，却覆盖了从 COM、跨进程共享内存到多媒体框架协商的完整知识面。本文以 vdev 仓库中的 `vdev-camera-win`（约 3100 行 Rust，含注释与测试）为例，讲清楚一条完整的实现路径：如何用纯 Rust 写一个 DirectShow 源过滤器（Source Filter），把它注册成系统摄像头，并把另一个进程推送的帧安全地送到任意 App 的摄像头画面里。
 
@@ -28,7 +29,7 @@
 
 - **Filter Graph（过滤器图）**：一张由"过滤器"（Filter）组成的数据流图。摄像头画面从 **Source Filter**（源过滤器）流出，经过可能的转换过滤器，到达渲染器或编码器。App 通过 Filter Graph Manager（`CLSID_FilterGraph`，实现在 `quartz.dll`）建图、连线和控制状态。
 - **Pin 与媒体协商**：每个过滤器有若干 Pin（引脚）。源过滤器暴露一个**输出 Pin**，下游渲染器提供输入 Pin。连线时双方协商一份 `AM_MEDIA_TYPE`（主类型/子类型/格式块，比如 `MEDIATYPE_Video` + `MEDIASUBTYPE_YUY2` + `VIDEOINFOHEADER`）。协商过程是 `IPin::Connect` → 对端 `ReceiveConnection` → 分配器协商（`IMemAllocator`），随后数据以 `IMediaSample` 为载体，由源过滤器调用下游的 `IPin::Receive`（准确说是 `IMemInputPin::Receive`）逐样本推送。
-- **状态机**：过滤器有 `Stopped / Paused / Running` 三态。对推源过滤器有一个关键细节：**Pause 时就要开始送预滚帧**，下游渲染器收到第一帧才能完成自己的 Pause，图才能进入 Run。我们的实现把推流线程启动放在 `Pause`，`Run` 只更新时间起点（`src/dshow/filter.rs:229-249`）。
+- **状态机**：过滤器有 `Stopped / Paused / Running` 三态。对推源过滤器有一个关键细节：**Pause 时就要开始送预滚帧**，下游渲染器收到第一帧才能完成自己的 Pause，图才能进入 Run。我们的实现把推流线程启动放在 `Pause`，`Run` 只更新时间起点（`crates/vdev-camera-win/src/dshow/filter.rs:229–249`）。
 - **时间戳**：每个 `IMediaSample` 用 `SetTime` 打上时间戳，且必须填**流时间**（相对 Run 起点、按帧间隔单调递增），渲染器拿它与参考时钟比较后按时呈现。时间戳填错时间域或干脆不打，下游会卡帧或黑屏。
 
 虚拟摄像头的本质因此非常朴素：**写一个"长得像摄像头"的 Source Filter**——实现 `IBaseFilter`（及继承链 `IMediaFilter`/`IPersist`）、一个输出 Pin（`IPin`），在 Pin 上声明自己会输出什么格式，然后周期性地往下游 `Receive` 样本。真正的画面数据则从进程外来。
@@ -55,7 +56,7 @@ pub struct OutputPin { pub inner: Arc<PinInner> }
 
 ### 3.2 类厂与 DLL 导出
 
-COM 组件由**类厂**（`IClassFactory`）创建。消费 App 调 `CoCreateInstance(CLSID)` 时，COM 运行时读注册表找到 DLL，`LoadLibrary` 后调用导出函数 `DllGetClassObject` 拿类厂，再 `CreateInstance` 出过滤器对象。四个标准导出在 `src/lib.rs:48-70`，全部只有一行转发：
+COM 组件由**类厂**（`IClassFactory`）创建。消费 App 调 `CoCreateInstance(CLSID)` 时，COM 运行时读注册表找到 DLL，`LoadLibrary` 后调用导出函数 `DllGetClassObject` 拿类厂，再 `CreateInstance` 出过滤器对象。四个标准导出在 `crates/vdev-camera-win/src/lib.rs:48–70`，全部只有一行转发：
 
 ```rust
 // crates/vdev-camera-win/src/lib.rs
@@ -66,17 +67,17 @@ pub extern "system" fn DllGetClassObject(
     com::dll::get_class_object(rclsid, riid, ppv)   // 校验 CLSID，返回 FilterClassFactory
 }
 // DllCanUnloadNow / DllRegisterServer / DllUnregisterServer 同型
-// 完整实现见 src/lib.rs:57-70 与 src/com/mod.rs:95-141
+// 完整实现见 crates/vdev-camera-win/src/lib.rs:57–70 与 crates/vdev-camera-win/src/com/mod.rs:95–141
 ```
 
-两个值得注意的工程决策：`DllCanUnloadNow` 恒返回 `S_FALSE`（拒绝卸载，避免 DLL 在使用中被拔掉，`src/com/mod.rs:119-121`）；所有线程入口（包括推流线程）都用一个 `ComInit` RAII 守卫初始化 COM，当宿主线程已经以别的模式初始化过（返回 `S_FALSE` 或 `RPC_E_CHANGED_MODE`）时**复用而不卸载**，避免破坏宿主的 COM 状态（`src/com/mod.rs:25-53`）——虚拟摄像头 DLL 是活在别人的进程里的，这类礼貌是必须的。
+两个值得注意的工程决策：`DllCanUnloadNow` 恒返回 `S_FALSE`（拒绝卸载，避免 DLL 在使用中被拔掉，`crates/vdev-camera-win/src/com/mod.rs:119–121`）；所有线程入口（包括推流线程）都用一个 `ComInit` RAII 守卫初始化 COM，当宿主线程已经以别的模式初始化过（返回 `S_FALSE` 或 `RPC_E_CHANGED_MODE`）时**复用而不卸载**，避免破坏宿主的 COM 状态（`crates/vdev-camera-win/src/com/mod.rs:25–53`）——虚拟摄像头 DLL 是活在别人的进程里的，这类礼貌是必须的。
 
 ### 3.3 自注册：DllRegisterServer 里到底注册了什么
 
-`register_filter()`（`src/camera.rs:46-62`）写三组注册表键：
+`register_filter()`（`crates/vdev-camera-win/src/camera.rs:46–62`）写三组注册表键：
 
 ```text
-HKCR\CLSID\{E4C01F0D-A9FC-4352-8590-F0E5AD2BFFCE}            # 过滤器 CLSID（filter.rs:27）
+HKCR\CLSID\{E4C01F0D-A9FC-4352-8590-F0E5AD2BFFCE}            # 过滤器 CLSID（crates/vdev-camera-win/src/dshow/filter.rs:27）
     默认值      = "vdev-camera"                              # 友好名
 HKCR\CLSID\{E4C01F0D-...}\InprocServer32
     默认值      = C:\...\vdev_camera_win.dll                  # 本 DLL 绝对路径
@@ -89,21 +90,21 @@ HKCR\CLSID\{860BB310-5D01-11D0-BD3B-00A0C911CE86}\Instance\{E4C01F0D-...}
 
 第二组是 COM 侧的"我是谁、代码在哪"；第三组才是"我是一个摄像头"——`{860BB310-...}` 是系统固定的 `CLSID_VideoInputDeviceCategory`（视频捕获源类别），设备枚举器 `ICreateDevEnum` 扫的就是这个类别下的 `Instance` 键。三个细节来自实战：
 
-- **`FriendlyName` 必须存在**，否则设备枚举器直接跳过此设备，而 `CoCreateInstance` 又能成功——极具迷惑性（`src/camera.rs:146-157` 注释）。
-- **`FilterData` 是 REGFILTER2 v2 的二进制布局**（`0pi3`/`0ty3` 签名的 pin/媒体类型记录 + 偏移引用的 GUID 存储），我们的 pin 声明为单个 YUY2 输出、`MERIT_DO_NOT_USE`（不参与自动建图，只能被显式选中——虚拟摄像头不该被 Graph 自动连到随便什么渲染器上）。序列化在 `serialize_filter_data()`（`src/camera.rs:174-207`），字节级对照了 Wine 的 `FM2_WriteFilterData` 与真实样例，并有布局回归测试。
-- **注册顺序是先 HKLM（系统级，需管理员）失败自动回退 HKCU（当前用户级）**，HKCR 是两者的合并视图，所以免管理员也能装（`src/camera.rs:106-124`）。
+- **`FriendlyName` 必须存在**，否则设备枚举器直接跳过此设备，而 `CoCreateInstance` 又能成功——极具迷惑性（`crates/vdev-camera-win/src/camera.rs:146–157` 注释）。
+- **`FilterData` 是 REGFILTER2 v2 的二进制布局**（`0pi3`/`0ty3` 签名的 pin/媒体类型记录 + 偏移引用的 GUID 存储），我们的 pin 声明为单个 YUY2 输出、`MERIT_DO_NOT_USE`（不参与自动建图，只能被显式选中——虚拟摄像头不该被 Graph 自动连到随便什么渲染器上）。序列化在 `serialize_filter_data()`（`crates/vdev-camera-win/src/camera.rs:174–207`），字节级对照了 Wine 的 `FM2_WriteFilterData` 与真实样例，并有布局回归测试。
+- **注册顺序是先 HKLM（系统级，需管理员）失败自动回退 HKCU（当前用户级）**，HKCR 是两者的合并视图，所以免管理员也能装（`crates/vdev-camera-win/src/camera.rs:106–124`）。
 
-另外，若同目录存在 32 位 DLL（`vdev_camera_win32.dll`），会同时注册 `Software\Classes\WOW6432Node` 视图——32 位进程（如 32 位 VLC）经 WOW64 重定向只能看到这个视图（`src/camera.rs:51-59`）。
+另外，若同目录存在 32 位 DLL（`vdev_camera_win32.dll`），会同时注册 `Software\Classes\WOW6432Node` 视图——32 位进程（如 32 位 VLC）经 WOW64 重定向只能看到这个视图（`crates/vdev-camera-win/src/camera.rs:51–59`）。
 
 ## 四、帧通道：从推流进程到 IMediaSample
 
-推流与取流是**两个独立进程**：你的推流程序（或 GUI 宿主）持有 `CameraServer`，而过滤器 DLL 被加载进消费 App 的进程。两者之间用三个命名内核对象通信（`src/com/shm.rs:32-36`）：
+推流与取流是**两个独立进程**：你的推流程序（或 GUI 宿主）持有 `CameraServer`，而过滤器 DLL 被加载进消费 App 的进程。两者之间用三个命名内核对象通信（`crates/vdev-camera-win/src/com/shm.rs:32–36`）：
 
 - `Local\vdev-camera-win-frames`：共享内存（文件映射），64 字节头 + 两个帧槽；
 - `Local\vdev-camera-win-frame-event`：自动重置事件，新帧信号；
 - `Local\vdev-camera-win-publish-lock`：命名互斥体，多生产者并发的发布锁。
 
-头部是一个 `#[repr(C)]` 结构，`seq` 与 `ready` 是跨进程原子（`src/com/shm.rs:48-58`）：
+头部是一个 `#[repr(C)]` 结构，`seq` 与 `ready` 是跨进程原子（`crates/vdev-camera-win/src/com/shm.rs:48–58`）：
 
 ```rust
 // crates/vdev-camera-win/src/com/shm.rs
@@ -120,9 +121,9 @@ struct Header {
 }
 ```
 
-**生产者** `publish()`（`src/com/shm.rs:177-252`）的顺序是：有界等待发布锁（500ms，正常持锁窗口是微秒级 memcpy）→ 读当前 `seq` 加一 → 把帧整块拷进**另一个槽**（`seq & 1` 双缓冲，写者写的永远是读者没在读的槽）→ 以 `Release` 顺序发布新 `seq`、置 `ready` → `SetEvent` 唤醒消费者 → `ReleaseMutex`。
+**生产者** `publish()`（`crates/vdev-camera-win/src/com/shm.rs:177–252`）的顺序是：有界等待发布锁（500ms，正常持锁窗口是微秒级 memcpy）→ 读当前 `seq` 加一 → 把帧整块拷进**另一个槽**（`seq & 1` 双缓冲，写者写的永远是读者没在读的槽）→ 以 `Release` 顺序发布新 `seq`、置 `ready` → `SetEvent` 唤醒消费者 → `ReleaseMutex`。
 
-**消费者** `latest()`（`src/com/shm.rs:268-297`）是一次标准的 **seqlock 读**：
+**消费者** `latest()`（`crates/vdev-camera-win/src/com/shm.rs:268–297`）是一次标准的 **seqlock 读**：
 
 ```rust
 // crates/vdev-camera-win/src/com/shm.rs（latest 读循环，精简）
@@ -140,11 +141,11 @@ for _ in 0..MAX_SEQLOCK_ATTEMPTS {          // 上限 8 轮，防活锁
 }
 ```
 
-防撕裂有两个关键点：一是**`seq_after` 必须在负载拷贝完成之后采样**——序号括弧要罩住"头部 + 负载"全部读取。若只在拷贝前采样，写方在拷贝期间连发两帧回到同一槽（奇偶相同，如 7→9）的撕裂像素会漏检并通过校验；二是拷贝长度在通过 `buf_len == w*h*4` 自洽校验之前不可信，必须按单槽容量截断，防崩溃残留的垃圾 `buf_len` 造成越界。这两条裁决被抽成了零 Windows 依赖的纯函数 `judge_seqlock_read`（`src/com/channel_logic.rs:86-107`），连同重读收敛、双发布回归等 9 个测试可以直接在任意平台 `rustc --test` 跑——**把无锁算法的"决策逻辑"与"系统调用"分离，是这类代码能被充分单测的关键**。
+防撕裂有两个关键点：一是**`seq_after` 必须在负载拷贝完成之后采样**——序号括弧要罩住"头部 + 负载"全部读取。若只在拷贝前采样，写方在拷贝期间连发两帧回到同一槽（奇偶相同，如 7→9）的撕裂像素会漏检并通过校验；二是拷贝长度在通过 `buf_len == w*h*4` 自洽校验之前不可信，必须按单槽容量截断，防崩溃残留的垃圾 `buf_len` 造成越界。这两条裁决被抽成了零 Windows 依赖的纯函数 `judge_seqlock_read`（`crates/vdev-camera-win/src/com/channel_logic.rs:86–107`），连同重读收敛、双发布回归等 9 个测试可以直接在任意平台 `rustc --test` 跑——**把无锁算法的"决策逻辑"与"系统调用"分离，是这类代码能被充分单测的关键**。
 
-**过滤器侧**的推流线程（`src/dshow/streaming.rs:62-166`）把通道数据变成 DirectShow 样本：`wait_frame` 等新帧（超时=一帧时长）→ `latest` 取帧，生产者分辨率与协商格式不一致时最近邻缩放，完全无帧则回退棋盘格测试图案（摄像头永远不能"没有画面"）→ BGRA 转 YUY2 → `allocator.GetBuffer` 取下游样本 → `GetPointer` 拿缓冲区、`copy_nonoverlapping` 填帧（这就是 FillBuffer）→ `SetTime` 打**流时间**戳、`SetSyncPoint(true)` → 下游 `IMemInputPin::Receive`。其中分配器协商镜像了 `CBaseOutputPin::DecideAllocator` 的协议：先试下游提供的分配器，`VFW_E_NO_ALLOCATOR`（ffmpeg 的 sink 就这样）或属性被拒时自建 `CLSID_MemoryAllocator` 并 `NotifyAllocator`（`src/dshow/pin.rs:527-549`）。
+**过滤器侧**的推流线程（`crates/vdev-camera-win/src/dshow/streaming.rs:62–166`）把通道数据变成 DirectShow 样本：`wait_frame` 等新帧（超时=一帧时长）→ `latest` 取帧，生产者分辨率与协商格式不一致时最近邻缩放，完全无帧则回退棋盘格测试图案（摄像头永远不能"没有画面"）→ BGRA 转 YUY2 → `allocator.GetBuffer` 取下游样本 → `GetPointer` 拿缓冲区、`copy_nonoverlapping` 填帧（这就是 FillBuffer）→ `SetTime` 打**流时间**戳、`SetSyncPoint(true)` → 下游 `IMemInputPin::Receive`。其中分配器协商镜像了 `CBaseOutputPin::DecideAllocator` 的协议：先试下游提供的分配器，`VFW_E_NO_ALLOCATOR`（ffmpeg 的 sink 就这样）或属性被拒时自建 `CLSID_MemoryAllocator` 并 `NotifyAllocator`（`crates/vdev-camera-win/src/dshow/pin.rs:527–549`）。
 
-顺带一提兼容性选型：输出子类型选 **YUY2 而非 RGB32**，因为 DirectShow 摄像头生态以 YUV 为主，VLC 3.0 无法从 RGB32 媒体类型提取 fourcc，直接报 unsupported format；`biHeight` 用**正数**（OBS/libdshowcapture 同款），负值会被 VLC 塞进 unsigned 字段溢出成黑屏（`src/dshow/media_type.rs:24,63-70`）。
+顺带一提兼容性选型：输出子类型选 **YUY2 而非 RGB32**，因为 DirectShow 摄像头生态以 YUV 为主，VLC 3.0 无法从 RGB32 媒体类型提取 fourcc，直接报 unsupported format；`biHeight` 用**正数**（OBS/libdshowcapture 同款），负值会被 VLC 塞进 unsigned 字段溢出成黑屏（`crates/vdev-camera-win/src/dshow/media_type.rs:24,63-70`）。
 
 ## 五、踩坑实录
 
@@ -154,7 +155,7 @@ for _ in 0..MAX_SEQLOCK_ATTEMPTS {          // 上限 8 轮，防活锁
 
 跨进程命名互斥体的等待只认 `WAIT_OBJECT_0` 是经典错误。原实现里推流方进程在持锁瞬间崩溃，内核会把互斥体标记为 abandoned，后续等待者的 `WaitForSingleObject` 返回 `WAIT_ABANDONED(0x80)`——**这个返回码的语义是"所有权已移交给本次等待"，等待者此刻已经拿到锁了**。把它当失败返回且不 `ReleaseMutex`，锁就永远滞留在死进程名下，之后所有生产者的推帧调用永久失败。
 
-正确姿势是按裸返回码分派（`src/com/channel_logic.rs:53-62`）：
+正确姿势是按裸返回码分派（`crates/vdev-camera-win/src/com/channel_logic.rs:53–62`）：
 
 ```rust
 // crates/vdev-camera-win/src/com/channel_logic.rs
@@ -169,17 +170,17 @@ pub fn judge_lock_wait(code: u32) -> LockWaitVerdict {
 }
 ```
 
-接管后的两条配套：一、既已获锁，正常路径末尾的 `ReleaseMutex` 照常执行（`src/com/shm.rs:250`）；二、锁保护的数据可能被崩溃写撕坏，读侧用上面的 seqlock 序号裁决兜底丢弃坏帧。同批还把 `INFINITE` 等待改成了 500ms 有界等待——正常持锁是微秒级，超时即持锁方异常，放弃本帧由下一帧自然重试，别让推流线程陪一个挂死的进程一起挂死。
+接管后的两条配套：一、既已获锁，正常路径末尾的 `ReleaseMutex` 照常执行（`crates/vdev-camera-win/src/com/shm.rs:250`）；二、锁保护的数据可能被崩溃写撕坏，读侧用上面的 seqlock 序号裁决兜底丢弃坏帧。同批还把 `INFINITE` 等待改成了 500ms 有界等待——正常持锁是微秒级，超时即持锁方异常，放弃本帧由下一帧自然重试，别让推流线程陪一个挂死的进程一起挂死。
 
 ### 坑 2：COM 对象的自引用环——引用计数永不归零的泄漏
 
 `#[implement]` 生成的 COM 对象在引用计数归零时才析构内部结构。原实现里 filter 和 pin 各自把"**自己的** COM 接口" `clone` 一份缓存在共享状态里（`self_base: Option<IBaseFilter>` 之类），而 `windows-core` 接口的 `clone` 是显式 `AddRef`——"对象 → 自己的接口"是天然的引用环，外部引用全部释放后计数仍停在 1，filter + pin 整套永不析构。对虚拟摄像头来说这意味着**每开一次摄像头泄漏一套对象**。
 
-解法是规范所有权：唯一持久的强引用放 owner（`FilterInner::pin_com` 持有 pin 的初始 `IPin`），所有"回指"——filter 看自己、pin 看自己、pin 看 owner——一律 `Interface::downgrade()` 存 `Weak`，用的时候 `upgrade`，失败即对象正在析构，返回错误或空指针而不是悬垂（`src/dshow/filter.rs:128-146`、`src/dshow/pin.rs:59-63,83-94`）。强引用链变成无环的 `F → FI → pin`，外部释放后整条链可回收。
+解法是规范所有权：唯一持久的强引用放 owner（`FilterInner::pin_com` 持有 pin 的初始 `IPin`），所有"回指"——filter 看自己、pin 看自己、pin 看 owner——一律 `Interface::downgrade()` 存 `Weak`，用的时候 `upgrade`，失败即对象正在析构，返回错误或空指针而不是悬垂（`crates/vdev-camera-win/src/dshow/filter.rs:128–146`、`crates/vdev-camera-win/src/dshow/pin.rs:59–63,83-94`）。强引用链变成无环的 `F → FI → pin`，外部释放后整条链可回收。
 
 ### 坑 3：Stop 的顺序——先 join 后 Decommit，反了会挂死
 
-停流要做的两件事：停推流线程（置 stop 标志 + `join`），以及对分配器 `Decommit`（与 Pause 时的 `Commit` 配对）。顺序是不可变更的不变量：**必须先等线程死，再 Decommit**。反过来的话，`Decommit` 返回后推流线程还活着，可能正好进入下一轮循环去 `GetBuffer` 访问已 decommit 的分配器。现实现的 `stop_streaming`（`src/dshow/filter.rs:309-329`）里 `t.stop()`（join 返回）在前、`Decommit` 在后，并有一段注释把推演写全。
+停流要做的两件事：停推流线程（置 stop 标志 + `join`），以及对分配器 `Decommit`（与 Pause 时的 `Commit` 配对）。顺序是不可变更的不变量：**必须先等线程死，再 Decommit**。反过来的话，`Decommit` 返回后推流线程还活着，可能正好进入下一轮循环去 `GetBuffer` 访问已 decommit 的分配器。现实现的 `stop_streaming`（`crates/vdev-camera-win/src/dshow/filter.rs:309–329`）里 `t.stop()`（join 返回）在前、`Decommit` 在后，并有一段注释把推演写全。
 
 这里有一个**有意接受的残余风险**，值得写驱动/过滤器的人体会：`GetBuffer` 在下游不还样本时可能无超时阻塞，join 因此可能等。之所以可以接受，是因为 DirectShow 全图 Stop 有顺序性——渲染器先停、样本释还，join 因而有界。你依赖的是框架的协议，而不是自己的运气。
 
@@ -187,7 +188,7 @@ pub fn judge_lock_wait(code: u32) -> LockWaitVerdict {
 
 自注册要往 `InprocServer32` 写 DLL 绝对路径。原实现用 `GetModuleFileNameW(None)` 推导——但 `None` 的语义是"**当前进程的 exe**"。`regsvr32` 下恰好碰对（调用约定使然），可同样的代码嵌进其他宿主（比如一个 64/32 双视图注册器进程），写进注册表的就是宿主 exe 的路径，之后 `CoCreateInstance` 加载的自然是垃圾。
 
-正解是以"模块内任意地址"反查所属模块：在本模块放一个静态符号作锚点，`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ..._UNCHANGED_REFCOUNT, 地址, &hmodule)` 取真句柄，再 `GetModuleFileNameW(Some(h))`（`src/com/registry.rs:125-154`）。`UNCHANGED_REFCOUNT` 表示只借句柄不配对 `FreeLibrary`。这个锚点在 regsvr32/LoadLibrary 宿主下解析为 DLL 自身，在 CLI（rlib 进 exe）下解析为 exe——两种宿主一套代码。
+正解是以"模块内任意地址"反查所属模块：在本模块放一个静态符号作锚点，`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ..._UNCHANGED_REFCOUNT, 地址, &hmodule)` 取真句柄，再 `GetModuleFileNameW(Some(h))`（`crates/vdev-camera-win/src/com/registry.rs:125–154`）。`UNCHANGED_REFCOUNT` 表示只借句柄不配对 `FreeLibrary`。这个锚点在 regsvr32/LoadLibrary 宿主下解析为 DLL 自身，在 CLI（rlib 进 exe）下解析为 exe——两种宿主一套代码。
 
 ## 六、构建、安装与运行
 
@@ -217,7 +218,7 @@ ffmpeg -f dshow -i "video=vdev-camera" -c:v libx264 -f mp4 out.mp4
 .\target\release\vdev-camera-win.exe uninstall
 ```
 
-`install` 走的是程序内自注册（CLI 直接调 `register_filter()`）。等价地，也可以用系统标准方式触发 DLL 的 `DllRegisterServer` 导出——两者最终执行同一段注册代码（`src/com/mod.rs:123-131` → `camera.rs`）：
+`install` 走的是程序内自注册（CLI 直接调 `register_filter()`）。等价地，也可以用系统标准方式触发 DLL 的 `DllRegisterServer` 导出——两者最终执行同一段注册代码（`crates/vdev-camera-win/src/com/mod.rs:123–131` → `camera.rs`）：
 
 ```powershell
 regsvr32 .\target\release\vdev_camera_win.dll      # 注册（无管理员权限时同样回退 HKCU）

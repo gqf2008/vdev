@@ -1,6 +1,7 @@
 # 用 Rust 写 Windows 内核虚拟键鼠：KMDF HID minidriver 从报告描述符到注入链路
 
 > 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
+> 代码引用约定：本文所有 `文件:行号` 均相对**仓库根**（如 `crates/.../foo.rs:12`），行号为写作时基线；代码演进后行号会漂移，按符号名搜索为准。
 
 ## 1. 为什么要"软件造一套键盘鼠标"
 
@@ -38,7 +39,7 @@ pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
 ];
 ```
 
-这个 8 字节的 Output 字段声明了一个输出管道：用户态对 HID 接口 `WriteFile` 的数据会沿它抵达驱动（`IOCTL_HID_WRITE_REPORT`）。驱动把它**当作输入报告**投递回 hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（67 字节，`contract.rs:118`）同理带一条 4 字节输出管道。
+这个 8 字节的 Output 字段声明了一个输出管道：用户态对 HID 接口 `WriteFile` 的数据会沿它抵达驱动（`IOCTL_HID_WRITE_REPORT`）。驱动把它**当作输入报告**投递回 hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（67 字节，`crates/vdev-hid-win/kernel/driver/src/contract.rs:118`）同理带一条 4 字节输出管道。
 
 还有一个值得注意的细节：按键码数组的 Usage/Logical Maximum 写到 `0x73`（115）而不是常见的 `0x65`（101），因为 F13–F24 的 usage 落在 0x68–0x73，上限给低了这些键会被 hidclass 静默丢弃——这是审查阶段抓出来的真实 bug（见第 6 节）。
 
@@ -69,15 +70,15 @@ AddService = vdev_hid, 0x00000000, vdev_hid_Service_Inst
 AddFilter=vdev_hid,,vdev_hid_Filter_Install
 ```
 
-驱动侧与之呼应，`evt_device_add` 里先调 `WdfFdoInitSetFilter` 声明过滤器身份（`kernel/driver/src/lib.rs:312`），随后建两条队列：**默认并行队列**接 hidclass 发来的 `IOCTL_HID_*`（回调 `evt_io_internal_device_control`），**manual 队列**挂起暂无数据可交的读请求（`lib.rs:329–379`）。
+驱动侧与之呼应，`evt_device_add` 里先调 `WdfFdoInitSetFilter` 声明过滤器身份（`crates/vdev-hid-win/kernel/driver/src/lib.rs:312`），随后建两条队列：**默认并行队列**接 hidclass 发来的 `IOCTL_HID_*`（回调 `evt_io_internal_device_control`），**manual 队列**挂起暂无数据可交的读请求（`crates/vdev-hid-win/kernel/driver/src/lib.rs:329–379`）。
 
-一个驱动服务两套设备：INF 写了两条模型行 `Root\vdev-hid`（键盘）与 `Root\vdev-hid-mouse`（鼠标），安装时经注册表硬件键写入 `Role` 值（0=键盘，1=鼠标），驱动在设备添加时读回（`read_role`，`lib.rs:266`），按角色选择各自的 HID 描述符、报告描述符与报告长度。VID/PID 也由角色决定：`VID=0x5644`（"VD"），键盘 `PID=0x4849`（"HI"），鼠标 `PID=0x484D`（"HM"）（`lib.rs:24–26`）。
+一个驱动服务两套设备：INF 写了两条模型行 `Root\vdev-hid`（键盘）与 `Root\vdev-hid-mouse`（鼠标），安装时经注册表硬件键写入 `Role` 值（0=键盘，1=鼠标），驱动在设备添加时读回（`read_role`，`crates/vdev-hid-win/kernel/driver/src/lib.rs:266`），按角色选择各自的 HID 描述符、报告描述符与报告长度。VID/PID 也由角色决定：`VID=0x5644`（"VD"），键盘 `PID=0x4849`（"HI"），鼠标 `PID=0x484D`（"HM"）（`crates/vdev-hid-win/kernel/driver/src/lib.rs:24–26`）。
 
-全局状态用一把 **WDF 框架自旋锁**保护：两个实例（各自的队列句柄、最近一次注入的 8 字节报告、`report_ready` 标志）都在锁内访问。`StateCell` 用 `UnsafeCell` + 手写 `unsafe impl Sync` 承载，RAII 守卫在 `Drop` 里 `WdfSpinLockRelease`（`lib.rs:149–242`）——为什么不用手工 `KSPIN_LOCK`，踩坑第 ⑤ 条有交代。
+全局状态用一把 **WDF 框架自旋锁**保护：两个实例（各自的队列句柄、最近一次注入的 8 字节报告、`report_ready` 标志）都在锁内访问。`StateCell` 用 `UnsafeCell` + 手写 `unsafe impl Sync` 承载，RAII 守卫在 `Drop` 里 `WdfSpinLockRelease`（`crates/vdev-hid-win/kernel/driver/src/lib.rs:149–242`）——为什么不用手工 `KSPIN_LOCK`，踩坑第 ⑤ 条有交代。
 
 ## 4. IOCTL 处理：HID 内部契约全家福
 
-minidriver 的全部工作就是一个 `match`。hidclass 与 minidriver 之间的 IOCTL 定义在 `hidport.h` 与 `hidclass.h`，都是 `CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, 功能码, Method, FILE_ANY_ACCESS)` 的展开。vdev 把这组常量放在 windows-free 的 `contract.rs` 里，宏展开对应关系如下（数值可在宿主机单测中断言，`contract.rs:163–197`）：
+minidriver 的全部工作就是一个 `match`。hidclass 与 minidriver 之间的 IOCTL 定义在 `hidport.h` 与 `hidclass.h`，都是 `CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, 功能码, Method, FILE_ANY_ACCESS)` 的展开。vdev 把这组常量放在 windows-free 的 `contract.rs` 里，宏展开对应关系如下（数值可在宿主机单测中断言，`crates/vdev-hid-win/kernel/driver/src/contract.rs:163–197`）：
 
 | IOCTL | 功能码 / Method | 值 | 用途 |
 |---|---|---|---|
@@ -94,7 +95,7 @@ minidriver 的全部工作就是一个 `match`。hidclass 与 minidriver 之间�
 
 （hidport.h 里另有功能码 7=ACTIVATE/8=DEACTIVATE/10=IDLE，本驱动未处理，落默认臂返回 `STATUS_INVALID_DEVICE_REQUEST`。）
 
-分发主干只有一屏（`kernel/driver/src/lib.rs:426–473`）：
+分发主干只有一屏（`crates/vdev-hid-win/kernel/driver/src/lib.rs:426–473`）：
 
 ```rust
 // crates/vdev-hid-win/kernel/driver/src/lib.rs（节选）
@@ -120,7 +121,7 @@ unsafe fn dispatch_ioctl(...) -> DispatchResult {
 
 ### HID_XFER_PACKET 要从 `Irp->UserBuffer` 取（WDM 逃逸）
 
-写报告类请求携带的不是裸缓冲，而是一个 `HID_XFER_PACKET` 结构（`hidclass.h`：`reportBuffer` 指针 + `reportBufferLen` + `reportId`，`hid.rs:70–74`）。vhidmini2 的 util.c 有一句关键注释：hidclass 把**包结构体的指针放在 `Irp->UserBuffer`**，KMDF 的 `WdfRequestRetrieveInputMemory`/`OutputMemory` 对这类请求取到的是别的东西——必须经 WDM 逃逸，先拿 IRP 再读 `UserBuffer`：
+写报告类请求携带的不是裸缓冲，而是一个 `HID_XFER_PACKET` 结构（`hidclass.h`：`reportBuffer` 指针 + `reportBufferLen` + `reportId`，`crates/vdev-hid-win/kernel/driver/src/hid.rs:70–74`）。vhidmini2 的 util.c 有一句关键注释：hidclass 把**包结构体的指针放在 `Irp->UserBuffer`**，KMDF 的 `WdfRequestRetrieveInputMemory`/`OutputMemory` 对这类请求取到的是别的东西——必须经 WDM 逃逸，先拿 IRP 再读 `UserBuffer`：
 
 ```rust
 // crates/vdev-hid-win/kernel/driver/src/lib.rs
@@ -142,15 +143,15 @@ unsafe fn retrieve_packet(
 }
 ```
 
-取到包后再校验 `reportBuffer` 非空、长度不小于本角色报告长度，把报告字节拷进状态并调用 `inject_report`（`lib.rs:545–573`）。这短短十几行是整个移植里最容易写错、错了还会蓝屏的地方（踩坑第 ③ 条）。
+取到包后再校验 `reportBuffer` 非空、长度不小于本角色报告长度，把报告字节拷进状态并调用 `inject_report`（`crates/vdev-hid-win/kernel/driver/src/lib.rs:545–573`）。这短短十几行是整个移植里最容易写错、错了还会蓝屏的地方（踩坑第 ③ 条）。
 
 ## 5. 注入链路：从一条 CLI 命令到系统收键
 
 以 `vdev-hid-win kernel key a` 为例，整条链路是：
 
-1. **纯逻辑层**（windows-free，macOS 也能跑单测）：`key_to_hid("a")` 把键名映射为 usage `0x04`（`src/report.rs:30`），`make_report` 组装 8 字节报告 `[0,0,0x04,0,0,0,0,0]`（修饰键、保留、键码三段布局，`report.rs:139`）；
-2. **找设备**：`HidD_GetHidGuid` 拿 HID 接口类 → `SetupDiEnumDeviceInterfaces` 枚举全部 HID 接口 → 逐个打开并 `HidD_GetAttributes` 核对 VID/PID，命中 `0x5644/0x4849` 即键盘（`src/kernel.rs:368–465`）；
-3. **写入**：`CreateFileW` 打开接口后直接 `WriteFile` 8 字节（`kernel.rs:468–493`）：
+1. **纯逻辑层**（windows-free，macOS 也能跑单测）：`key_to_hid("a")` 把键名映射为 usage `0x04`（`crates/vdev-hid-win/src/report.rs:30`），`make_report` 组装 8 字节报告 `[0,0,0x04,0,0,0,0,0]`（修饰键、保留、键码三段布局，`crates/vdev-hid-win/src/report.rs:139`）；
+2. **找设备**：`HidD_GetHidGuid` 拿 HID 接口类 → `SetupDiEnumDeviceInterfaces` 枚举全部 HID 接口 → 逐个打开并 `HidD_GetAttributes` 核对 VID/PID，命中 `0x5644/0x4849` 即键盘（`crates/vdev-hid-win/src/kernel.rs:368–465`）；
+3. **写入**：`CreateFileW` 打开接口后直接 `WriteFile` 8 字节（`crates/vdev-hid-win/src/kernel.rs:468–493`）：
 
 ```rust
 // crates/vdev-hid-win/src/kernel.rs（节选）
@@ -164,10 +165,10 @@ let ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) };
 ```
 
 4. **内核侧**：WriteFile 到 HID 接口 → hidclass 组 `IOCTL_HID_WRITE_REPORT` + `HID_XFER_PACKET` → 默认队列回调 → `handle_inject` 经 WDM 逃逸取包 → `inject_report` 把报告写入实例状态；
-5. **交付**：`inject_report` 尝试从 manual 队列取一个挂起的 `READ_REPORT` 请求，有则立刻用报告完成它（`lib.rs:615–641`）；没有就置 `report_ready`，等 hidclass 的下一次读请求到来时立即投递（`handle_read_report`，`lib.rs:479–539`）。hidclass 对一个设备同时只挂一个读，所以 manual 队列至多一个请求；转发请求与注入到达之间存在一小段竞态窗口，代码在 `WdfRequestForwardToIoQueue` 之后再检查一次 `report_ready`，把可能"刚进门"的注入取回并自行完成，避免报告永久滞留（`lib.rs:499–538`）；
+5. **交付**：`inject_report` 尝试从 manual 队列取一个挂起的 `READ_REPORT` 请求，有则立刻用报告完成它（`crates/vdev-hid-win/kernel/driver/src/lib.rs:615–641`）；没有就置 `report_ready`，等 hidclass 的下一次读请求到来时立即投递（`handle_read_report`，`crates/vdev-hid-win/kernel/driver/src/lib.rs:479–539`）。hidclass 对一个设备同时只挂一个读，所以 manual 队列至多一个请求；转发请求与注入到达之间存在一小段竞态窗口，代码在 `WdfRequestForwardToIoQueue` 之后再检查一次 `report_ready`，把可能"刚进门"的注入取回并自行完成，避免报告永久滞留（`crates/vdev-hid-win/kernel/driver/src/lib.rs:499–538`）；
 6. **系统消费**：完成的读请求沿 hidclass 上行，报告被翻译成普通键盘事件进 Win32 输入栈——与插上一个真实键盘无异。
 
-`HidD_GetInputReport`（`IOCTL_HID_GET_INPUT_REPORT`）走同一条路的反向：把实例里缓存的最近报告拷回调用方缓冲（`lib.rs:579–612`），可用于自检"驱动眼里当前按键状态"。
+`HidD_GetInputReport`（`IOCTL_HID_GET_INPUT_REPORT`）走同一条路的反向：把实例里缓存的最近报告拷回调用方缓冲（`crates/vdev-hid-win/kernel/driver/src/lib.rs:579–612`），可用于自检"驱动眼里当前按键状态"。
 
 ## 6. 踩坑实录：编译器看不见的三重契约
 
@@ -203,7 +204,7 @@ packed 结构体在 Rust 里禁止取字段引用，所以字段一律按值读�
 
 ### 坑 ④：数字键 usage 错位一位
 
-`'1'..'9'` 的 Key Codes usage 是 `0x1E..0x26`，`'0'` 是 `0x27`——不是连续的 `0x1E + (c - '0')`。初版恰是后者：按 `0` 出来的是 `1`，`1`–`9` 整体偏移 +1，而且被一个"把错误当期望值"的单测固化了。修复与回归（`src/report.rs:47–56`）：
+`'1'..'9'` 的 Key Codes usage 是 `0x1E..0x26`，`'0'` 是 `0x27`——不是连续的 `0x1E + (c - '0')`。初版恰是后者：按 `0` 出来的是 `1`，`1`–`9` 整体偏移 +1，而且被一个"把错误当期望值"的单测固化了。修复与回归（`crates/vdev-hid-win/src/report.rs:47–56`）：
 
 ```rust
 // 数字行：'1'..'9' → 0x1E..0x26；'0' 特判为 0x27
@@ -214,11 +215,11 @@ let usage = if c == '0' { 0x27 } else { 0x1E + (c as u8 - b'1') };
 
 ### 坑 ⑤：自制自旋锁在 DISPATCH_LEVEL 的同 CPU 死锁窗口
 
-初版用手工 `KSPIN_LOCK` 保护全局状态。自旋锁不可重入：任何"持锁状态下再次获取同一把锁"的路径，在单 CPU 上就是永久自旋；而这类驱动的回调本就可运行在 DISPATCH_LEVEL，手工管理 IRQL 提升/恢复（OldIrql 的保存与跨分支还原）又平添出错面。审查发现的正是这样的死锁窗口，修复改用 **WdfSpinLock**：IRQL 提升与恢复由框架接管，并把临界区收窄到"纯内存读写 + `WdfIoQueueRetrieveNextRequest`"（后者在 DISPATCH_LEVEL 调用合法），锁本身在 `DriverEntry` 单线程阶段创建、之后只读（`lib.rs:179–214` 的 SAFETY 注释完整记录了这条推理）。
+初版用手工 `KSPIN_LOCK` 保护全局状态。自旋锁不可重入：任何"持锁状态下再次获取同一把锁"的路径，在单 CPU 上就是永久自旋；而这类驱动的回调本就可运行在 DISPATCH_LEVEL，手工管理 IRQL 提升/恢复（OldIrql 的保存与跨分支还原）又平添出错面。审查发现的正是这样的死锁窗口，修复改用 **WdfSpinLock**：IRQL 提升与恢复由框架接管，并把临界区收窄到"纯内存读写 + `WdfIoQueueRetrieveNextRequest`"（后者在 DISPATCH_LEVEL 调用合法），锁本身在 `DriverEntry` 单线程阶段创建、之后只读（`crates/vdev-hid-win/kernel/driver/src/lib.rs:179–214` 的 SAFETY 注释完整记录了这条推理）。
 
 ### 坑 ⑥：IOCTL 常量"编个号就行"？功能码与 Method 位都要溯源
 
-初版自造了一套功能码（ATTRIBUTES=4、STRING=5、FEATURE=6……），而真实 hidport.h 二十多年未变的编号是 0/1/2/3/4/7/8/9/10（5/6 保留）——4/5 恰好互换，6–9 段根本不存在，`GET_DEVICE_ATTRIBUTES` 落进默认死臂导致 `HidD_GetAttributes` 必失败；feature/报表类 IOCTL 则定义在另一个头文件 hidclass.h（`HID_IN/OUT_CTL_CODE`，功能码与用户态 `HidD_*` 同号），Method 位是 IN/OUT_DIRECT 而非 NEITHER，初版注释还把 `METHOD_IN_DIRECT=1` 写成了 0。更隐蔽的是，连审查意见给的"正确值"也得再溯源一次（曾有意见把自造的功能码 7 当权威，算出的 0xB001D 实为 ACTIVATE_DEVICE）。最终这组常量以三方对照（2003 DDK 头文件 + 现行 WDK + vhidmini2 源码）校直，并写进宿主可跑的单测：每个 IOCTL 断言 `CTL_CODE(...)` 等式与字面值（`contract.rs:163–197`）。
+初版自造了一套功能码（ATTRIBUTES=4、STRING=5、FEATURE=6……），而真实 hidport.h 二十多年未变的编号是 0/1/2/3/4/7/8/9/10（5/6 保留）——4/5 恰好互换，6–9 段根本不存在，`GET_DEVICE_ATTRIBUTES` 落进默认死臂导致 `HidD_GetAttributes` 必失败；feature/报表类 IOCTL 则定义在另一个头文件 hidclass.h（`HID_IN/OUT_CTL_CODE`，功能码与用户态 `HidD_*` 同号），Method 位是 IN/OUT_DIRECT 而非 NEITHER，初版注释还把 `METHOD_IN_DIRECT=1` 写成了 0。更隐蔽的是，连审查意见给的"正确值"也得再溯源一次（曾有意见把自造的功能码 7 当权威，算出的 0xB001D 实为 ACTIVATE_DEVICE）。最终这组常量以三方对照（2003 DDK 头文件 + 现行 WDK + vhidmini2 源码）校直，并写进宿主可跑的单测：每个 IOCTL 断言 `CTL_CODE(...)` 等式与字面值（`crates/vdev-hid-win/kernel/driver/src/contract.rs:163–197`）。
 
 ## 7. 构建与安装
 
@@ -242,13 +243,13 @@ vdev-hid-win kernel mouse wheel 120 # 滚轮向上
 vdev-hid-win kernel uninstall
 ```
 
-安装过程（`src/kernel.rs` 的 `install`）用纯 SetupAPI 完成：清理残留节点 → `SetupDiGetINFClassW` 取设备类 → 依次创建键盘、鼠标两个根枚举节点并 `DIF_REGISTERDEVICE` → `DiInstallDriverW` 装入驱动存储。曾有一个配套 bug：初版只建键盘节点，INF 里的鼠标安装节永远匹配不上，鼠标设备"从不存在"；HWID 匹配也必须逐段精确比较——`Root\vdev-hid` 是 `Root\vdev-hid-mouse` 的前缀，子串匹配会把鼠标误配成键盘（`report.rs:177` 的 `hwid_matches` 有完整注释与回归）。
+安装过程（`src/kernel.rs` 的 `install`）用纯 SetupAPI 完成：清理残留节点 → `SetupDiGetINFClassW` 取设备类 → 依次创建键盘、鼠标两个根枚举节点并 `DIF_REGISTERDEVICE` → `DiInstallDriverW` 装入驱动存储。曾有一个配套 bug：初版只建键盘节点，INF 里的鼠标安装节永远匹配不上，鼠标设备"从不存在"；HWID 匹配也必须逐段精确比较——`Root\vdev-hid` 是 `Root\vdev-hid-mouse` 的前缀，子串匹配会把鼠标误配成键盘（`crates/vdev-hid-win/src/report.rs:177` 的 `hwid_matches` 有完整注释与回归）。
 
 ## 8. 现状与局限
 
 - **状态**：构建、clippy、fmt 全绿；IOCTL 常量/描述符字节/键码映射/报告布局有 15 个宿主单测守护（契约层 windows-free，macOS 上即可运行）。真机安装验证进行中——当前需要测试签名，属"构建与自测通过、装机验证未完成"的如实状态。
 - **功能边界**：无 feature 报告（`GET/SET_FEATURE` 返回 `STATUS_NOT_SUPPORTED` 而非伪成功）；不实现 HID 字符串（由 INF/devnode 提供）；键盘一次至多 6 键 + 8 修饰位；鼠标只有相对移动（±127）与滚轮（120 的倍数、实际写入 ±127），无绝对坐标模式。
-- **工程取舍**：panic 处理器直接 `KeBugCheckEx(0xE2)` 留蓝屏证据而不是自旋挂死（内核 no_std 无法 unwind，`lib.rs:751–766`）；`HID_DESCRIPTOR` 的 packed 布局断言只能在 Windows 侧编译验证（wdk-build 拒绝非 Windows 主机），契约层则拆出 `contract.rs`/`report.rs` 两个 windows-free 模块让宿主单测真正触达——用户态与内核经 `#[path]` 共享同一份契约定义，单一事实来源（`src/report.rs:13`）。
+- **工程取舍**：panic 处理器直接 `KeBugCheckEx(0xE2)` 留蓝屏证据而不是自旋挂死（内核 no_std 无法 unwind，`crates/vdev-hid-win/kernel/driver/src/lib.rs:751–766`）；`HID_DESCRIPTOR` 的 packed 布局断言只能在 Windows 侧编译验证（wdk-build 拒绝非 Windows 主机），契约层则拆出 `contract.rs`/`report.rs` 两个 windows-free 模块让宿主单测真正触达——用户态与内核经 `#[path]` 共享同一份契约定义，单一事实来源（`crates/vdev-hid-win/src/report.rs:13`）。
 
 ## 9. 写在最后：minidriver 的"三重契约"
 

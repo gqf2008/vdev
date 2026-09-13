@@ -3,6 +3,7 @@
 # 在 macOS 上造一块"假显示器"：CGVirtualDisplay 私有 API 的 Rust 封装实录
 
 > 对应仓库：[`crates/vdev-screen`](https://github.com/gqf2008/vdev/tree/main/crates/vdev-screen)（约 400 行）。文中所有代码片段与 file:line 均来自 main 分支当前状态（commit `2385ebe`），所有命令与根 README 逐字一致。
+> 代码引用约定：本文所有 `文件:行号` 均相对**仓库根**（如 `crates/.../foo.rs:12`），行号为写作时基线；代码演进后行号会漂移，按符号名搜索为准。
 
 ## 一、引言：为什么想造一块假显示器
 
@@ -91,19 +92,19 @@ pub fn create(opts: CreateOptions) -> Result<VirtualDisplay> {
 }
 ```
 
-RAII 的关键在 `VirtualDisplay` 的字段设计（`lib.rs:49`）：**四个 `Retained` 全部保存在结构体里，而不是只留 display 本体**。Drop 时按声明序逆序释放：先释放 display（触发 WindowServer 拆屏），再释放 settings、descriptor、mode——与创建顺序严格互逆。如果只保存 display 而让中间对象提前析构，等于把生命周期赌在 CG 内部是否持有拷贝上，没必要冒这个险。
+RAII 的关键在 `VirtualDisplay` 的字段设计（`crates/vdev-screen/src/lib.rs:49`）：**四个 `Retained` 全部保存在结构体里，而不是只留 display 本体**。Drop 时按声明序逆序释放：先释放 display（触发 WindowServer 拆屏），再释放 settings、descriptor、mode——与创建顺序严格互逆。如果只保存 display 而让中间对象提前析构，等于把生命周期赌在 CG 内部是否持有拷贝上，没必要冒这个险。
 
-`create` 的默认参数也值得抄走（`lib.rs:30`）：1920×1080@60，vendor `0x05AC`（Apple）、product `0x1111`、物理尺寸 597×336 mm、maxPixels 3840×2160。物理尺寸不是摆设——系统用它推算 DPI，尺寸瞎填会得到诡异的缩放行为。
+`create` 的默认参数也值得抄走（`crates/vdev-screen/src/lib.rs:30`）：1920×1080@60，vendor `0x05AC`（Apple）、product `0x1111`、物理尺寸 597×336 mm、maxPixels 3840×2160。物理尺寸不是摆设——系统用它推算 DPI，尺寸瞎填会得到诡异的缩放行为。
 
 ## 四、关键实现解析
 
 ### 4.1 描述符：身份 + 色域
 
-`create_descriptor` 除了逐项填入 `DescriptorOptions` 的八个字段，还硬编码了 Display P3 色域主色（`private.rs:102`）——红 `(0.680, 0.320)`、绿 `(0.265, 0.690)`、蓝 `(0.150, 0.060)`、白点 `(0.3127, 0.3290)`，与大多数现代 Mac 显示器一致。不填色域某些版本也能工作，但填了可以让"显示器 EDID 信息"看起来像一块正经的 Apple 屏。
+`create_descriptor` 除了逐项填入 `DescriptorOptions` 的八个字段，还硬编码了 Display P3 色域主色（`crates/vdev-screen/src/private.rs:102`）——红 `(0.680, 0.320)`、绿 `(0.265, 0.690)`、蓝 `(0.150, 0.060)`、白点 `(0.3127, 0.3290)`，与大多数现代 Mac 显示器一致。不填色域某些版本也能工作，但填了可以让"显示器 EDID 信息"看起来像一块正经的 Apple 屏。
 
 ### 4.2 模式设置与 HiDPI
 
-`create_settings` 把 mode 装进 `NSArray` 后 `setModes:`，然后 `setHiDPI: 1u32`（`private.rs:139`）。HiDPI 开启后，系统会在 1920×1080 的模式上呈现"Retina 逻辑分辨率"，窗口渲染按 2x 走，采集到的帧更细腻。对推流场景，这就是"虚拟屏出 1080p 高清画面"的开关。
+`create_settings` 把 mode 装进 `NSArray` 后 `setModes:`，然后 `setHiDPI: 1u32`（`crates/vdev-screen/src/private.rs:139`）。HiDPI 开启后，系统会在 1920×1080 的模式上呈现"Retina 逻辑分辨率"，窗口渲染按 2x 走，采集到的帧更细腻。对推流场景，这就是"虚拟屏出 1080p 高清画面"的开关。
 
 ### 4.3 应用设置与拿 ID
 
@@ -140,7 +141,7 @@ pub fn mirror(source: u32, target: u32) -> Result<()> {
 }
 ```
 
-begin/configure/complete 三段式，其中每个 `CGConfigure*` 都返回 `CGError`，**必须逐个检查后才允许 complete**——否则残缺配置会被整体应用出去（`ffi.rs:91` 的注释就是这个教训）。
+begin/configure/complete 三段式，其中每个 `CGConfigure*` 都返回 `CGError`，**必须逐个检查后才允许 complete**——否则残缺配置会被整体应用出去（`crates/vdev-screen/src/ffi.rs:91` 的注释就是这个教训）。
 
 ### 4.5 与采集 API 配合：虚拟屏作为推流源
 
@@ -159,15 +160,15 @@ begin/configure/complete 三段式，其中每个 `CGConfigure*` 都返回 `CGEr
 
 审查发现三类"恰好能跑"的宽度错误：
 
-1. `initWithWidth:height:refreshRate:` 的 width/height 真实类型是 `NSUInteger`（64 位）。DeskPad 的私有头 dump 是证据来源。传 `u32` 时 x86_64/arm64 的调用约定恰好零扩展高位，于是"一直没炸"——直到有人按规范把参数当 32 位读取。修法就是代码里的 `u64::from(width)`（`private.rs:30` 的注释完整记录了推理）；
+1. `initWithWidth:height:refreshRate:` 的 width/height 真实类型是 `NSUInteger`（64 位）。DeskPad 的私有头 dump 是证据来源。传 `u32` 时 x86_64/arm64 的调用约定恰好零扩展高位，于是"一直没炸"——直到有人按规范把参数当 32 位读取。修法就是代码里的 `u64::from(width)`（`crates/vdev-screen/src/private.rs:30` 的注释完整记录了推理）；
 2. `setHiDPI:` 的类型编码是 `I`（unsigned int），**不是 `BOOL`**。go-macos/virtualdisplay 项目实测编码为 `"v20@0:8I16"`——凭"布尔开关传 bool"的直觉反而错，`1u32` 才是对的；
-3. `CGDisplayIsBuiltin` 等函数的返回值 `boolean_t` 在 MacTypes.h 里是 **4 字节 int**，FFI 声明曾误写为 `u8`，仅因小端读低位恰好可用（`ffi.rs:11` 注释）。
+3. `CGDisplayIsBuiltin` 等函数的返回值 `boolean_t` 在 MacTypes.h 里是 **4 字节 int**，FFI 声明曾误写为 `u8`，仅因小端读低位恰好可用（`crates/vdev-screen/src/ffi.rs:11` 注释）。
 
 教训浓缩成一句：**手写私有 API 绑定时，逐参数对照运行时类型编码或多份独立 dump 交叉验证，宽度一律按声明传，绝不靠"实践中恰好没炸"兜底**。
 
 ### 坑 2：`setRotation:` 这个 selector 可能不存在
 
-`setRotation:` 不在 DeskPad 私有头 dump 的 `CGVirtualDisplaySettings` 属性列表里，多个 dump 之间互相互斥；实参类型也没有权威出处。致命的是 ObjC 的语义：**无条件向不存在 selector 发消息会抛 `NSInvalidArgumentException`，进程直接 abort**——不是返回错误，是崩溃。修法是先探测再调用（`private.rs:148`）：
+`setRotation:` 不在 DeskPad 私有头 dump 的 `CGVirtualDisplaySettings` 属性列表里，多个 dump 之间互相互斥；实参类型也没有权威出处。致命的是 ObjC 的语义：**无条件向不存在 selector 发消息会抛 `NSInvalidArgumentException`，进程直接 abort**——不是返回错误，是崩溃。修法是先探测再调用（`crates/vdev-screen/src/private.rs:148`）：
 
 ```rust
 let has_rotation: bool =
@@ -181,7 +182,7 @@ macOS 26.5 实测探测为真、调用可用。对私有 API，任何"不确定�
 
 ### 坑 3：静态画面的 CGDisplayStream 几乎不回调
 
-虚拟屏推流后画面静止（比如停在一张幻灯片上），下游虚拟摄像头开始出彩条。第一版修复在 CGDisplayStream 回调里等 `kCGDisplayStreamFrameStatusIdle` 再重发最后一帧——实测 macOS 26 上**画面完全静止后连 IDLE 都几乎不回调**（静态虚拟屏 145 秒只收到 20 帧），“回调驱动保活”整体失效。最终方案是独立保活线程：每 200ms 检查最后发送时间，超过 500ms 无新帧就重发最后一帧（带新时间戳），实测静态虚拟屏稳定 2fps 出帧（`screen.rs:108`，修复记录在 README:107）。
+虚拟屏推流后画面静止（比如停在一张幻灯片上），下游虚拟摄像头开始出彩条。第一版修复在 CGDisplayStream 回调里等 `kCGDisplayStreamFrameStatusIdle` 再重发最后一帧——实测 macOS 26 上**画面完全静止后连 IDLE 都几乎不回调**（静态虚拟屏 145 秒只收到 20 帧），“回调驱动保活”整体失效。最终方案是独立保活线程：每 200ms 检查最后发送时间，超过 500ms 无新帧就重发最后一帧（带新时间戳），实测静态虚拟屏稳定 2fps 出帧（`crates/vdev-app/src/screen.rs:108`，修复记录在 README:107）。
 
 ### 坑 4：第二块虚拟屏的不确定性，与一个槽位泄漏
 

@@ -1,6 +1,7 @@
 # 用 Rust 写 macOS 虚拟键盘/鼠标：CGEventPost 注入与 EventTap 监听
 
 > 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
+> 代码引用约定：本文所有 `文件:行号` 均相对**仓库根**（如 `crates/.../foo.rs:12`），行号为写作时基线；代码演进后行号会漂移，按符号名搜索为准。
 
 ## 一、为什么要"软件注入"键鼠
 
@@ -63,7 +64,7 @@ vdev 提供一张"键名 → 键码"表。字母与控制键复用 `cgevents::Ke
 "f12" => 0x6F,
 ```
 
-表外有两道保护：`by_name()` 查不到返回 `None`，CLI 报 `unknown key: … (see vdev hid key --help)`（`crates/vdev-host/src/main.rs:177`）；帮助文本里的键名列表来自同一张表的 `NAMES` 常量，并有单测锁死「NAMES 里每个名字都必须能被 `by_name` 解析」以及全部别名收录（`keycodes.rs:188-211`）——帮助信息与解析逻辑永不漂移。
+表外有两道保护：`by_name()` 查不到返回 `None`，CLI 报 `unknown key: … (see vdev hid key --help)`（`crates/vdev-host/src/main.rs:177`）；帮助文本里的键名列表来自同一张表的 `NAMES` 常量，并有单测锁死「NAMES 里每个名字都必须能被 `by_name` 解析」以及全部别名收录（`crates/vdev-hid/src/keycodes.rs:188–211`）——帮助信息与解析逻辑永不漂移。
 
 注意 CLI **只收键名、不收数字键码**：`vdev hid key space` 可以，`vdev hid key 49` 不行。要发任意原始键码，得用库 API `key(keycode, pressed)`。
 
@@ -91,16 +92,16 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 
 1. **down 和 up 都要带 modifiers**。修饰键以 flags 形式附着在事件上（底层 `CGEventSetFlags`），只给 down 不给 up，接收方会认为修饰键还按着不放；
 2. **flags 是"替换"而非"叠加"**——合成事件会整体覆盖 flags 字段，物理按住的修饰键在这一瞬间被"顶掉"。要做物理+合成组合键，得先读当前 flags 再合并（vdev 没做，它的用例不需要）；
-3. **GAP = 12ms**（`lib.rs:22`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
+3. **GAP = 12ms**（`crates/vdev-hid/src/lib.rs:22`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
 
-修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`lib.rs:174-191`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
+修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:174–191`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
 
 ### 3.3 文本输入：另一条 Unicode 通道
 
 逐字符 `tap_key` 只能输入 US 键位上印得出来的字符，中文、emoji 无从下手。CGEvent 给键盘事件留了一个附属字段——Unicode string（`CGEventKeyboardSetUnicodeString`）。cgevents 的 `type_string` 就是逐字符走这条通道：
 
 ```rust
-// cgevents 0.10.1, src/event/mod.rs:665-676（节选）
+// cgevents 0.10.1（第三方依赖）, src/event/mod.rs:665-676（节选）
 for ch in s.chars() {
     let chunk = ch.to_string();
     let down = KeyEvent::down(0).with_unicode(&chunk).build(&source)?;
@@ -110,13 +111,13 @@ for ch in s.chars() {
 }
 ```
 
-注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。vdev 的 `type_text`（`lib.rs:53-56`）直接封装它，CLI 一行 `vdev hid type "hello from vdev"` 即可。
+注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。vdev 的 `type_text`（`crates/vdev-hid/src/lib.rs:53–56`）直接封装它，CLI 一行 `vdev hid type "hello from vdev"` 即可。
 
 ## 四、鼠标注入
 
-鼠标三条命令对应三种事件构造，全部发生在 `lib.rs:59-83`：
+鼠标三条命令对应三种事件构造，全部发生在 `crates/vdev-hid/src/lib.rs:59–83`：
 
-**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`lib.rs:58` 注释），Retina 屏上这里是"点"不是物理像素。
+**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`crates/vdev-hid/src/lib.rs:58` 注释），Retina 屏上这里是"点"不是物理像素。
 
 **点击**：先 `mouse_move` 到目标，再 `button_down` + GAP + `button_up`：
 
@@ -135,9 +136,9 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 }
 ```
 
-先 move 再 down 不是多余的：目标 App 的悬停状态（tooltip、hover 高亮）依赖 moved 事件先到位。按钮经 CLI 的 `parse_button` 解析，支持 left/right/middle（middle 别名 center，`main.rs:113-118`）。事件构造最终落在 Swift 侧的 `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)`——注意 vdev **没有显式设置 clickState**，即按系统默认的单击语义；要合成双击/三击，需自己给事件的 `kCGMouseEventClickState` 字段递增计数。
+先 move 再 down 不是多余的：目标 App 的悬停状态（tooltip、hover 高亮）依赖 moved 事件先到位。按钮经 CLI 的 `parse_button` 解析，支持 left/right/middle（middle 别名 center，`crates/vdev-host/src/main.rs:113–118`）。事件构造最终落在 Swift 侧的 `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)`——注意 vdev **没有显式设置 clickState**，即按系统默认的单击语义；要合成双击/三击，需自己给事件的 `kCGMouseEventClickState` 字段递增计数。
 
-**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`lib.rs:78-83`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
+**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`crates/vdev-hid/src/lib.rs:78–83`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
 
 ## 五、监听侧：vdev hid listen
 
@@ -186,7 +187,7 @@ let handle = thread::spawn(move || {
     }
 ```
 
-EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`lib.rs:160-166`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
+EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`crates/vdev-hid/src/lib.rs:160–166`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
 
 ## 六、踩坑实录
 
@@ -225,7 +226,7 @@ std::thread::sleep(Duration::from_secs(seconds));
 
 1. **唯一权威是 Apple 的 kVK_* 常量**（Carbon `HIToolbox/Events.h`），字母/控制键直接用 cgevents 的 `Keycode` 常量（其值即 kVK_*），数字/标点/F5–F12 逐项抄 `Events.h` 的十六进制字面量；
 2. **独立复核**：审查阶段把键码表与 kVK_* 全量对照了一遍，确认一致（审查报告原话："vdev-hid 键码表全量与 kVK_* 一致"）；
-3. **单测锁一致性**：`NAMES`（帮助文本展示的键名）与 `by_name`（实际解析）之间靠 `names_all_resolve_via_by_name` 单测双向锁定（`keycodes.rs:188-211`）——帮助列出的键必须可解析，解析支持的别名必须收录进帮助。
+3. **单测锁一致性**：`NAMES`（帮助文本展示的键名）与 `by_name`（实际解析）之间靠 `names_all_resolve_via_by_name` 单测双向锁定（`crates/vdev-hid/src/keycodes.rs:188–211`）——帮助列出的键必须可解析，解析支持的别名必须收录进帮助。
 
 ### 坑 4：文档漂移——README 里的命令跑不通
 
@@ -275,7 +276,7 @@ vdev hid click 100 100 --button right      # left / right / middle
 - **文本输入依赖 Unicode 通道**：`type` 对读 `NSEvent.characters` 的常规 App 无往不利，但对只认虚拟键码的目标（部分游戏、远程桌面）会失效，此时改用 `key --modifiers` 逐键合成；
 - **点击是"单击"语义**：clickState 未显式设置，双击/拖拽（按住移动）需要自己组合 down/move/up 或改写 clickState，CLI 暂无对应子命令；
 - **监听输出是调试级的**：滚轮事件只打 `[scroll]` 不带 delta；tap 恒为 Pass，未暴露拦截/改写（架构上已具备）；
-- **listen 的 CLI 只有定时模式**（`--seconds`，默认 10）。库 API `listen(None)` 支持常驻，但 CLI 未接（`main.rs:208-210` 有注释说明）；
+- **listen 的 CLI 只有定时模式**（`--seconds`，默认 10）。库 API `listen(None)` 支持常驻，但 CLI 未接（`crates/vdev-host/src/main.rs:208–210` 有注释说明）；
 - **合成事件的天花板**：过不了登录窗口与 Secure Input 域，唤不醒已休眠的机器（坑 5），锁屏状态下行为取决于会话状态。这些是 Quartz 用户态路线的固有边界，不是 bug；
 - **macOS 版本**：权限预检 API 是 10.15+ 的（cgevents 内部有 `#available` 分支，更老的系统直接跳过检查）；vdev 实测环境为 macOS 26。
 

@@ -1,6 +1,7 @@
 # 用 100% Rust 写 macOS 虚拟声卡：AudioServerPlugIn 从加载到环回出声
 
 > 本文是 [vdev](https://github.com/gqf2008/vdev) 虚拟设备驱动开发系列之一。全套含 macOS 摄像头/声卡/键鼠/虚拟屏与 Windows 摄像头/显示器/声卡/HID 九篇。
+> 代码引用约定：本文所有 `文件:行号` 均相对**仓库根**（如 `crates/.../foo.rs:12`），行号为写作时基线；代码演进后行号会漂移，按符号名搜索为准。
 
 ## 一、虚拟声卡是干什么的
 
@@ -62,10 +63,10 @@ pub static mut VTABLE_PTR: *mut AudioServerPlugInDriverInterface = &raw mut VTAB
 
 `VTABLE_PTR` 必须真的存在于镜像里并加 `#[no_mangle]`——注释里写得很直白：防止编译器把 `&VTABLE_PTR` 优化成 `VTABLE_PTR` 的值。值语义差一层解引用，宿主第一次调用就是野跳转。
 
-**4. 手工铺 vtable。** `AudioServerPlugInDriverInterface` 的布局必须与 C 头文件逐字段一致：`IUNKNOWN_C_GUTS`（`_reserved` + `QueryInterface` + `AddRef` + `Release`）后跟 19 个插件方法（`crates/vdev-audio/src/vtable.rs:105-267`）。Rust 侧用 `#[repr(C)]` 结构体 + `Option<unsafe extern "C" fn ...>` 逐项镜像，`lib.rs:376` 的 `static mut VTABLE` 把每个槽位填上实现。两个 ABI 细节值得单独记住：
+**4. 手工铺 vtable。** `AudioServerPlugInDriverInterface` 的布局必须与 C 头文件逐字段一致：`IUNKNOWN_C_GUTS`（`_reserved` + `QueryInterface` + `AddRef` + `Release`）后跟 19 个插件方法（`crates/vdev-audio/src/vtable.rs:105-267`）。Rust 侧用 `#[repr(C)]` 结构体 + `Option<unsafe extern "C" fn ...>` 逐项镜像，`crates/vdev-audio/src/lib.rs:376` 的 `static mut VTABLE` 把每个槽位填上实现。两个 ABI 细节值得单独记住：
 
-- **REFIID 按值传**。`QueryInterface` 的第二个参数是 `CFUUIDBytes`（16 字节结构体），在 arm64 上拆进 x1:x2 两个寄存器——不是指针。vtable.rs:19 的注释："否则 out 取到 UUID 高位直接崩"。
-- **引用计数可以不实现**。`AddRef/Release` 恒返回 1（lib.rs:440-445）：接口对象是插件镜像里的静态变量，宿主 Release 到 0 也不会卸载，BlackHole 同款。`QueryInterface` 则只接受驱动接口 IID（`kAudioServerPlugInDriverInterfaceUUID`，lib.rs:409）和 IUnknown，其余一律 `E_NOINTERFACE`。
+- **REFIID 按值传**。`QueryInterface` 的第二个参数是 `CFUUIDBytes`（16 字节结构体），在 arm64 上拆进 x1:x2 两个寄存器——不是指针。crates/vdev-audio/src/vtable.rs:19 的注释："否则 out 取到 UUID 高位直接崩"。
+- **引用计数可以不实现**。`AddRef/Release` 恒返回 1（crates/vdev-audio/src/lib.rs:440–445）：接口对象是插件镜像里的静态变量，宿主 Release 到 0 也不会卸载，BlackHole 同款。`QueryInterface` 则只接受驱动接口 IID（`kAudioServerPlugInDriverInterfaceUUID`，crates/vdev-audio/src/lib.rs:409）和 IUnknown，其余一律 `E_NOINTERFACE`。
 
 ## 四、核心机制：sample-time 环形缓冲 + 追赶时钟
 
@@ -83,9 +84,9 @@ fn ring_write_out(idx: usize, data: &[f32], out_sample_time: f64, frames: u32) {
     // ... 处理回绕的两段 copy_from_slice，更新 RING_LAST_OUTPUT_BITS
 ```
 
-读侧（`ring_read_in`，lib.rs:282）维护三个原子量：`RING_LAST_OUTPUT_BITS`（上次输出写到的结束 sample time）、`RING_IS_CLEAR`、`RING_RESYNC`。输出还没写到输入要读的位置（`last_output - frames < in_sample_time`）就静音并清空——**宁可静音，不放旧账**。残留旧音频的检测见坑 4。
+读侧（`ring_read_in`，crates/vdev-audio/src/lib.rs:282）维护三个原子量：`RING_LAST_OUTPUT_BITS`（上次输出写到的结束 sample time）、`RING_IS_CLEAR`、`RING_RESYNC`。输出还没写到输入要读的位置（`last_output - frames < in_sample_time`）就静音并清空——**宁可静音，不放旧账**。残留旧音频的检测见坑 4。
 
-IO 主循环 `plugin_do_io_operation`（lib.rs:626）里还有两个防御：入口把宿主请求的 frames 夹紧到 ring 容量（异常大的请求不再让切片越界），cycle 缺失时 READ_INPUT 直接输出静音。整条 RT 路径没有分配、没有可能长持锁的 Mutex——跨线程同步全靠原子量。
+IO 主循环 `plugin_do_io_operation`（crates/vdev-audio/src/lib.rs:626）里还有两个防御：入口把宿主请求的 frames 夹紧到 ring 容量（异常大的请求不再让切片越界），cycle 缺失时 READ_INPUT 直接输出静音。整条 RT 路径没有分配、没有可能长持锁的 Mutex——跨线程同步全靠原子量。
 
 ### 4.2 GetZeroTimeStamp：锚定 + 量化 + 追赶
 
@@ -104,17 +105,17 @@ fn zts_next_beat(anchor: u64, prev_ticks: f64, period_ticks: f64,
 }
 ```
 
-语义：时钟按 16384 帧一拍量化（`ZTS_PERIOD_FRAMES`，即属性 `'ring'` 的值，BlackHole 要求 ≥10923），**只有当"计划中的下一拍"在真实时间上已经到达时，才推进一拍**。IO 停止期间没人调用，就不推进；恢复后从断点继续——`host = anchor + prev_ticks`，`sample = count * 16384`，两者永远步进一致，时钟在宿主眼里连续。IO 长停顿后"追赶"也只每次查询推进一拍（lib.rs:800 的单测锁死了这个语义），不会一口气跳几十万帧。
+语义：时钟按 16384 帧一拍量化（`ZTS_PERIOD_FRAMES`，即属性 `'ring'` 的值，BlackHole 要求 ≥10923），**只有当"计划中的下一拍"在真实时间上已经到达时，才推进一拍**。IO 停止期间没人调用，就不推进；恢复后从断点继续——`host = anchor + prev_ticks`，`sample = count * 16384`，两者永远步进一致，时钟在宿主眼里连续。IO 长停顿后"追赶"也只每次查询推进一拍（crates/vdev-audio/src/lib.rs:800 的单测锁死了这个语义），不会一口气跳几十万帧。
 
-实现上，`Zts` 的三个字段（锚点、拍数、上次拍点的 f64 ticks）全部原子化，`query` 用快照 + CAS 循环推进（lib.rs:102-173）——因为 `GetZeroTimeStamp` 跑在宿主的定时线程上，不能与 `start_io` 的控制线程互相持锁。`zts_next_beat` 被抽成纯函数，边界条件（含"等于"算到拍）有确定性单测。host time 一律用 `mach_absolute_time()` 的 ticks、经 `mach_timebase_info` 换算，**不是纳秒**——返回纳秒会让 coreaudiod 认为设备时钟异常，IO 只跑几个周期就停。
+实现上，`Zts` 的三个字段（锚点、拍数、上次拍点的 f64 ticks）全部原子化，`query` 用快照 + CAS 循环推进（crates/vdev-audio/src/lib.rs:102–173）——因为 `GetZeroTimeStamp` 跑在宿主的定时线程上，不能与 `start_io` 的控制线程互相持锁。`zts_next_beat` 被抽成纯函数，边界条件（含"等于"算到拍）有确定性单测。host time 一律用 `mach_absolute_time()` 的 ticks、经 `mach_timebase_info` 换算，**不是纳秒**——返回纳秒会让 coreaudiod 认为设备时钟异常，IO 只跑几个周期就停。
 
 ### 4.3 设备的生与死：StartIO/StopIO 计数
 
-设备从空闲到活跃（第一个 IO 客户端出现）时重置时钟锚点并清空 ring；`stop_io` 用 `fetch_update` 做饱和递减，未配对的 stop 不会让计数回绕到 `u32::MAX`（lib.rs:511-536）。这两个细节保证"每次重新开始都是干净的时间线"。
+设备从空闲到活跃（第一个 IO 客户端出现）时重置时钟锚点并清空 ring；`stop_io` 用 `fetch_update` 做饱和递减，未配对的 stop 不会让计数回绕到 `u32::MAX`（crates/vdev-audio/src/lib.rs:511–536）。这两个细节保证"每次重新开始都是干净的时间线"。
 
 ## 五、两台设备、一张路由矩阵、一份 DSP 的教训
 
-单设备稳定后，项目把它扩成两台 8 声道设备（`vdev-audio A/B`，对象 ID 固定 3..7 与 8..12，lib.rs:26-41），并加了三样东西，每样都附带一个架构教训。
+单设备稳定后，项目把它扩成两台 8 声道设备（`vdev-audio A/B`，对象 ID 固定 3..7 与 8..12，crates/vdev-audio/src/lib.rs:26–41），并加了三样东西，每样都附带一个架构教训。
 
 **路由矩阵。** `route[src][dst]` 表示 src 设备的输出混入 dst 设备输入的增益，默认对角阵（各自环回）。RT 读侧要无锁，于是每行两个 f32 的位模式打包进一个 `AtomicU64`，`ReadInput` 一次 load 取整行快照：
 
@@ -129,11 +130,11 @@ const fn route_row_pack(gains: [f32; N_DEVICES]) -> u64 {
 }
 ```
 
-宿主通过自定义属性 `'vrut'` 写入（CFString `"r00,r01,r10,r11"`），写侧整行一次 store。跨设备读侧（`ring_peek`，lib.rs:330）窥视别的设备的 ring——代码注释诚实地标注这是**非实时安全的实验特性**：若 src 写侧整圈反超（读侧停顿超过约 1.4s），会读到新旧混合样本，但 f32 字宽读写不撕裂，是音频伪影而非内存安全问题。
+宿主通过自定义属性 `'vrut'` 写入（CFString `"r00,r01,r10,r11"`），写侧整行一次 store。跨设备读侧（`ring_peek`，crates/vdev-audio/src/lib.rs:330）窥视别的设备的 ring——代码注释诚实地标注这是**非实时安全的实验特性**：若 src 写侧整圈反超（读侧停顿超过约 1.4s），会读到新旧混合样本，但 f32 字宽读写不撕裂，是音频伪影而非内存安全问题。
 
-**DSP。** RBJ cookbook 三段 EQ（120Hz 低架 / 1kHz 峰值 / 8kHz 高架）+ 总增益 + tanh 软限幅（`crates/vdev-audio/src/dsp.rs`），系数只在设参时重算，处理路径纯乘加。教训在于放置位置：多设备重构时 DSP 一度是全局单例，结果两台设备的 biquad 状态互相串扰、属性线程与两个 IO 线程挤一把锁（见坑 6）。现在是每设备一个 `OnceLock<Mutex<Dsp>>`（lib.rs:203-207），各 IO 线程只锁自己的实例。
+**DSP。** RBJ cookbook 三段 EQ（120Hz 低架 / 1kHz 峰值 / 8kHz 高架）+ 总增益 + tanh 软限幅（`crates/vdev-audio/src/dsp.rs`），系数只在设参时重算，处理路径纯乘加。教训在于放置位置：多设备重构时 DSP 一度是全局单例，结果两台设备的 biquad 状态互相串扰、属性线程与两个 IO 线程挤一把锁（见坑 6）。现在是每设备一个 `OnceLock<Mutex<Dsp>>`（crates/vdev-audio/src/lib.rs:203–207），各 IO 线程只锁自己的实例。
 
-**自定义属性。** `'vdsp'`（DSP 参数）与 `'vrut'`（路由）都走 CoreAudio 自定义属性协议：在设备的 `'cust'`（`kAudioObjectPropertyCustomPropertyInfoList`）里注册 `CustomPropertyInfo`，dataType 用 `'cfst'`（props.rs:482-490），值是 CFString。为什么是字符串——见坑 5。控制类对象（音量/静音）也搭齐了（`vlme`/`mute` 类、`vlsc`/`lcdv`/`mute` 选择器），Audio MIDI Setup 里推子可见可用。
+**自定义属性。** `'vdsp'`（DSP 参数）与 `'vrut'`（路由）都走 CoreAudio 自定义属性协议：在设备的 `'cust'`（`kAudioObjectPropertyCustomPropertyInfoList`）里注册 `CustomPropertyInfo`，dataType 用 `'cfst'`（crates/vdev-audio/src/props.rs:482–490），值是 CFString。为什么是字符串——见坑 5。控制类对象（音量/静音）也搭齐了（`vlme`/`mute` 类、`vlsc`/`lcdv`/`mute` 选择器），Audio MIDI Setup 里推子可见可用。
 
 ## 六、踩坑实录
 
@@ -207,7 +208,7 @@ if last_output - in_sample_time > rate {
 
 **现象**：独立审查（commit `e7caea0` 一并修复）指出：多设备化之后 DSP 仍是全局单例——两台设备的 biquad 滤波状态 `s1/s2` 互相串扰；混音 scratch 缓冲 `MIX_BUF` 全设备共享，两个 IO 线程写写竞争，属 UB + 音频损坏。
 **定位**：coreaudiod **每设备一个 IO 线程**，任何"每设备一份才对"的状态放成全局，都立刻变成数据竞争。
-**修法**：DSP 改 `OnceLock<Mutex<Dsp>>` 每设备一份（lib.rs:203），scratch 改 `MIX_BUFS[idx]` 每设备一份（lib.rs:246），RT 路径上每设备只碰自己的槽位；同设备属性线程与 IO 线程的短暂锁竞争，注释里明说"持锁窗口为单周期乘加，接受"。
+**修法**：DSP 改 `OnceLock<Mutex<Dsp>>` 每设备一份（crates/vdev-audio/src/lib.rs:203），scratch 改 `MIX_BUFS[idx]` 每设备一份（crates/vdev-audio/src/lib.rs:246），RT 路径上每设备只碰自己的槽位；同设备属性线程与 IO 线程的短暂锁竞争，注释里明说"持锁窗口为单周期乘加，接受"。
 **教训**：多设备驱动的默认架构是"每设备一份状态 + 原子量共享全局配置"，不要先全局再拆。
 
 另有一条贯穿始终的调试纪律，值得单独写一行：**coreaudiod 一旦空转，立即停手**——卸载问题驱动、重启一次 coreaudiod，仍不行就重启电脑；反复 `killall -9` 加装卸驱动会把它的 XPC 状态搞坏到系统级损坏。正确的姿势是先在独立进程里用 dlopen + 工厂 + Initialize 的 C 测试跑通全链路，再装系统。
