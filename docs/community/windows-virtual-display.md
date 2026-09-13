@@ -216,7 +216,7 @@ vdev-display-win.exe uninstall
 
 添加后系统设置里立刻出现新显示器，桌面可扩展过去（OS 直接渲染）。`add` 的模式语法是 `宽x高@刷新率1/刷新率2`，缺省刷新率补 60。
 
-**测试的门禁矩阵**值得单独一提：`driver-ipc` 的协议/状态测试全部依赖 tokio 的 Windows named pipe，只能随 Windows `cargo test` 跑；为了不让 macOS 宿主零覆盖，纯逻辑被刻意抽成零依赖模块（`validate.rs`、`mode_check.rs`、`quote.rs`、`state.rs`、ArcPointer 布局镜像），由 `scripts/state-tests-host.sh` 用 `rustc --test` 在宿主直跑。CI 里 `windows-user` job 门禁 WDK-free 的用户态包，`windows-driver-wdk` job（装 WDK + LLVM 后 `cargo check --workspace`）目前是 `continue-on-error` 的**顾问 job**——runner 上 winget 装 WDK 的组合尚未长期稳定，红不阻塞合并但必须人工读日志（`.github/workflows/ci.yml:104-140`）。坑 3、坑 4 都是它首跑逮到的，顾问期物超所值。
+**测试的门禁矩阵**值得单独一提：`driver-ipc` 的协议/状态测试全部依赖 tokio 的 Windows named pipe，只能随 Windows `cargo test` 跑；为了不让 macOS 宿主零覆盖，纯逻辑被刻意抽成零依赖模块（`validate.rs`、`mode_check.rs`、`quote.rs`、`state.rs`、ArcPointer 布局镜像），由 `scripts/state-tests-host.sh` 用 `rustc --test` 在宿主直跑。CI 里 `windows-user` job 门禁 WDK-free 的用户态包；`windows-driver-wdk` job（runner 上 winget 装 WDK + LLVM 后 `cargo check --workspace`）起初以 `continue-on-error` 的**顾问 job** 形式上线——坑 3、坑 4 都是它首跑逮到的，顾问期物超所值；实测连续多次稳定通过、且历史红灯都是真实驱动编译错误后，已于 2026-09 升为**硬门禁**（`.github/workflows/ci.yml:122-150`）。
 
 ## 九、现状与局限
 
