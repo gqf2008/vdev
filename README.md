@@ -52,7 +52,7 @@ crates/*-win/       # Windows 侧：各自独立 workspace（不影响 macOS 主
   vdev-display-win/ 虚拟显示器：IddCx UMDF 间接显示驱动 + CLI + driver-ipc
   vdev-audio-win/   虚拟声卡：PortCls/WaveRT miniport（WDM 内核）+ CLI
   vdev-app-win/     Windows 宿主 App（Rust + Slint）
-docs/RESEARCH.md    技术路线调研笔记与参考项目
+docs/                文档：README.md 索引；community/ 对外系列；dev/ 内部开发笔记
 ```
 
 ---
@@ -200,7 +200,7 @@ VDEV_BG=blur        # 开启背景模糊（Vision 人像分割）
   `CMIOExtensionMachServiceName` 必须以 App Group 为前缀 → 换二进制必须递增版本号。
 - 运行时：`CMIOExtensionProvider` 进程级单例只能建一个；`device.addStream` 必须先于
   `provider.addDevice`（否则零流设备、能枚举但 0 帧）；`legacyDeviceID` 填 UUID 字符串。
-- 详见 `docs/RESEARCH.md` 与 `~/.agents/rules/LESSON_系列_屏幕采集与虚拟摄像头.md`（"CMIOExtension
+- 详见 `docs/dev/macos-route-survey.md` 与 `~/.agents/rules/LESSON_系列_屏幕采集与虚拟摄像头.md`（"CMIOExtension
   虚拟摄像头激活与出帧的连环坑"小节）。
 
 历史遗留已清理：旧 DAL 插件（`dal/`）、旧 Swift 宿主（`host/`）、旧 Swift 扩展壳
@@ -296,11 +296,11 @@ BGRA 帧变成系统里的一个"视频捕获源"，任意 App（ffmpeg / OBS / 
 - 固定输出 **YUY2**，3 档分辨率（1080p / 720p / 640x480）@30fps。
 - CLI：`install / uninstall / list / push / selftest`；支持 64 位 + 32 位双视图注册。
 - 自测：进程内 DirectShow 图（源 → NullRenderer）3s 交付约 80 帧；`cargo test`（SHM 往返 + FilterData 布局）。
-- 关键踩坑（详见 `docs/windows-virtual-camera.md`）：Instance 键必须带 `FriendlyName`（否则枚举不到但
+- 关键踩坑（详见 `docs/dev/windows-camera-design.md`）：Instance 键必须带 `FriendlyName`（否则枚举不到但
   CoCreateInstance 能成功）；输出 pin 必须实现 `IKsPropertySet` 返回 `PIN_CATEGORY_CAPTURE`（否则 ffmpeg
   报 Could not find output pin）；推源必须自建并 `Commit` 内存分配器；样本时间戳用**流时间域**的
   `SetTime`（从 0 起 + `SetSyncPoint(true)`，不设媒体时间）——早期"不要 SetTime"的结论系误诊，
-  详见 `docs/windows-virtual-camera.md`；用 **YUY2** 别用 RGB32（VLC 无法提取 fourcc）；`biHeight` 用正数
+  详见 `docs/dev/windows-camera-design.md`；用 **YUY2** 别用 RGB32（VLC 无法提取 fourcc）；`biHeight` 用正数
   （VLC 负数会溢出成黑屏）。
 
 ```powershell
@@ -414,19 +414,23 @@ CI（`.github/workflows/ci.yml`，push main + PR 触发）：
 
 # 文档导航
 
-| 文档 | 内容 |
+文档分两层：[`docs/README.md`](docs/README.md) 是索引；**`docs/community/` 是对外发布的社区系列**（9 篇 + 公告），**`docs/dev/` 是内部开发笔记**（调研/设计/选题，可能滞后于实现）。
+
+| 目录 / 文档 | 内容 |
 |---|---|
-| `docs/RESEARCH.md` | 三条技术路线的调研笔记与参考项目 |
-| `docs/windows-virtual-camera.md` | Windows 虚拟摄像头（DirectShow）设计与踩坑 |
-| `docs/windows-virtual-display-audio.md` | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 |
-| `docs/Windows驱动开发有趣方向.md` | Windows 侧"值得写"的内容线索 |
-| `docs/macOS驱动开发有趣方向.md` | macOS 侧"值得写"的内容线索 |
+| `docs/README.md` | 文档索引：dev 与 community 的分工 |
+| `docs/community/README.md` | 社区系列总目录（9 篇 + 发布公告） |
+| `docs/dev/macos-route-survey.md` | macOS 三条虚拟设备技术路线调研（HID/摄像头/屏幕） |
+| `docs/dev/macos-route-ideas.md` | macOS 侧"值得写"的内容线索 |
+| `docs/dev/windows-route-ideas.md` | Windows 侧"值得写"的内容线索 |
+| `docs/dev/windows-camera-design.md` | Windows 虚拟摄像头（DirectShow）设计与踩坑 |
+| `docs/dev/windows-display-audio-design.md` | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 |
 | `crates/vdev-display-win/README.md` | 虚拟显示器驱动（构建/签名/CLI/验收） |
 | `crates/vdev-hid-win/kernel/driver/README.md` | 内核 HID 驱动（构建/注入） |
 
 # 路线图
 
-- [x] 调研三条技术路线（macOS：见 `docs/RESEARCH.md`）
+- [x] 调研三条技术路线（macOS：见 `docs/dev/macos-route-survey.md`）
 - [x] macOS：vdev-hid / vdev-screen / vdev-camera（CMIOExtension 全链路）/ vdev-audio 可用
 - [x] macOS：组合玩法（虚拟屏 + 摄像头串流 + SFU 端到端）+ 设备侧滤镜（美颜/背景替换）
 - [x] 远端桥（WebRTC 流 → 虚拟摄像头/声卡）已迁至 aerodesk 仓库（`aerodesk-vdev-bridge`）

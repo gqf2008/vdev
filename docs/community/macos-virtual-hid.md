@@ -283,6 +283,6 @@ vdev hid click 100 100 --button right      # left / right / middle
 
 `vdev-hid` 是整个 vdev 里最"薄"的一个虚拟设备：400 行、一个依赖、零签名零安装，却是四件事里离"每个 macOS 开发者都用得上"最近的——自动化测试、CI 里的 UI 冒烟、远控转发，起点都是 `CGEventPost` 这一个函数。它也把虚拟设备系列的核心思路演得最直白：**先找操作系统在用户态留的正门，找不到才考虑驱动**。
 
-想继续深入的话：往"改写"方向走，把 listen 的 `TapAction::Pass` 换成改写逻辑，就是一个小 Karabiner（按键映射器）的骨架；往"真硬件级"方向走，Windows 侧的 `vdev-hid-win` 提供了对照——KMDF 内核 HID minidriver，从 HIDCLASS 层把虚拟设备注册成系统真件，系列另有专文。仓库里各路线的选型笔记见 `docs/macOS驱动开发有趣方向.md`，全套文章索引见 [docs/community](https://github.com/gqf2008/vdev/tree/main/docs/community)。
+想继续深入的话：往"改写"方向走，把 listen 的 `TapAction::Pass` 换成改写逻辑，就是一个小 Karabiner（按键映射器）的骨架；往"真硬件级"方向走，Windows 侧的 `vdev-hid-win` 提供了对照——KMDF 内核 HID minidriver，从 HIDCLASS 层把虚拟设备注册成系统真件，系列另有专文。仓库里各路线的选型笔记见 `docs/dev/macos-route-ideas.md`，全套文章索引见 [docs/community](https://github.com/gqf2008/vdev/tree/main/docs/community)。
 
 如果本文帮到了你，欢迎到 [vdev](https://github.com/gqf2008/vdev) 点个 star，或在 issue 里聊聊你想看的下一篇。

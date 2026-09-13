@@ -25,5 +25,4 @@
 ## 相关仓库内文档
 
 - `README.md` — 项目总览、构建矩阵与各驱动状态框（✅ 已可用 / 🔧 构建与自测通过、真机验证进行中）
-- `docs/windows-virtual-camera.md`、`docs/windows-virtual-display-audio.md` — Windows 侧内部设计/联调笔记
-- `docs/macOS驱动开发有趣方向.md`、`docs/Windows驱动开发有趣方向.md` — 选题阶段的研究笔记
+- `docs/dev/` — 内部开发笔记：`windows-camera-design.md`、`windows-display-audio-design.md`（Windows 设计/联调）、`macos-route-survey.md`（macOS 路线调研）、`macos-route-ideas.md` / `windows-route-ideas.md`（选题线索）
