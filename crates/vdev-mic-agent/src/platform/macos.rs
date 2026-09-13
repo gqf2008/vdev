@@ -245,6 +245,22 @@ mod ffi {
             data: *const c_void,
         ) -> OSStatus;
 
+        pub fn AudioDeviceCreateIOProcID(
+            dev: AudioDeviceID,
+            proc_: AudioDeviceIOProc,
+            client_data: *mut c_void,
+            out_id: *mut AudioDeviceIOProcID,
+        ) -> OSStatus;
+        pub fn AudioDeviceDestroyIOProcID(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
+        pub fn AudioDeviceStart(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
+        pub fn AudioDeviceStop(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
+    }
+
+    // AudioUnit / AudioComponent 符号由 AudioToolbox 提供，不在 CoreAudio 里。
+    // 声明错框架时 `cargo check`/测试照常通过，只有真正 build 二进制才在 ld 阶段
+    // 报 `_AudioUnitInitialize` 等未定义符号——CI 不 build 就永远看不到。
+    #[link(name = "AudioToolbox", kind = "framework")]
+    extern "C" {
         pub fn AudioComponentFindNext(
             in_component: *mut c_void,
             in_desc: *const AudioComponentDescription,
@@ -274,16 +290,6 @@ mod ffi {
         pub fn AudioUnitUninitialize(unit: AudioUnit) -> OSStatus;
         pub fn AudioOutputUnitStart(unit: AudioUnit) -> OSStatus;
         pub fn AudioOutputUnitStop(unit: AudioUnit) -> OSStatus;
-
-        pub fn AudioDeviceCreateIOProcID(
-            dev: AudioDeviceID,
-            proc_: AudioDeviceIOProc,
-            client_data: *mut c_void,
-            out_id: *mut AudioDeviceIOProcID,
-        ) -> OSStatus;
-        pub fn AudioDeviceDestroyIOProcID(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
-        pub fn AudioDeviceStart(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
-        pub fn AudioDeviceStop(dev: AudioDeviceID, id: AudioDeviceIOProcID) -> OSStatus;
     }
 }
 
@@ -1804,10 +1810,16 @@ fn print_report(r: &RunReport) {
             "model time  : p50 {:.4}  p95 {:.4}  p99 {:.4}  max {:.4} ms  (budget {:.1} ms)",
             r.frame_ms_p50, r.frame_ms_p95, r.frame_ms_p99, r.frame_ms_max, r.frame_ms
         );
-        println!(
-            "cpu         : {:.2} s -> {:.2} % of one core",
-            r.cpu_seconds, r.cpu_percent_of_one_core
-        );
+        // proctime::cpu_seconds() 在 macOS 返回 0.0（Windows-only 实现）；
+        // 与其印出无意义的 0.00%，不如如实说没测——与离线报告的 n/a 口径一致。
+        if r.cpu_seconds > 0.0 {
+            println!(
+                "cpu         : {:.2} s -> {:.2} % of one core",
+                r.cpu_seconds, r.cpu_percent_of_one_core
+            );
+        } else {
+            println!("cpu         : n/a (CPU time not instrumented on this platform)");
+        }
         println!(
             "wet ratio   : mean {:.3}  min {:.3}  max {:.3}",
             r.wet_ratio_mean, r.wet_ratio_min, r.wet_ratio_max
