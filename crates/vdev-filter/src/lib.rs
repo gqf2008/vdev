@@ -59,6 +59,25 @@ pub struct FilterParams {
     pub whiten_strength: f32,
 }
 
+impl FilterParams {
+    /// 是否等于默认值（等效于不作任何处理）。
+    ///
+    /// `process_frame` 用它做零开销快返回：调用方（宿主推流 / 扩展滤镜链）默认
+    /// 无滤镜时不应付出逐像素遍历的代价。
+    #[must_use]
+    #[allow(clippy::float_cmp)] // 与 Default 值逐字段比较，全部是哨兵常量
+    pub fn is_noop(&self) -> bool {
+        let d = Self::default();
+        self.brightness == d.brightness
+            && self.contrast == d.contrast
+            && self.saturation == d.saturation
+            && self.green_screen_threshold == d.green_screen_threshold
+            && self.sharpen == d.sharpen
+            && self.beauty_strength == d.beauty_strength
+            && self.whiten_strength == d.whiten_strength
+    }
+}
+
 impl Default for FilterParams {
     fn default() -> Self {
         Self {
@@ -120,11 +139,27 @@ fn green_screen(p: Pixel, threshold: u8) -> Pixel {
     }
 }
 
+/// 走 no-op 快返回的次数（仅测试观测用）。
+#[cfg(test)]
+static NOOP_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 读取并清零 no-op 快返回计数（仅测试用）。
+#[cfg(test)]
+fn take_noop_hits() -> usize {
+    NOOP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 对一整帧 BGRA 应用滤镜（原地处理，无分配）。
 ///
 /// # Panics
 /// `bgra.len() < width * height * 4` 时 panic（缓冲区太小）。
 pub fn process_frame(bgra: &mut [u8], width: u32, height: u32, params: &FilterParams) {
+    // 无滤镜：直接返回，不做逐像素遍历（「未配置零额外开销」的兑现点）。
+    if params.is_noop() {
+        #[cfg(test)]
+        NOOP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let px = (width * height) as usize;
     let n = px * 4;
     assert!(bgra.len() >= n, "buffer 太小");
@@ -504,5 +539,84 @@ mod tests {
         );
         let p2 = Pixel::from_slice(&f2[0..4]);
         assert_eq!(p2.a, 255, "非绿色应保留");
+    }
+
+    #[test]
+    fn default_params_are_noop() {
+        assert!(FilterParams::default().is_noop());
+    }
+
+    #[test]
+    fn any_non_default_param_is_not_noop() {
+        assert!(!FilterParams {
+            brightness: 0.1,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            contrast: 1.1,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            saturation: 0.9,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            green_screen_threshold: 1,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            sharpen: 0.1,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            beauty_strength: 0.1,
+            ..Default::default()
+        }
+        .is_noop());
+        assert!(!FilterParams {
+            whiten_strength: 0.1,
+            ..Default::default()
+        }
+        .is_noop());
+    }
+
+    /// 阳性对照：默认参数下 `process_frame` 必须走 no-op 快返回（计数器 +1）
+    /// 且逐字节不改写像素；任何一个参数非默认都必须走完整逐像素路径（计数器不动）。
+    /// 回归前（无快返回）此断言会红：计数器恒为 0。
+    #[test]
+    fn default_params_take_zero_cost_fast_path() {
+        let mut f = frame(
+            Pixel {
+                b: 7,
+                g: 8,
+                r: 9,
+                a: 10,
+            },
+            4,
+            4,
+        );
+        let before = f.clone();
+        take_noop_hits();
+        process_frame(&mut f, 4, 4, &FilterParams::default());
+        assert_eq!(take_noop_hits(), 1, "默认参数必须走 no-op 快返回");
+        assert_eq!(f, before, "no-op 快返回不得改写任何像素");
+
+        // 非默认参数：不得走快返回
+        take_noop_hits();
+        process_frame(
+            &mut f,
+            4,
+            4,
+            &FilterParams {
+                brightness: 0.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(take_noop_hits(), 0, "非默认参数不得走 no-op 快返回");
     }
 }
