@@ -221,7 +221,7 @@ holding for 10s (Ctrl-C to destroy) ...
 
 这个 crate 的全部代码不到 400 行，但它把 macOS 虚拟屏幕这件事从"逆向 speculate"变成了"照着 dump 写绑定 + 交叉验证 + 显式失败"。私有 API 开发的全部方法论其实就三条：**存在性假设显式化**（查不到类就报错、selector 先探测）、**ABI 宽度以证据为准**（类型编码/dump 交叉验证，不赌调用约定）、**生命周期自己兜底**（RAII 配对创建销毁，进程退出即拆屏）。
 
-如果这篇文档帮你省掉了一次 `NSInvalidArgumentException` 的抓瞎，欢迎到 vdev 仓库 点个 star；系列的其余八篇（macOS 摄像头/声卡/键鼠，Windows 摄像头/显示器/声卡/HID）见 vdev 仓库。
+如果这篇文档帮你省掉了一次 `NSInvalidArgumentException` 的抓瞎，欢迎到 vdev 仓库点个 star；系列的其余八篇（macOS 摄像头/声卡/键鼠，Windows 摄像头/显示器/声卡/HID）见系列索引。
 
 ---
 

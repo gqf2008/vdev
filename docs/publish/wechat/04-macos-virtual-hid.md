@@ -256,7 +256,7 @@ vdev hid click 100 100 --button left
 vdev hid listen --seconds 10
 `
 
-补充几个 README 没列全、代码里有的子命令（均来自 的 `HidCmd` 定义）：
+补充几个 README 没列全、代码里有的子命令（均来自 `main.rs` 的 `HidCmd` 定义）：
 
 `bash
 vdev hid key space --modifiers cmd,shift # 组合键（shift/cmd/ctrl/alt 及全称）

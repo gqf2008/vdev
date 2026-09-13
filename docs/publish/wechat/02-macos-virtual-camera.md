@@ -63,7 +63,7 @@ offset size 字段
 36 ... BGRA32 整帧
 `
 
-常量与校验入口在 和 的 `parse_header`。发送侧的对称实现在 （`FrameClient::send_frame`），两侧字段一一对应。扩展侧每个连接只保留**最新一帧**（`INJECTED` 静态槽），这与虚拟摄像头的语义天然匹配——消费端永远只要"当前画面"，不消费历史。
+常量与校验入口在 `frame_channel.rs` 的 `parse_header`。发送侧的对称实现在 `frame.rs` 的 `FrameClient::send_frame`，两侧字段一一对应。扩展侧每个连接只保留**最新一帧**（`INJECTED` 静态槽），这与虚拟摄像头的语义天然匹配——消费端永远只要"当前画面"，不消费历史。
 
 通道有三个防御性设计，都是被真实 bug 教出来的：
 

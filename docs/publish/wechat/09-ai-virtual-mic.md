@@ -189,7 +189,7 @@ target/release/vdev-mic-agent live --probe digital --seconds 30 --report /tmp/di
 target/release/vdev-mic-agent live --probe acoustic --seconds 30 --report /tmp/acoustic.json
 `
 
-关于 `librnnoise`：它通过 `libloading` **运行时**加载、从不参与链接——不是为了让程序缺库也能跑（所有降噪路径缺库即报错退出，唯一例外是不需要后端的 `--probe digital`），而是打包上的取舍：现成的 MinGW 构建 `librnnoise-0.dll` 配 GNU 导入库，MSVC 链接器吃不下，让用户自己用 dlltool 重造 `.lib` 是零收益的负担。解析顺序：显式 `--dll <path>` → 存在且非空的 `$RNNOISE_DLL` → 从可执行文件所在目录起向上最多 5 级祖先目录，**每一级先查该祖先目录本身、再查其下的若干 vendored 子路径**（`third_party/native/`、`third_party/` 等；workspace 构建时命中 `crates/vdev-mic-agent/third_party/native/`）→ 当前目录；候选名覆盖 `librnnoise-0.dll`/`rnnoise.dll`/`librnnoise.dll`/`librnnoise.dylib`。该目录是 git-ignored 的，库可从 xiph/rnnoise 项目 自建，或直接取 MSYS2 `ucrt64` 包（archive 仓库的 `third_party/FETCH.md` 有精确步骤）。加载时会校验 `rnnoise_get_frame_size` 必须 == 480，否则拒绝启动——platform 层的缓冲与重分帧都按 480 硬编码，错的帧长意味着越界或流失步。
+关于 `librnnoise`：它通过 `libloading` **运行时**加载、从不参与链接——不是为了让程序缺库也能跑（所有降噪路径缺库即报错退出，唯一例外是不需要后端的 `--probe digital`），而是打包上的取舍：现成的 MinGW 构建 `librnnoise-0.dll` 配 GNU 导入库，MSVC 链接器吃不下，让用户自己用 dlltool 重造 `.lib` 是零收益的负担。解析顺序：显式 `--dll <path>` → 存在且非空的 `$RNNOISE_DLL` → 从可执行文件所在目录起向上最多 5 级祖先目录，**每一级先查该祖先目录本身、再查其下的若干 vendored 子路径**（`third_party/native/`、`third_party/` 等；workspace 构建时命中 `crates/vdev-mic-agent/third_party/native/`）→ 当前目录；候选名覆盖 `librnnoise-0.dll`/`rnnoise.dll`/`librnnoise.dll`/`librnnoise.dylib`。该目录是 git-ignored 的，库可从 xiph/rnnoise 项目自建，或直接取 MSYS2 `ucrt64` 包（archive 仓库的 `third_party/FETCH.md` 有精确步骤）。加载时会校验 `rnnoise_get_frame_size` 必须 == 480，否则拒绝启动——platform 层的缓冲与重分帧都按 480 硬编码，错的帧长意味着越界或流失步。
 
 ## 七、Windows 通路：WASAPI 轮询 + 内核环回，驱动零改动
 
