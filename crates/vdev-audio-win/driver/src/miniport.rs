@@ -974,7 +974,12 @@ unsafe extern "system" fn ae_get_supported_device_formats(
     }
     let fmt_size = size_of::<KsDataFormatWaveFormatExtensible>();
     let need = size_of::<KsMultipleItem>() + fmt_size;
-    // SAFETY: out 指向 KSMULTIPLE_ITEM
+    // 自审修正：先判长度再写头。原来无论缓冲多大都先写 KSMULTIPLE_ITEM（8 字节），
+    // 调用方若传 <8 字节的缓冲就会越界写。0 长度探测时也只回所需长度。
+    if (buf_size as usize) < size_of::<KsMultipleItem>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 缓冲 >= sizeof(KSMULTIPLE_ITEM)
     unsafe {
         core::ptr::write(
             out.cast::<KsMultipleItem>(),
