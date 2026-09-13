@@ -19,3 +19,5 @@ crates/vdev-audio-win/target/
 crates/vdev-hid-win/target/
 crates/vdev-hid-win/kernel/target/
 .worktrees/
+__pycache__/
+*.pyc

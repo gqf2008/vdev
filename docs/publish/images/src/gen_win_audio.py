@@ -51,7 +51,7 @@ for i, (title, sub, body, tag, bg, tagc) in enumerate(routes):
     d.multiline_text((92, y+96), body, font=f(19), fill=INK, anchor="la", spacing=8)
     d.text((W-92, y+bh-38), tag, font=f(21, True), fill=tagc, anchor="ra")
 center(d, W//2, y0+3*(bh+gap)+20, "内核路线的代价：一次野指针 / 池越界 / IRQL 误判 = BSOD，不是段错误", 21, "#b91c1c", True)
-img.save(OUT/"win-audio-01-routes.png", quality=95)
+img.quantize(colors=64, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).save(OUT/"win-audio-01-routes.png", optimize=True)
 
 # ---------- 图 2：数据流 + PortCls 分工 ----------
 W, H = 1200, 980
@@ -94,5 +94,5 @@ d.text((RX+28, 578), "GetDescription · AllocateAudioBuffer\nGetPosition · 格�
 rbox(d, (LX, 760, LX+LW, 856), 14, "#fff1f2", "#e11d48", 2)
 d.text((LX+24, 782), "最容易违反的契约", font=f(21, True), fill="#be123c", anchor="la")
 d.text((LX+24, 818), "GetPosition 必须返回环形缓冲内偏移（对 dma_size 取模），不能是累计字节数", font=f(18), fill=INK, anchor="la")
-img.save(OUT/"win-audio-02-datapath.png", quality=95)
+img.quantize(colors=64, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE).save(OUT/"win-audio-02-datapath.png", optimize=True)
 print("生成:", OUT/"win-audio-01-routes.png", OUT/"win-audio-02-datapath.png")
