@@ -668,14 +668,17 @@ unsafe extern "system" fn pin_count_impl(
 /// 约定：`*num` 进入时为缓冲可容纳的 GUID 数；不足则回所需数量 + BUFFER_TOO_SMALL。
 unsafe extern "system" fn signal_proc_get_modes(
     _this: PVOID,
-    _pin: u32,
+    pin: u32,
     modes: *mut GUID,
     num: *mut u32,
 ) -> NTSTATUS {
+    dbg_inc(&DBG_MODES_CALLS);
+    DBG_MODES_LAST_PIN.store(pin, Ordering::Relaxed);
     if num.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let cap = unsafe { *num };
+    DBG_MODES_LAST_COUNT.store(cap, Ordering::Relaxed);
     if modes.is_null() || cap == 0 {
         unsafe { *num = SUPPORTED_MODES.len() as u32 };
         return STATUS_BUFFER_TOO_SMALL;
@@ -842,6 +845,8 @@ unsafe extern "system" fn ae_get_engine_format_size(
     } else {
         size_of::<KsDataFormatWaveFormatExtensible>()
     };
+    DBG_AE_FMT_TYPE.store(format_type, Ordering::Relaxed);
+    DBG_AE_FMT_SIZE_OUT.store(need as u32, Ordering::Relaxed);
     // SAFETY: size 可写
     unsafe { core::ptr::write(size, need as u32) };
     STATUS_SUCCESS
@@ -923,6 +928,7 @@ unsafe extern "system" fn ae_set_device_format(
     // 回归：原来接受 84 字节并截断存储，回读给引擎的是残缺格式 → 引擎反复
     // SetDeviceFormat/GetDeviceFormat 并最终判 AUDCLNT_E_UNSUPPORTED_FORMAT(0x88890008)。
     let need = size_of::<KsDataFormatWaveFormatExtensible>();
+    DBG_AE_SET_BUF_SIZE.store(buf_size, Ordering::Relaxed);
     if (buf_size as usize) < need {
         DBG_AE_SET_STATUS.store(status_bits(STATUS_BUFFER_TOO_SMALL), Ordering::Relaxed);
         return STATUS_BUFFER_TOO_SMALL;
@@ -2018,6 +2024,16 @@ static DBG_AE_SET_STATUS: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_TAG: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_RATE: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_STORED_BITS: AtomicU32 = AtomicU32::new(0);
+/// 更细的引擎调用现场（下一次真机验证用）：
+/// - GetEngineFormatSize 的最后一次 formatType 与我们回的长度
+/// - SetDeviceFormat 最后一次的缓冲长度（引擎是否带属性列表/是否 <104）
+/// - GetModes 调用次数与最后一次的 pin / 返回的模式数
+static DBG_AE_FMT_TYPE: AtomicU32 = AtomicU32::new(u32::MAX);
+static DBG_AE_FMT_SIZE_OUT: AtomicU32 = AtomicU32::new(0);
+static DBG_AE_SET_BUF_SIZE: AtomicU32 = AtomicU32::new(0);
+static DBG_MODES_CALLS: AtomicU32 = AtomicU32::new(0);
+static DBG_MODES_LAST_PIN: AtomicU32 = AtomicU32::new(u32::MAX);
+static DBG_MODES_LAST_COUNT: AtomicU32 = AtomicU32::new(0);
 /// PROPOSEDATAFORMAT2 GET 的返回长度与实例属性列表长度（看引擎带的模式属性）
 static DBG_PROPOSED_GET_SIZE: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_ATTR_LEN: AtomicU32 = AtomicU32::new(0);
@@ -2091,7 +2107,7 @@ static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
 };
 const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
 /// 计数器快照长度：32 个 u32
-const DBG_STATS_LEN: usize = 44 * 4;
+const DBG_STATS_LEN: usize = 50 * 4;
 
 unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
     // SAFETY: PortCls 保证 req 有效
@@ -2149,6 +2165,12 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
             DBG_AE_LAST_FAIL_STATUS.load(Ordering::Relaxed),
             DBG_PROPOSED_GET_SIZE.load(Ordering::Relaxed),
             DBG_PROPOSED_ATTR_LEN.load(Ordering::Relaxed),
+            DBG_AE_FMT_TYPE.load(Ordering::Relaxed),
+            DBG_AE_FMT_SIZE_OUT.load(Ordering::Relaxed),
+            DBG_AE_SET_BUF_SIZE.load(Ordering::Relaxed),
+            DBG_MODES_CALLS.load(Ordering::Relaxed),
+            DBG_MODES_LAST_PIN.load(Ordering::Relaxed),
+            DBG_MODES_LAST_COUNT.load(Ordering::Relaxed),
         ];
         // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
         unsafe {
