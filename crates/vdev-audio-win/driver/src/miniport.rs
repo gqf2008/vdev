@@ -197,13 +197,24 @@ static WAVERT_STREAM_VTABLE: IMiniportWaveRTStreamVtbl = IMiniportWaveRTStreamVt
 /// minor b：校验 Specifier 与 WAVEFORMATEX 字段（仅支持 48kHz / 16bit / 2ch PCM，
 /// 与数据范围 AUDIO_DATA_RANGE 一致）
 unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFORMAT) -> NTSTATUS {
+    dbg_inc(&DBG_SET_FORMAT_CALLS);
     let this = this as *mut WaveRTStream;
     // SAFETY: 调用方保证 data_format 指向完整 KSDATAFORMAT_WAVEFORMATEX
     let ksdm = unsafe { &*data_format.cast::<KSDATAFORMAT_WAVEFORMATEX>() };
+    // 诊断：记录最后一次协商到的格式（用户态经自定义属性集读回）
+    DBG_LAST_FORMAT_SIZE.store(ksdm.DataFormat.FormatSize, Ordering::Relaxed);
+    DBG_LAST_TAG.store(u32::from(ksdm.WaveFormatEx.wFormatTag), Ordering::Relaxed);
+    DBG_LAST_CHANNELS.store(u32::from(ksdm.WaveFormatEx.nChannels), Ordering::Relaxed);
+    DBG_LAST_RATE.store(ksdm.WaveFormatEx.nSamplesPerSec, Ordering::Relaxed);
+    DBG_LAST_BITS.store(
+        u32::from(ksdm.WaveFormatEx.wBitsPerSample),
+        Ordering::Relaxed,
+    );
     if ksdm.DataFormat.SubFormat != KSDATAFORMAT_SUBTYPE_PCM
         || ksdm.DataFormat.Specifier != KSDATAFORMAT_SPECIFIER_WAVEFORMATEX
         || ksdm.DataFormat.FormatSize < size_of::<KSDATAFORMAT_WAVEFORMATEX>() as u32
     {
+        DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     let wf = &ksdm.WaveFormatEx;
@@ -219,18 +230,21 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         || wf.nChannels != 2
         || wf.nBlockAlign != 4
     {
+        DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     // EXTENSIBLE 时 SubFormat 必须是 PCM（前面的 ksdm.DataFormat.SubFormat 检查对应
     // KSDATAFORMAT 的 SubFormat；这里再核对 WAVEFORMATEXTENSIBLE.SubFormat 偏移）
     if wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
         if ksdm.DataFormat.FormatSize < (size_of::<KSDATAFORMAT>() + 40) as u32 {
+            DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         }
         let base = (data_format as *const u8).add(size_of::<KSDATAFORMAT>() + 24);
         // SAFETY: FormatSize >= 104 已校验，偏移 64+24=88 处为 SubFormat GUID
         let sub = unsafe { core::ptr::read_unaligned(base.cast::<GUID>()) };
         if sub != KSDATAFORMAT_SUBTYPE_PCM {
+            DBG_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         }
     }
@@ -239,6 +253,8 @@ unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFOR
         (*this).block_align = wf.nBlockAlign;
         (*this).bytes_per_sec = wf.nSamplesPerSec * u32::from(wf.nBlockAlign);
     }
+    dbg_inc(&DBG_SET_FORMAT_OK);
+    DBG_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
     STATUS_SUCCESS
 }
 
@@ -560,6 +576,19 @@ unsafe extern "system" fn miniport_qi(
     obj: *mut *mut c_void,
 ) -> NTSTATUS {
     let this = this as *mut MiniportWaveRT;
+    // 诊断：记录引擎问过的接口（最近 8 个 GUID 的 data1）
+    let idx = DBG_QI_COUNT.fetch_add(1, Ordering::Relaxed);
+    let d1 = unsafe { (*iid).data1 };
+    match idx % 8 {
+        0 => DBG_QI_0.store(d1, Ordering::Relaxed),
+        1 => DBG_QI_1.store(d1, Ordering::Relaxed),
+        2 => DBG_QI_2.store(d1, Ordering::Relaxed),
+        3 => DBG_QI_3.store(d1, Ordering::Relaxed),
+        4 => DBG_QI_4.store(d1, Ordering::Relaxed),
+        5 => DBG_QI_5.store(d1, Ordering::Relaxed),
+        6 => DBG_QI_6.store(d1, Ordering::Relaxed),
+        _ => DBG_QI_7.store(d1, Ordering::Relaxed),
+    }
     // SAFETY: 调用方保证 iid/obj 有效
     unsafe {
         if is_equal_guid(iid, &IID_IUnknown)
@@ -568,6 +597,7 @@ unsafe extern "system" fn miniport_qi(
         {
             *obj = this.cast();
             interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
+            dbg_inc(&DBG_QI_OK);
             STATUS_SUCCESS
         } else {
             // minor e：COM 约定 E_NOINTERFACE
@@ -625,19 +655,41 @@ unsafe extern "system" fn miniport_data_range_intersection(
     out: PVOID,
     out_len_ret: *mut u32,
 ) -> NTSTATUS {
+    dbg_inc(&DBG_RANGE_CALLS);
     let _ = this;
     // _mine（本地数据范围）与 _pin 未用：交集仅比对客户端范围与 AUDIO_DATA_RANGE 常量
     // SAFETY: out_len_ret 为有效输出
     unsafe { *out_len_ret = 0 };
     // SAFETY: client 由 PortCls 传入且指向完整 KSDATARANGE
     let c = unsafe { &*client };
+    DBG_RANGE_LAST_MAJOR.store(c.MajorFormat.data1, Ordering::Relaxed);
+    DBG_RANGE_LAST_SUB.store(c.SubFormat.data1, Ordering::Relaxed);
+    DBG_RANGE_LAST_SPEC.store(c.Specifier.data1, Ordering::Relaxed);
+    DBG_RANGE_LAST_FSIZE.store(c.FormatSize, Ordering::Relaxed);
+    DBG_RANGE_LAST_OUTLEN.store(out_len, Ordering::Relaxed);
     if c.MajorFormat != KSDATAFORMAT_TYPE_AUDIO || c.SubFormat != KSDATAFORMAT_SUBTYPE_PCM {
+        DBG_RANGE_LAST_STATUS.store(STATUS_NO_MATCH as u32, Ordering::Relaxed);
         return STATUS_NO_MATCH;
     }
     let needed = size_of::<KSDATAFORMAT>() + size_of::<WAVEFORMATEX>();
-    if out_len < needed as u32 || out.is_null() {
+    // 0 长度（或空缓冲）= 调用方"只问需要多大"：必须回 STATUS_BUFFER_OVERFLOW + 所需长度。
+    // 回归（决定"端点打不开"的真凶）：原来这里统一回 STATUS_BUFFER_TOO_SMALL，调用方视为硬失败、
+    // 不再带足缓冲重试 —— 真机计数器实测 range=314 / range_ok=0 / 全部 out_len=0 +
+    // BUFFER_TOO_SMALL，引擎因此拿不到可用格式，new_stream 一直是 0，端点表现为
+    // IAudioClient::GetMixFormat|Initialize 报 0x80070491。契约对照官方 sysvad
+    // minwavert.cpp::DataRangeIntersection（"if (!OutputBufferLength) { *len = requiredSize;
+    // return STATUS_BUFFER_OVERFLOW; } else if (OutputBufferLength < requiredSize) {
+    // return STATUS_BUFFER_TOO_SMALL; }"）。
+    if out_len == 0 || out.is_null() {
         // SAFETY: 输出指针有效
         unsafe { *out_len_ret = needed as u32 };
+        DBG_RANGE_LAST_STATUS.store(STATUS_BUFFER_OVERFLOW as u32, Ordering::Relaxed);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if out_len < needed as u32 {
+        // SAFETY: 输出指针有效
+        unsafe { *out_len_ret = needed as u32 };
+        DBG_RANGE_LAST_STATUS.store(STATUS_BUFFER_TOO_SMALL as u32, Ordering::Relaxed);
         return STATUS_BUFFER_TOO_SMALL;
     }
     let df = out as *mut KSDATAFORMAT;
@@ -670,6 +722,8 @@ unsafe extern "system" fn miniport_data_range_intersection(
         );
         *out_len_ret = needed as u32;
     }
+    dbg_inc(&DBG_RANGE_OK);
+    DBG_RANGE_OK_SEEN.store(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
 
@@ -679,6 +733,7 @@ unsafe extern "system" fn miniport_init(
     _resource_list: *mut c_void,
     port: PVOID,
 ) -> NTSTATUS {
+    dbg_inc(&DBG_INIT_CALLS);
     let this = this as *mut MiniportWaveRT;
     // SAFETY: 单线程初始化
     unsafe {
@@ -696,6 +751,7 @@ unsafe extern "system" fn miniport_new_stream(
     capture: bool,
     data_format: PKSDATAFORMAT,
 ) -> NTSTATUS {
+    dbg_inc(&DBG_NEW_STREAM_CALLS);
     let this = this as *mut MiniportWaveRT;
     // 校验格式（详细字段校验在 SetFormat，PortCls 紧随其后调用）
     // SAFETY: 调用方保证 data_format 有效
@@ -984,6 +1040,7 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
 
     let need = size_of::<KsDataFormatWaveFormatExtensible>() as u32;
     if verb & KSPROPERTY_TYPE_GET != 0 {
+        dbg_inc(&DBG_PROPOSED_GET);
         if r.ValueSize < need {
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -1007,9 +1064,21 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
         if r.ValueSize < 16 {
             return STATUS_INVALID_PARAMETER;
         }
-        let p = r.Value.cast::<u8>();
         // SAFETY: ValueSize >= 16，逐字段 read_unaligned 不要求对齐
-        let tag = unsafe { core::ptr::read_unaligned(p.cast::<u16>()) };
+        let p = r.Value.cast::<u8>();
+        // 值可能是 KSDATAFORMAT_WAVEFORMATEX(TENSIBLE)（offset 0 是 FormatSize，
+        // wFormatTag 在 KSDATAFORMAT 之后 = offset 64），也可能是裸 WAVEFORMATEX（tag 在 0）。
+        // 回归（真机计数器：prop_set=1883、prop_last_tag=104=FormatSize）：原来一律按裸
+        // WAVEFORMATEX 在 offset 0 取 tag，于是把 104 当 tag、每次回
+        // STATUS_INVALID_PARAMETER —— 引擎反复提案却永远拿不到确认，端点因此打不开。
+        let tag_off = if r.ValueSize >= (size_of::<KSDATAFORMAT>() + 16) as u32 {
+            size_of::<KSDATAFORMAT>()
+        } else {
+            0
+        };
+        let tag = unsafe { core::ptr::read_unaligned(p.add(tag_off).cast::<u16>()) };
+        dbg_inc(&DBG_PROPOSED_SET);
+        DBG_PROPOSED_LAST_TAG.store(u32::from(tag), Ordering::Relaxed);
         return if tag == 1 || tag == 0xFFFE {
             STATUS_SUCCESS
         } else {
@@ -1020,7 +1089,7 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
     STATUS_INVALID_PARAMETER
 }
 
-static WAVE_PROPERTY_ITEMS: [PCPROPERTY_ITEM; 2] = [
+static WAVE_PROPERTY_ITEMS: [PCPROPERTY_ITEM; 3] = [
     PCPROPERTY_ITEM {
         Set: &KSPROPSETID_PIN,
         Id: KSPROPERTY_PIN_PROPOSEDATAFORMAT,
@@ -1032,6 +1101,13 @@ static WAVE_PROPERTY_ITEMS: [PCPROPERTY_ITEM; 2] = [
         Id: KSPROPERTY_PIN_PROPOSEDATAFORMAT2,
         Flags: KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
         Handler: wave_format_property_handler,
+    },
+    // 诊断用：自定义只读属性集（用户态 IOCTL_KS_PROPERTY 读计数器）
+    PCPROPERTY_ITEM {
+        Set: &KSPROPSETID_VDEV_DEBUG,
+        Id: KSPROPERTY_VDEV_DEBUG_STATS,
+        Flags: KSPROPERTY_TYPE_GET,
+        Handler: vdev_debug_property_handler,
     },
 ];
 static WAVE_AUTOMATION: PCAUTOMATION_TABLE = PCAUTOMATION_TABLE {
@@ -1047,9 +1123,128 @@ static WAVE_AUTOMATION: PCAUTOMATION_TABLE = PCAUTOMATION_TABLE {
     Reserved: 0,
 };
 
+// ============ 真机诊断计数器（自定义只读属性集） ============
+//
+// 目的：端点"看得见但打不开"时，无法从用户态判断引擎究竟走到驱动哪一步。
+// 这组计数器用自定义 KSPROPSETID 暴露，用户态用 IOCTL_KS_PROPERTY 读取即可
+// （无需改 CLI、无需 DbgPrint/DebugView）。生产构建里也可留着——只读、无副作用。
+static DBG_INIT_CALLS: AtomicU32 = AtomicU32::new(0);
+static DBG_NEW_STREAM_CALLS: AtomicU32 = AtomicU32::new(0);
+static DBG_SET_FORMAT_CALLS: AtomicU32 = AtomicU32::new(0);
+static DBG_SET_FORMAT_OK: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_CHANNELS: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_RATE: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_BITS: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_FORMAT_SIZE: AtomicU32 = AtomicU32::new(0);
+static DBG_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_CALLS: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_OK: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_SET: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_GET: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_LAST_TAG: AtomicU32 = AtomicU32::new(0);
+// 数据范围求交失败的现场（引擎一直在问，但 314 次全 NO_MATCH/TOO_SMALL）
+static DBG_RANGE_LAST_MAJOR: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_LAST_SUB: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_LAST_SPEC: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_LAST_FSIZE: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_LAST_OUTLEN: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+/// QueryInterface 追踪：引擎会 QI 各种接口（IMiniportWaveRT / IMiniportAudioEngineNode …），
+/// 记录总次数与最近 8 个被请求 GUID 的 data1，用于判断它是否在某个 QI 上停下。
+static DBG_QI_COUNT: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_0: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_1: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_2: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_3: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_4: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_5: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_6: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_7: AtomicU32 = AtomicU32::new(0);
+static DBG_QI_OK: AtomicU32 = AtomicU32::new(0);
+static DBG_RANGE_OK_SEEN: AtomicU32 = AtomicU32::new(0);
+
+fn dbg_inc(counter: &AtomicU32) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 自定义诊断属性集 GUID（仅本驱动使用，随机生成不复用系统 GUID）
+static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
+    data1: 0x7f4e_2a11,
+    data2: 0x9c3b,
+    data3: 0x4b6e,
+    data4: [0x8f, 0x2a, 0x1d, 0x2c, 0x3b, 0x4a, 0x5e, 0x60],
+};
+const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
+/// 计数器快照长度：32 个 u32
+const DBG_STATS_LEN: usize = 32 * 4;
+
+unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
+    // SAFETY: PortCls 保证 req 有效
+    let r = unsafe { &mut *req };
+    if r.Value.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if r.Verb & KSPROPERTY_TYPE_GET != 0 {
+        if (r.ValueSize as usize) < DBG_STATS_LEN {
+            r.ValueSize = DBG_STATS_LEN as ULONG;
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let vals = [
+            DBG_INIT_CALLS.load(Ordering::Relaxed),
+            DBG_NEW_STREAM_CALLS.load(Ordering::Relaxed),
+            DBG_SET_FORMAT_CALLS.load(Ordering::Relaxed),
+            DBG_SET_FORMAT_OK.load(Ordering::Relaxed),
+            DBG_LAST_TAG.load(Ordering::Relaxed),
+            DBG_LAST_CHANNELS.load(Ordering::Relaxed),
+            DBG_LAST_RATE.load(Ordering::Relaxed),
+            DBG_LAST_BITS.load(Ordering::Relaxed),
+            DBG_LAST_FORMAT_SIZE.load(Ordering::Relaxed),
+            DBG_LAST_STATUS.load(Ordering::Relaxed),
+            DBG_RANGE_CALLS.load(Ordering::Relaxed),
+            DBG_RANGE_OK.load(Ordering::Relaxed),
+            DBG_PROPOSED_SET.load(Ordering::Relaxed),
+            DBG_PROPOSED_GET.load(Ordering::Relaxed),
+            DBG_PROPOSED_LAST_TAG.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_MAJOR.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_SUB.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_SPEC.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_FSIZE.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_OUTLEN.load(Ordering::Relaxed),
+            DBG_RANGE_LAST_STATUS.load(Ordering::Relaxed),
+            DBG_QI_COUNT.load(Ordering::Relaxed),
+            DBG_QI_OK.load(Ordering::Relaxed),
+            DBG_QI_0.load(Ordering::Relaxed),
+            DBG_QI_1.load(Ordering::Relaxed),
+            DBG_QI_2.load(Ordering::Relaxed),
+            DBG_QI_3.load(Ordering::Relaxed),
+            DBG_QI_4.load(Ordering::Relaxed),
+            DBG_QI_5.load(Ordering::Relaxed),
+            DBG_QI_6.load(Ordering::Relaxed),
+            DBG_QI_7.load(Ordering::Relaxed),
+            DBG_RANGE_OK_SEEN.load(Ordering::Relaxed),
+        ];
+        // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
+        unsafe {
+            for (i, v) in vals.iter().enumerate() {
+                core::ptr::write_unaligned(r.Value.cast::<u32>().add(i), *v);
+            }
+        }
+        r.ValueSize = DBG_STATS_LEN as ULONG;
+        return STATUS_SUCCESS;
+    }
+    STATUS_INVALID_PARAMETER
+}
+
 /// portcls.h:1509 `PCFILTER_NODE` = ks.h:922 `KSFILTER_NODE` = `(ULONG)-1`
 /// （同 topology.rs 的本地常量；滤波器内部连接的端点之一）
 const PCFILTER_NODE: u32 = u32::MAX;
+
+/// ntstatus.h `STATUS_BUFFER_OVERFLOW` = 0x80000005（**warning 级**成功码）：
+/// KSPROPERTY_PIN_DATAINTERSECTION 以 0 长度缓冲询问"需要多大"时，PortCls/官方样例
+/// （sysvad minwavert.cpp）即用它 + `*ResultantFormatLength = requiredSize` 应答；
+/// 若这里回 STATUS_BUFFER_TOO_SMALL，调用方按硬失败处理、不会带足缓冲重试。
+const STATUS_BUFFER_OVERFLOW: NTSTATUS = 0x8000_0005u32 as i32;
 
 /// wave 滤波器内部连接：host pin ↔ bridge pin（对照本机 ToDesk 虚拟声卡实测
 /// `KSPROPERTY_TOPOLOGY_CONNECTIONS` 返回 1 条连接；sysvad 是经
