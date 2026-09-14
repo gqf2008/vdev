@@ -233,35 +233,37 @@ def windows_display():
 
 # ---------------------------------------------------------------- Windows HID
 def windows_hid():
-    W, H = 1200, 800
+    W, H = 1200, 880
     img, d = canvas(W, H)
-    title(d, W, "KMDF HID minidriver：三重契约", "编译器看不见的那部分，才是内核驱动的正确性大头")
+    title(d, W, "内核 HID：minidriver 三重契约 → 改用 VHF",
+          "编译器看不见的那部分才是正确性大头；minidriver 路线因 MsHidKmdf.inf 只在 Win11 提供而弃用")
 
     cards = [
         (70, "① INF 接线", BLUE_BG, BLUE,
          "Include/Needs 把 hidclass 与\nmshidkmdf 接进驱动栈\n\nAddService flag 0 让关联\n服务唯一\n\nAddFilter + FilterPosition=\nLower 挂对层级\n\n接错了，代码再对也是死代码"),
         (435, "② IOCTL 契约", GREEN_BG, GREEN,
-         "初版自造功能码，真实 hidport.h\n编号是 0/1/2/3/4/7/8/9/10\n（5/6 保留）\n\n4/5 恰好互换、6–9 段不存在\n→ HidD_GetAttributes 必失败\n\nfeature/报表类还在另一个头文件"), 
+         "初版自造功能码，真实 hidport.h\n编号是 0/1/2/3/4/7/8/9/10\n（5/6 保留）\n\n4/5 恰好互换、6–9 段不存在\n→ HidD_GetAttributes 必失败\n\nfeature/报表类还在另一个头文件"),
         (800, "③ 结构布局", AMBER_BG, AMBER,
          "_HID_DESCRIPTOR 被 pshpack1.h\n包裹（1 字节对齐）\n\nRust 侧初版用 #[repr(C)]\n自然对齐，偏移 7 处插了填充，\nsize_of 变 10\n\nhidclass 错位读，协商直接崩"),
     ]
     for x, head, bg, oc, body in cards:
-        card(d, x, 140, 330, 340, head, body, bg, oc, hs=23, bs=16)
+        card_fit(d, x, 140, 330, 340, head, body, bg, oc, hs=23, bs=16)
 
-    rbox(d, (70, 500, 1130, 620), GRAY_BG, BORDER, 2)
-    d.text((98, 518), "两个 crate：CLI + 驱动", font=font(22, True), fill=INK, anchor="la")
-    d.text((98, 556),
-           "用户态 CLI vdev-hid-win（SetupAPI 装驱动、注入命令）\n"
-           "内核驱动 vdev-hid-driver（独立 workspace，绑由 bindgen 生成的 vendored wdk-sys）\n"
-           "两侧经 #[path] 共享同一份契约定义（contract.rs / report.rs）——单一事实来源",
-           font=font(18), fill=INK, anchor="la", spacing=9)
+    card_fit(d, 70, 508, 1060, 108, "两个 crate：CLI + 驱动",
+         "用户态 CLI vdev-hid-win（SetupAPI 装驱动、注入命令）；内核驱动 vdev-hid-driver（独立 workspace，绑定由 bindgen 生成的 vendored wdk-sys）。\n"
+         "两侧经 #[path] 共享同一份契约定义（contract.rs / report.rs）——单一事实来源。",
+         GRAY_BG, BORDER, hs=21, bs=17)
 
-    rbox(d, (70, 650, 1130, 760), GREEN_BG, GREEN, 2)
-    d.text((98, 668), "宿主可测的部分", font=font(21, True), fill=GREEN, anchor="la")
-    d.text((98, 702),
-           "纯逻辑层 windows-free：键名→HID usage、8 字节报告布局、IOCTL 常量、描述符字节，15 个单测在 macOS 上直接跑。\n"
-           "数字键 '0' 是 0x27 而非 0x1E+(c-'0')——初版整体偏移 +1，还被一个「把错误当期望值」的单测固化了。",
-           font=font(17), fill=INK, anchor="la", spacing=8)
+    card_fit(d, 70, 634, 1060, 104, "宿主可测的部分",
+         "纯逻辑层 windows-free：键名→HID usage、8 字节报告布局、IOCTL 常量、描述符字节，15 个单测在 macOS 上直接跑。\n"
+         "数字键 '0' 是 0x27 而非 0x1E+(c-'0')——初版整体偏移 +1，还被一个「把错误当期望值」的单测固化了。",
+         GREEN_BG, GREEN, hs=21, bs=17, hcolor=GREEN)
+
+    card_fit(d, 70, 756, 1060, 96, "最终路线：VHF（Virtual HID Framework）",
+         "VHF 自 Win10 1607 起随系统提供，Win10/11 通用。\n"
+         "免掉了自己应答 IOCTL_HID_*、以及从 IRP 缓冲区掏 HID 传输包这一整类契约风险。",
+         BLUE_BG, BLUE, hs=21, bs=17, hcolor=BLUE)
+
     save(img, "windows-hid-01-contracts.png")
 
 
