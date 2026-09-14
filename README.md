@@ -127,42 +127,42 @@ cargo build --release
 .\target\release\vdev-camera-win.exe install
 ffmpeg -f dshow -list_devices true -i dummy     # 应看到 "vdev-camera"
 
-  # 显示器 / 声卡 / HID 驱动：需先签名（见下），再 install
-  vdev-display-win.exe install --inf-dir target\dist
-  vdev-display-win.exe add 1920x1080                      # 增删改查虚拟屏（需管理员）
-  vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0
+# 显示器 / 声卡 / HID 驱动：需先签名（见下），再 install
+vdev-display-win.exe install --inf-dir target\dist
+vdev-display-win.exe add 1920x1080                      # 增删改查虚拟屏（需管理员）
+vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0
 
-  # 虚拟声卡：装机后可直接注入 / 采集验证（一条命令跑环回自测）
-  cd crates\vdev-audio-win; cargo build --release
-  vdev-audio-win.exe inject --tone 1000 --amplitude 0.5 --duration 4   # 注入到「vdev 扬声器」
-  vdev-audio-win.exe capture --duration 6 --skip 4                     # 从「vdev 麦克风」采集并报电平
+# 虚拟声卡：装机后可直接注入 / 采集验证（一条命令跑环回自测）
+cd crates\vdev-audio-win; cargo build --release
+vdev-audio-win.exe inject --tone 1000 --amplitude 0.5 --duration 4   # 注入到「vdev 扬声器」
+vdev-audio-win.exe capture --duration 6 --skip 4                     # 从「vdev 麦克风」采集并报电平
 
-  # 内核 HID（VHF）：装好后即可注入
-  vdev-hid-win.exe kernel install && vdev-hid-win.exe kernel status
-  vdev-hid-win.exe kernel key a / vdev-hid-win.exe kernel mouse move 20 0
+# 内核 HID（VHF）：装好后即可注入
+vdev-hid-win.exe kernel install && vdev-hid-win.exe kernel status
+vdev-hid-win.exe kernel key a / vdev-hid-win.exe kernel mouse move 20 0
 ```
 
 驱动签名（一次性制备证书，Subject / FriendlyName 必须与 `crates/*/scripts/stage-sign*.ps1`
 的选择条件一致）：
 
 ```powershell
-  $cert = New-SelfSignedCertificate -Type CodeSigningCert `
-    -Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
-  -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
-  -KeySpec Signature -KeyUsage DigitalSignature `
-  -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+$cert = New-SelfSignedCertificate -Type CodeSigningCert `
+-Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
+-CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
+-KeySpec Signature -KeyUsage DigitalSignature `
+-TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
 Export-Certificate -Cert $cert -FilePath vdev-cert.cer
-  certutil -addstore -f TrustedPublisher vdev-cert.cer     # 管理员
-  certutil -addstore -f Root vdev-cert.cer                 # 管理员
-  bcdedit /set testsigning on                              # 声卡 / 内核 HID 需要，重启生效
-  ```
+certutil -addstore -f TrustedPublisher vdev-cert.cer     # 管理员
+certutil -addstore -f Root vdev-cert.cer                 # 管理员
+bcdedit /set testsigning on                              # 声卡 / 内核 HID 需要，重启生效
+```
 
-  宿主 GUI（`vdev-app-win`）四个页签对应四类设备：摄像头推流、显示器增删、声卡注入/环回自测、
-  键鼠注入。它不直接调驱动，而是委托各 `*-win` CLI（找不到 exe 时设 `VDEV_*_EXE` 或放到同目录）：
+宿主 GUI（`vdev-app-win`）四个页签对应四类设备：摄像头推流、显示器增删、声卡注入/环回自测、
+键鼠注入。它不直接调驱动，而是委托各 `*-win` CLI（找不到 exe 时设 `VDEV_*_EXE` 或放到同目录）：
 
-  ```powershell
-  cd crates\vdev-app-win; cargo build --release; .\target\release\vdev-app-win.exe
-  ```
+```powershell
+cd crates\vdev-app-win; cargo build --release; .\target\release\vdev-app-win.exe
+```
 
 ## 文档导航
 
@@ -174,9 +174,9 @@ Export-Certificate -Cert $cert -FilePath vdev-cert.cer
 |---|---|
 | 快速了解项目能做什么 | [`docs/community/announcement-ai-mic.md`](docs/community/announcement-ai-mic.md) |
 | 各设备怎么写出来的（含踩坑） | [`docs/community/README.md`](docs/community/README.md)（系列总目录） |
-  | Windows 声卡（驱动/CLI/GUI/验收） | [`crates/vdev-audio-win/README.md`](crates/vdev-audio-win/README.md) |
-  | 显示器驱动构建/签名/CLI/验收 | [`crates/vdev-display-win/README.md`](crates/vdev-display-win/README.md) |
-  | 内核 HID（VHF）驱动构建/注入 | [`crates/vdev-hid-win/kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md) |
+| Windows 声卡（驱动/CLI/GUI/验收） | [`crates/vdev-audio-win/README.md`](crates/vdev-audio-win/README.md) |
+| 显示器驱动构建/签名/CLI/验收 | [`crates/vdev-display-win/README.md`](crates/vdev-display-win/README.md) |
+| 内核 HID（VHF）驱动构建/注入 | [`crates/vdev-hid-win/kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md) |
 | AI 虚拟麦克风 | [`crates/vdev-mic-agent/README.md`](crates/vdev-mic-agent/README.md) |
 | macOS 路线调研 / 选型过程 | [`docs/dev/`](docs/dev) |
 
@@ -184,13 +184,13 @@ Export-Certificate -Cert $cert -FilePath vdev-cert.cer
 
 - [x] macOS：HID / 屏幕 / 摄像头（CMIOExtension 全链路）/ 声卡 可用
 - [x] macOS：虚拟屏 + 摄像头串流 + SFU 端到端；设备侧滤镜（美颜 / 背景替换）
-  - [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
-  - [x] Windows：IddCx UMDF 显示器 / PortCls WaveRT 声卡 / VHF 虚拟 HID —— 代码与门禁就绪
-  - [x] Windows：三驱动真机安装验证（测试签名）——显示器第二块屏、声卡端点可开流且环回有数据、
-        键鼠出现在设备管理器且实弹注入生效
-  - [x] Windows：CLI `inject`/`capture` 与 GUI「虚拟声卡」页（注入 + 一键环回自测）
-  - [ ] Windows：虚拟声卡环回固定延迟从 1.36s 调小（当前 = 1 MB 环形缓冲）
-  - [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
+- [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
+- [x] Windows：IddCx UMDF 显示器 / PortCls WaveRT 声卡 / VHF 虚拟 HID —— 代码与门禁就绪
+- [x] Windows：三驱动真机安装验证（测试签名）——显示器第二块屏、声卡端点可开流且环回有数据、
+  键鼠出现在设备管理器且实弹注入生效
+- [x] Windows：CLI `inject`/`capture` 与 GUI「虚拟声卡」页（注入 + 一键环回自测）
+- [ ] Windows：虚拟声卡环回固定延迟从 1.36s 调小（当前 = 1 MB 环形缓冲）
+- [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
 
 ## 内容与授权
 
