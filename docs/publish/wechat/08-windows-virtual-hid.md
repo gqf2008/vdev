@@ -1,8 +1,21 @@
-# 用 Rust 写 Windows 内核虚拟键鼠：KMDF HID minidriver 从报告描述符到注入链路
+# 用 Rust 写 Windows 内核虚拟键鼠：从 KMDF HID minidriver 到 Virtual HID Framework
 
 **内核 HID minidriver 的正确性大头不在语法，而在三重契约：INF 接线、IOCTL 编号、结构体布局——编译器全都看不见。**
 
 > 本文是 vdev 虚拟设备驱动开发系列之一（共 9 篇）。完整源码与代码位置标注见仓库对应文章。
+
+> **2026-09-14 更新：内核路线已从 minidriver 换成 VHF（Virtual HID Framework）。** 原因很硬：
+> minidriver 路线要 `Include=MsHidKmdf.inf`，而该文件只随 **Windows 11（build 22000+）** 提供——
+> Win10 19045 的 `%SystemRoot%\inf` 下没有它，安装直接报 `0xE0000219`。
+> **VHF 自 Win10 1607 起随系统提供**，跨版本可用，且免去"自己应答 `IOCTL_HID_*`、从
+> `Irp->UserBuffer` 掏 `HID_XFER_PACKET`"这一整类契约风险：描述符与输入报告上行都由 VHF 代管，
+> 驱动只需 `VhfCreate`/`VhfStart` 建虚拟 HID 设备、`VhfReadReportSubmit` 交报告；
+> 用户态用 `HidD_SetFeature` 写厂商 Feature 报告即注入（`WriteFile` 路线返回 `ERROR_INVALID_FUNCTION`），
+> INF 里则需要 `HKR,,LowerFilters,0x00010000,"vhf"`（缺它 `VhfCreate` 直接返回
+> `STATUS_INVALID_DEVICE_REQUEST(0xC0000010)`）。
+> **下文保留了 minidriver 版的完整实现与踩坑**——它是一条真实的失败路径，价值在"为什么走不通"
+> 与"哪些契约在 VHF 下依然适用"（结构布局、报告描述符、键码映射三节完全不失效）。
+> 实测结果见文末"现状与局限"。
 
 ## 1. 为什么要"软件造一套键盘鼠标"
 
@@ -44,7 +57,7 @@ pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
 
 还有一个值得注意的细节：按键码数组的 Usage/Logical Maximum 写到 `0x73`（115）而不是常见的 `0x65`（101），因为 F13–F24 的 usage 落在 0x68–0x73，上限给低了这些键会被 hidclass 静默丢弃——这是审查阶段抓出来的真实 bug（见第 6 节）。
 
-## 3. KMDF HID minidriver 架构
+## 3. 第一版：KMDF HID minidriver 架构（minidriver 路线，已弃用）
 
 Windows 的 HID 栈是标准的类驱动/微型驱动分层：
 
@@ -77,7 +90,11 @@ AddFilter=vdev_hid,,vdev_hid_Filter_Install
 
 全局状态用一把 **WDF 框架自旋锁**保护：两个实例（各自的队列句柄、最近一次注入的 8 字节报告、`report_ready` 标志）都在锁内访问。`StateCell` 用 `UnsafeCell` + 手写 `unsafe impl Sync` 承载，RAII 守卫在 `Drop` 里 `WdfSpinLockRelease`——为什么不用手工 `KSPIN_LOCK`，踩坑第 ⑤ 条有交代。
 
-## 4. IOCTL 处理：HID 内部契约全家福
+## 4. IOCTL 处理：HID 内部契约全家福（minidriver 版，已弃用）
+
+> 本节是**第一版 minidriver 实现**的契约细节（Win11 可用、Win10 装不上）。当前 VHF 实现不再
+> 自己应答这些内部 IOCTL——但"数值必须可溯源、可断言"这条纪律与实现选型无关，且报告描述符、
+> 键码映射、结构布局三节在 VHF 下**完全继续适用**。
 
 minidriver 的全部工作就是一个 `match`。hidclass 与 minidriver 之间的 IOCTL 定义在 `hidport.h` 与 `hidclass.h`，都是 `CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B, 功能码, Method, FILE_ANY_ACCESS)` 的展开。vdev 把这组常量放在 windows-free 的 `contract.rs` 里，宏展开对应关系如下（数值可在宿主机单测中断言，）：
 
@@ -246,11 +263,11 @@ vdev-hid-win kernel uninstall
 
 ## 8. 现状与局限
 
-- **状态**：构建、clippy、fmt 全绿；IOCTL 常量/描述符字节/键码映射/报告布局有 15 个宿主单测守护（契约层 windows-free，macOS 上即可运行）。真机安装验证进行中——当前需要测试签名，属"构建与自测通过、装机验证未完成"的如实状态。
+- **状态：已真机验证通过（2026-09-14，Win10 19045 x64 + 测试签名）。** 设备管理器 HID 类出现「vdev 虚拟键盘」（`Root\vdev-hid`）与「vdev 虚拟鼠标」（`Root\vdev-hid-mouse`）两个 `CM_PROB_NONE` 节点；实弹注入逐项生效（字符、修饰键、Ctrl+A、鼠标相对移动/点击/滚轮）。构建、clippy、fmt 全绿；IOCTL 常量/描述符字节/键码映射/报告布局有 15 个宿主单测守护（契约层 windows-free，macOS 上即可运行）。
 - **功能边界**：无 feature 报告（`GET/SET_FEATURE` 返回 `STATUS_NOT_SUPPORTED` 而非伪成功）；不实现 HID 字符串（由 INF/devnode 提供）；键盘一次至多 6 键 + 8 修饰位；鼠标只有相对移动（±127）与滚轮（120 的倍数、实际写入 ±127），无绝对坐标模式。
 - **工程取舍**：panic 处理器直接 `KeBugCheckEx(0xE2)` 留蓝屏证据而不是自旋挂死（内核 no_std 无法 unwind，）；`HID_DESCRIPTOR` 的 packed 布局断言只能在 Windows 侧编译验证（wdk-build 拒绝非 Windows 主机），契约层则拆出 `contract.rs`/`report.rs` 两个 windows-free 模块让宿主单测真正触达——用户态与内核经 `#[path]` 共享同一份契约定义，单一事实来源。
 
-## 9. 写在最后：minidriver 的"三重契约"
+## 9. 写在最后：三重契约 + 一条选型约束
 
 回看这轮修复，所有问题可以归约为三类契约，本文称之为 **minidriver 三重契约**：
 
