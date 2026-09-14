@@ -28,8 +28,15 @@ if (-not $isAdmin) {
         '-RepoRoot', "`"$RepoRoot`"", '-OutDir', "`"$OutDir`"")
     if ($HidCli) { $fwd += @('-HidCli', "`"$HidCli`"") }
     if ($HidDist) { $fwd += @('-HidDist', "`"$HidDist`"") }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $fwd
-    exit 0
+    # 用 -Wait -PassThru 把**子进程的退出码**透传出去：否则 UAC 被取消（或子进程失败）时
+    # 包装脚本仍会 exit 0，读者会把"没跑"当成"跑过且通过"。
+    try {
+        $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $fwd -Wait -PassThru
+        exit $child.ExitCode
+    } catch {
+        Write-Output ("❌ 提权失败或被取消：{0}（未做任何改动）" -f $_.Exception.Message)
+        exit 1
+    }
 }
 
 Start-Transcript -Path (Join-Path $OutDir 'hid-converge.log') -Force | Out-Null
