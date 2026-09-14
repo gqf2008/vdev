@@ -194,11 +194,21 @@ static WAVERT_STREAM_VTABLE: IMiniportWaveRTStreamVtbl = IMiniportWaveRTStreamVt
 
 // ---- 流方法实现 ----
 
-/// minor b：校验 Specifier 与 WAVEFORMATEX 字段（仅支持 48kHz / 16bit / 2ch PCM，
-/// 与数据范围 AUDIO_DATA_RANGE 一致）
 unsafe extern "system" fn stream_set_format(this: PVOID, data_format: PKSDATAFORMAT) -> NTSTATUS {
+    // SAFETY: this 为有效流对象（PortCls 传入）
+    unsafe { apply_stream_format(this as *mut WaveRTStream, data_format) }
+}
+
+/// minor b：校验 Specifier 与 WAVEFORMATEX 字段（仅支持 48kHz / 16bit / 2ch PCM，
+/// 与数据范围 AUDIO_DATA_RANGE 一致）并记录 block_align / bytes_per_sec。
+///
+/// **两条路径都要走这里**：PortCls 的 stream `SetFormat`，以及 `NewStream` 的
+/// `DataFormat` 参数。WaveRT 模型里格式实际是在 NewStream 传入的（sysvad 亦为
+/// `NewStream → stream->Init(..., DataFormat, ...)`）；原实现只在 SetFormat 里记格式，
+/// 而 WaveRT 根本不会调 SetFormat → `bytes_per_sec` 恒为 0 → `GetPosition` 永不推进
+/// → 真机实测引擎 padding 一直卡在满值 48000、capture 一个数据包都收不到。
+unsafe fn apply_stream_format(this: *mut WaveRTStream, data_format: PKSDATAFORMAT) -> NTSTATUS {
     dbg_inc(&DBG_SET_FORMAT_CALLS);
-    let this = this as *mut WaveRTStream;
     // SAFETY: 调用方保证 data_format 指向完整 KSDATAFORMAT_WAVEFORMATEX
     let ksdm = unsafe { &*data_format.cast::<KSDATAFORMAT_WAVEFORMATEX>() };
     // 诊断：记录最后一次协商到的格式（用户态经自定义属性集读回）
@@ -1538,7 +1548,6 @@ unsafe extern "system" fn miniport_new_stream(
 ) -> NTSTATUS {
     dbg_inc(&DBG_NEW_STREAM_CALLS);
     let this = this as *mut MiniportWaveRT;
-    // 校验格式（详细字段校验在 SetFormat，PortCls 紧随其后调用）
     // SAFETY: 调用方保证 data_format 有效
     let df = unsafe { &*data_format };
     if df.SubFormat != KSDATAFORMAT_SUBTYPE_PCM {
@@ -1548,6 +1557,15 @@ unsafe extern "system" fn miniport_new_stream(
     let stream = unsafe { WaveRTStream::new(this, port_stream, capture) };
     if stream.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    // WaveRT 的格式是随 NewStream 传入的（PortCls 之后**不会**再调 SetFormat），
+    // 必须在这里就校验并记录 block_align / bytes_per_sec，否则 GetPosition 不会推进。
+    // SAFETY: stream 刚创建且有效；data_format 由调用方保证有效
+    let status = unsafe { apply_stream_format(stream, data_format) };
+    if status < 0 {
+        // SAFETY: 创建时 refcount=1，出错路径自己释放（release 到 0 会 free）
+        unsafe { stream_release(stream.cast()) };
+        return status;
     }
     // SAFETY: 输出流指针
     unsafe { *stream_out = stream.cast() };
