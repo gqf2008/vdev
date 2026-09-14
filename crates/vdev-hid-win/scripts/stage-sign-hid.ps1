@@ -3,7 +3,8 @@ $ErrorActionPreference = "Stop"
 $root = Join-Path $PSScriptRoot ".."
 $rel = Join-Path $root "kernel\target\x86_64-pc-windows-msvc\release"
 $dist = Join-Path $root "target\dist"
-$kit = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0"
+. (Join-Path $PSScriptRoot "..\..\..\scripts\sign-common.ps1")
+$kit = Get-VdevWdkBin
 $signtool = Join-Path $kit "x64\signtool.exe"
 $inf2cat = Join-Path $kit "x86\Inf2Cat.exe"
 
@@ -17,8 +18,9 @@ if (-not (Test-Path $dll)) {
 Copy-Item $dll (Join-Path $dist "vdev_hid.sys")
 Copy-Item (Join-Path $root "kernel\driver\vdev-hid.inf") $dist
 
-$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.FriendlyName -eq "vdev-driver" } | Select-Object -First 1
-if (-not $cert) { throw "找不到 vdev-driver 证书" }
+# 证书来源见 scripts/sign-common.ps1（本地按 vdev-driver 找；CI 走 VDEV_SIGN_PFX / VDEV_SIGN_THUMBPRINT）
+$cert = Get-VdevSigningCert
+Export-VdevSigningCert -Cert $cert -Dist $dist
 
 # 用 /sha1（指纹）选证书，不用 /n：signtool 的 /n 匹配主题 **CN 值**
 # （如 "vdev Virtual Display Driver"），传 $cert.Subject 这种完整 DN（"CN=..."）
