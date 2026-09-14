@@ -1,4 +1,4 @@
-# 用 Rust 把虚拟声卡写进 Windows 内核：六个蓝屏级踩坑与"编译过 ≠ 能跑"
+# 用 Rust 把虚拟声卡写进 Windows 内核：六个蓝屏级踩坑 + 五个"能枚举却打不开"的运行时坑
 
 > 本文是 vdev 虚拟设备驱动开发系列之一（共 9 篇）。完整源码与代码位置标注见仓库对应文章。
 
@@ -6,7 +6,7 @@
 
 ![Windows 虚拟声卡：三条路线的取舍](../images/win-audio-01-routes.png)
 
-> 状态如实说：这个驱动的**构建与门禁全绿、宿主单测全过，但真机安装验证仍在进行中**（PortCls filter 图构建、端点枚举、WASAPI 实录实放还没在真机上跑完）。本文讲的是**怎么把内核驱动写对**，不是"可以拿来用的成品"。
+> 状态如实说（2026-09-14 更新）：这个驱动**已在 Win10 19045 x64（测试签名）真机验证通过**——端点可开流（`GetDevicePeriod`/`GetMixFormat`/`Initialize` 共享与独占/`Start` 全 `S_OK`），向「vdev 扬声器」注入 0.5 幅度 1 kHz 正弦后，从「vdev 麦克风」采回 **RMS −6.0 dBFS / 峰值 −6.0 dBFS**（0.5 幅度正弦的理论值），基线静音 −93.8 dBFS；CLI 有 `inject`/`capture`，GUI 有「环回自测」按钮。**但"能枚举"到"真能用"之间还隔着一层运行时坑**——本文第五、六两节分别是静态审查抓出的蓝屏级缺陷与装机后才暴露的五个缺陷。
 
 ## 一、为什么选了最难走的那条路
 
@@ -222,15 +222,31 @@ vdev-audio-win.exe uninstall                       # 卸载
 
 INF 是 Media 类、`Root\vdev-audio` 硬件 ID。有个值得单独说的细节：**INF 必须是 UTF-16 LE（带 BOM）**——SetupAPI 只认这个编码，仓库的宿主单测会读 INF 字节流校验 BOM、CRLF 行尾，以及四个接口模板与驱动里注册名逐字节一致（这个 INF 曾是 UTF-8 + 双 BOM，还是审查抓出来的）。
 
+## 六、装机之后：五个"能枚举却打不开"的运行时坑
+
+前六个案例是静态审查抓出来的，这一批正好相反：门禁全绿、设备管理器里有声卡、控制面板里两个端点都在、`IMMDevice::Activate` 也成功——**但第一个真正要打开 KS pin 的调用就失败**。它们只在真机上暴露，靠三件事定位：逐调用探测 HRESULT、跟同机可用设备做 KS 属性对照、必要时扫第三方驱动的二进制描述符。
+
+1. **wave 开流 pin 没暴露 WaveRT 的环回流接口。** 现象：`Activate` 返回 `S_OK`，紧接着 `GetDevicePeriod` 返回 `0x80070491`（`ERROR_NO_MATCH`），之后全盘失败；同机可用虚拟声卡同一步 `hr=0`。根因：`KSPROPERTY_PIN_INTERFACES` 该给 `KSINTERFACE_STANDARD_LOOPED_STREAMING(1)`（audiodg 按它选接口），我们给了 `..._STREAMING(0)`，选不到即 `STATUS_NO_MATCH`。
+2. **数据范围缺"音频信号处理模式"属性列表。** Win10 引擎给端点定设备格式时按信号处理模式匹配数据范围；范围要置 `KSDATARANGE_ATTRIBUTES`，且指针数组为 `[范围, KSATTRIBUTE_LIST]`，其中一条 `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE`（sysvad `endpoints.h` 同款）。
+3. **`KSPROPERTY_PIN_PROPOSEDATAFORMAT` 的 SET 被当成"照单全收"。** 引擎对这个属性的调用计数涨到 **1600+ 次**却始终不建流；因为 SET 的语义是**校验**（支持回 `STATUS_SUCCESS`、不支持回 `STATUS_NO_MATCH`、不回填缓冲），我们却对每个候选格式都回成功还回写设备格式。改成校验语义后计数归零。
+4. **WaveRT 的格式随 `NewStream` 传入，stream `SetFormat` 根本不会被调。** 现象：`Initialize`/`Start` 全部成功但**不出声**——渲染 `GetCurrentPadding` 恒等于缓冲满值（48000 不变），采集 `GetNextPacketSize` 恒 0；计数器 `new_stream=17` 而 `set_format=0`。格式没进流对象 → `bytes_per_sec=0` → `GetPosition` 的 QPC 推进被判不可用、位置恒 0。修法：抽出 `apply_stream_format()`，`SetFormat` 与 `NewStream` 两条路径都调。
+5. **KS 结构的"线上长度"不能用 Rust 的 `size_of`。** `KSDATAFORMAT_WAVEFORMATEX` 线上是 `64+18=82` 字节，Rust 结构体因 8 字节对齐会 padding 成 84/88；用它当阈值会把引擎发来的合法 82 字节设备格式判死（现场：`set_format=54`、`set_format_ok=16`、`last_size=0x52`）。改成显式 82 后，独占模式也从 `0x8889000F` 变 `S_OK`。
+
+> 附带的同类坑：`windows` crate 里 `WAVEFORMATEX` 是 packed 类型——既不能取字段引用，也不能"把 18 字节拷到栈上再读偏移 24 的 SubFormat"（越界读栈垃圾；现场是 float32 混音格式被误判成"位深 32 不支持"）。
+
+**定位顺序**（省时间）：①接口/属性形状（KS 层与可用设备逐属性 diff）→ ②`GetDevicePeriod` 是否 0 → ③`GetMixFormat`/`Initialize` 是否 0 → ④`GetCurrentPadding` 是否下降 → ⑤capture 是否有包。每一步都能独立归因，别一次改多处；探测脚本记得给 COM 接口方法加 `[PreserveSig]`，否则非 0 HRESULT 会被抛成异常、看不出是哪一步。
+
 ## 七、现状与局限
 
 如实交底：
 
-- **构建与门禁全绿，真机验证仍在进行中。** 交叉编译通过、宿主单测（环形缓冲性质测试、布局断言、描述符一致性、GUID 字节比对、INF 编码契约）全部通过；但 PortCls filter 图构建、端点枚举、WASAPI 实录实放这些运行时行为，只能装到开了测试签名的真机上验证，这一步尚未完成。
-- **格式固定**：48 kHz / 16 bit / 双声道 PCM，`stream_set_format` 硬校验，别的不收。
+- **已真机验证通过（2026-09-14，Win10 19045 x64 + 测试签名）。** 端点渲染/采集与同机 Realtek/ToDesk 逐调用一致（`GetDevicePeriod hr=0`、`GetMixFormat` float32/48k、`IsFormatSupported`、共享与独占 `Initialize`、`GetBufferSize=48000`、`Start` 全 `S_OK`）；环回实测：注入 0.5 幅度 1 kHz 正弦 → 采回 RMS −6.0 dBFS / 峰值 −6.0 dBFS（理论值），基线静音 −93.8 dBFS；CLI `inject`/`capture` 与 GUI「环回自测」都已实测。
+- **格式固定**：48 kHz / 16 bit / 双声道 PCM，`apply_stream_format` 硬校验，别的不收（引擎负责混音格式↔设备格式转换）。
 - **位置走轮询**：无硬件位置寄存器（修复后明确返回 `STATUS_NOT_SUPPORTED`），依赖 PortCls 的轮询模式 + QPC 时间锚。
-- **音量 / 静音是"记事本"**：topology 节点属性真实可读写，但没有 DSP 效果。
-- **没有用户态注入接口**：环回纯内核内完成，驱动没有任何 IOCTL / WriteFile 面（安全面上是干净的，但"宿主程序直接往环形缓冲注音"目前做不到）。
+- **渲染拓扑直通、采集拓扑串音量/静音**：渲染侧音量的处理交给引擎软件混音层，驱动不再替它做节点（第一版按 sysvad 走"节点中转"，正是打不开的原因之一）。
+- **环回有固定积压**：两个流共享 1 MB 非分页环形缓冲，48 kHz/32bit/2ch 下约 **1.36 s**——"先注入再采集"的顺序执行读到的是环里的历史数据，量当次注入必须并发（CLI/GUI 的环回自测都是并发的），或把缓冲调小。
+- **驱动本身没有用户态注入接口，但端点侧有入口**：环回纯内核内完成，驱动不暴露 IOCTL/WriteFile 面（安全面干净）；宿主注音是往「vdev 扬声器」推流（`vdev-audio-win inject`），采集是 `capture`，两者并发即环回自测。
+- **待办**：Driver Verifier 专项（special pool + DDI compliance）未跑；环形缓冲积压可按需调小。
 
 ## 写在最后：内核驱动"编译过 ≠ 能跑"
 
@@ -241,6 +257,8 @@ INF 是 Media 类、`Root\vdev-audio` 硬件 ID。有个值得单独说的细节
 1. **官方样例与 WDK 头文件是唯一权威。** sysvad 的安装顺序、连接表条目、端点拓扑，逐行照抄不丢人；结构布局、GUID、NTSTATUS、vtable 槽序，逐字段对照头文件，注释里写明行号来源。
 2. **把"内核才能验证的"压缩到最小，其余全部下沉为宿主可测。** 纯数学抽模块、纯常量抽模块、布局断言进 `#[cfg(test)]`——本驱动最终有 6 个驱动测试模块（含 CLI 共 7 个）可以在 macOS 宿主跑，其中两个（回绕性质测试、NTSTATUS / GUID 值回归）正是案例二和案例五的疫苗。
 3. **装上 Driver Verifier 再上真机。** special pool + DDI compliance 会把池越界和 IRQL 违规在第一时间变成可定位的 bugcheck，而不是等池损坏在别处爆炸。
+4. **"能枚举"离"能用"很远。** 设备管理器有节点、控制面板有端点、`Activate` 返回 `S_OK`，但第一个真正打开 KS pin 的调用就已经在报错。**别把"看得见"当"验证过"**：把 HRESULT 打到第一个失败点，再拿同机可用设备逐属性对照——比读文档猜快得多（第六节）。
+5. **官方样例也要对版本与平台核对。** sysvad 的"节点中转"拓扑在虚拟设备上并不需要；`MsHidKmdf.inf` 只随 Win11 提供（同系列 HID 篇的换路线原因）。抄之前先确认依赖在目标系统上存在、且确实是当前需要的形状。
 
 > 内核驱动的世界没有"先跑起来再说"。每一个凭记忆写出的字节，最终都会以蓝屏的形式找你复核。
 

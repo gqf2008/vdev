@@ -22,7 +22,7 @@ Windows 上做虚拟显示器，历史上有两条路线：
 
 - **官方支持**：OS 原生把桌面渲染进虚拟屏，`EnumDisplayDevices`、系统设置里它就是一块正常的显示器；
 - **用户态隔离**：驱动是运行在 `WUDFHost.exe` 宿主进程里的 DLL，崩溃不影响内核，调试也像普通用户态程序；
-- **签名门槛低**：UMDF 驱动包用自签名代码签名证书（装进 TrustedPublisher + Root）通常即可安装，不必开测试签名，更不必 EV 证书（仓库 [README 状态框](https://github.com/gqf2008/vdev#vdev-display-win--iddcx-umdf-虚拟显示器-装机验证中)对四类设备的签名门槛有一张对照表）。
+- **签名门槛低**：UMDF 驱动包用自签名代码签名证书（装进 TrustedPublisher + Root）通常即可安装，不必开测试签名，更不必 EV 证书（四类设备的签名门槛见仓库 [README](https://github.com/gqf2008/vdev#readme) 的构建与安装章节：摄像头免签名、显示器自签名即可、声卡与内核 HID 需测试签名）。
 
 代价是：**这是一个真正的驱动项目**。哪怕代码在用户态，它面对的是 C ABI、框架管理的对象生命周期、和一份只在装了 WDK 的 Windows 主机上才存在的头文件体系。本文剩下的篇幅，就是把这条链路完整走一遍。
 
@@ -220,14 +220,20 @@ vdev-display-win.exe uninstall
 
 ## 九、现状与局限
 
-引用仓库 README 状态框的原话：`vdev-display-win` **代码已合入 main、构建与单测通过，真机安装验证进行中**（需先准备自签名证书）。也就是说：静态审查、CI 门禁、协议层单测都已就绪，但"装上真机、睡眠唤醒、枚举显示、端到端推流"的实机验证还在进行中。
+**已真机验证通过（2026-09-14，Win10 19045 x64）**：装机后 `add 1920x1080` 让系统多出一块屏
+（`\\.\DISPLAY223` 1920x1080，Monitor 类出现 "Generic PnP Monitor"），`set-mode 0 2560x1440`
+返回 0，`list` 能枚举到该虚拟屏；静态审查、CI 门禁（含 `windows-driver-wdk` 硬门禁）、协议层
+单测都已就绪。README 的状态框已随之从"装机验证中"改为 ✅ 可用。
 
 已知局限，如实列出：
 
 - swap chain 处理是**直通**（取帧即还），画面注入/捕获是后续工作；
 - 硬件光标能力**刻意未声明**：曾声明支持却不喂数据导致光标更新丢失，现回退为 OS 软件光标（`crates/vdev-display-win/driver/src/context.rs:283–287` 注释），绑定层的 `IddCxMonitorSetupHardwareCursor` 封装保留备用；
 - INF 仅声明 `NTamd64`，而 build.rs 已支持 ARM64 目标——两侧尚未对齐；
-- SDDL 限定管理员意味着 CLI 需要提权才能连驱动，日常频繁增删显示器的场景可以考虑收紧为交互用户 + 仍保留首实例防护；
+- **CLI 需要管理员**：驱动侧管道 SDDL 只给 `BA`/`SY`，所以 `add`/`list`/`set-mode`/`remove` 这类
+  要连驱动命令都必须提权（CLI 只在 `install`/`uninstall` 上自动 UAC，其余子命令会直接失败）。
+  日常频繁增删显示器的场景可以考虑放宽为交互用户 + 仍保留首实例防护；
+- **多虚拟屏会崩**：追加第二块以上的节点时 UMDF 侧不稳定（实测崩），当前按"单虚拟屏"使用；
 - 驱动侧对 `adapter_commit_modes` 目前直接返回成功，未记录 OS 实际提交的模式。
 
 ## 十、写在最后

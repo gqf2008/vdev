@@ -24,7 +24,7 @@
 | 5 | [Windows 虚拟摄像头](community/windows-virtual-camera.md) | Windows x64 | DirectShow Source Filter（用户态 COM） |
 | 6 | [Windows 虚拟显示器](community/windows-virtual-display.md) | Windows x64 | IddCx UMDF 间接显示驱动 |
 | 7 | [Windows 虚拟声卡](community/windows-virtual-audio.md) | Windows x64 | PortCls WaveRT（WDM 内核驱动） |
-| 8 | [Windows 虚拟 HID](community/windows-virtual-hid.md) | Windows x64 | KMDF HID minidriver |
+| 8 | [Windows 虚拟 HID](community/windows-virtual-hid.md) | Windows x64 | Virtual HID Framework（VHF，Win10/11 通用） |
 | 9 | [AI 虚拟麦克风](community/ai-virtual-mic.md) | macOS + Windows | RNNoise + CoreAudio / WASAPI（用户态） |
 | — | [发布公告：AI 虚拟麦克风](community/announcement-ai-mic.md) | — | 速览篇：只讲结果与上手；机制见第 9 篇 |
 
@@ -38,12 +38,17 @@
 | [macos-route-ideas.md](dev/macos-route-ideas.md) | macOS 侧"值得写"的内容线索（选题阶段） | 选题笔记，非约定 |
 | [windows-route-ideas.md](dev/windows-route-ideas.md) | Windows 侧"值得写"的内容线索（选题阶段） | 选题笔记，非约定 |
 | [windows-camera-design.md](dev/windows-camera-design.md) | Windows 虚拟摄像头（DirectShow）设计与踩坑 | 实现已合入，文中为设计/联调过程 |
-| [windows-display-audio-design.md](dev/windows-display-audio-design.md) | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 | 实现已合入，文中为设计过程 |
+| [windows-display-audio-design.md](dev/windows-display-audio-design.md) | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 | 实现已合入并真机验证（2026-09-14）；文中为设计过程 |
+
+> Windows 四类设备（摄像头 / 显示器 / 声卡 / 键鼠）均已在 Win10 19045 x64 上装机验证，
+> 但`dev/` 下的笔记**保持写作时的口径**（反映当时的决策与踩坑），不随验证结论回改；
+> 要最新状态请看根 [`README.md`](../README.md) 与 `community/` 各篇的"现状与局限"章节。
 
 此外，组件级的构建/签名/验收说明放在各自 crate 内：
 
+- [`crates/vdev-audio-win/README.md`](../crates/vdev-audio-win/README.md) — 虚拟声卡驱动 / CLI / GUI / 验收
 - [`crates/vdev-display-win/README.md`](../crates/vdev-display-win/README.md) — 虚拟显示器驱动
-- [`crates/vdev-hid-win/kernel/driver/README.md`](../crates/vdev-hid-win/kernel/driver/README.md) — 内核 HID 驱动
+- [`crates/vdev-hid-win/kernel/driver/README.md`](../crates/vdev-hid-win/kernel/driver/README.md) — 内核 HID（VHF）驱动
 - [`crates/vdev-mic-agent/README.md`](../crates/vdev-mic-agent/README.md) — AI 虚拟麦克风
 - 其余 crate 的说明见根 [`README.md`](../README.md) 的"仓库结构"与"文档导航"
 

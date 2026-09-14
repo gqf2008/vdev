@@ -220,7 +220,9 @@ vdev-display-win.exe uninstall
 
 ## 九、现状与局限
 
-引用仓库 README 状态框的原话：`vdev-display-win` **代码已合入 main、构建与单测通过，真机安装验证进行中**（需先准备自签名证书）。也就是说：静态审查、CI 门禁、协议层单测都已就绪，但"装上真机、睡眠唤醒、枚举显示、端到端推流"的实机验证还在进行中。
+**已真机验证通过（2026-09-14，Win10 19045 x64）**：装机后 `add 1920x1080` 让系统多出一块屏（`\\.\DISPLAY223` 1920x1080，设备管理器 Monitor 类出现 "Generic PnP Monitor"），`set-mode 0 2560x1440` 返回 0，`list` 能枚举到它。静态审查、CI 门禁（含 `windows-driver-wdk` 硬门禁）、协议层单测都已在位，README 状态框也已从"装机验证中"改为 ✅ 可用。
+
+已知两条使用限制：`add`/`list`/`set-mode`/`remove` 都需要管理员（驱动侧管道 SDDL 只给 BA/SY，CLI 只在 install/uninstall 自动提权）；当前按单虚拟屏使用——追加第二块以上的节点时 UMDF 侧不稳定（实测崩）。
 
 已知局限，如实列出：
 
