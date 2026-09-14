@@ -35,6 +35,7 @@
 | `hid-converge.ps1` | 把幽灵节点收敛成"键盘/鼠标各一个"（CLI uninstall + `pnputil /remove-device` 兜底 + 重装 + 注入冒烟） | **管理员** |
 | `hid-reinstall.ps1` | **干净重装**：删掉 store 里的 `vdev-hid.inf` 包（同版本不删不会替换文件）→ 重新安装 → 断言恰好一对 | **管理员** |
 | `hid-channel-probe.py` | 逐条通道试写鼠标报告（SetFeature 帧化/裸、WriteFile），打印 API 结果、`errno` 与光标位移，用来区分"写没到驱动"与"到了没进系统" | 普通 |
+| `drivers-cleanup.ps1` | 清理 driver store 里不再被 vdev 设备使用的历史驱动包（自动保留现役包；`-DryRun` 只列不删） | **管理员**（`-DryRun` 不需要） |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\acceptance\hid-keyboard-verify.ps1
