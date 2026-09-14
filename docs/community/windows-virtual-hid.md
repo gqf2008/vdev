@@ -28,25 +28,36 @@ HID 设备用**报告描述符（Report Descriptor）**自描述数据格式。�
 
 键盘的经典 8 字节输入报告布局：第 0 字节是 8 个修饰键（左 Ctrl 到右 Win）的位图，第 1 字节保留，第 2–7 字节是最多 6 个按下的按键码（数组型字段，每个字节填一个 Key Codes usage）。鼠标则常用 1 字节键位（3 bit + 5 bit 填充）加 X/Y/滚轮三个 int8 相对值，共 4 字节。
 
-vdev 的键盘描述符（完整 60 字节）有一个关键设计——**厂商输出管道**：
+vdev 的键盘描述符（当前 VHF 版完整 63 字节）有一个关键设计——**厂商 Feature 管道**：
 
 ```rust
 // crates/vdev-hid-win/kernel/driver/src/contract.rs
-pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
+pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 63] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection (Application)
     //   ……修饰键位图 + 保留字节 + 6 按键码（Input）……
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x00, // Usage (Undefined)
+    0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
+    0x19, 0x01, // Usage Minimum (1)
+    0x29, 0x08, // Usage Maximum (8) —— 与 Report Count 对齐（否则描述符非法）
+    0x15, 0x00, // Logical Minimum (0)
     0x26, 0xFF, 0x00, // Logical Maximum (255)
+    0x75, 0x08, // Report Size (8)
     0x95, 0x08, // Report Count (8)
-    0x91, 0x00, // Output (Data, Array, Absolute) —— 注入管道
+    0xB1, 0x02, // Feature (Data, Variable, Absolute) —— 注入管道
     0xC0, // End Collection
 ];
 ```
 
-这个 8 字节的 Output 字段声明了一个输出管道：用户态对 HID 接口 `WriteFile` 的数据会沿它抵达驱动（`IOCTL_HID_WRITE_REPORT`）。驱动把它**当作输入报告**投递回 hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（70 字节，见 `crates/vdev-hid-win/kernel/driver/src/contract.rs:125` 的 `MOUSE_REPORT_DESCRIPTOR`）同理带一条 4 字节输出管道。
+这个 8 字节的 Feature 字段声明了一条厂商注入管道：用户态 `HidD_SetFeature` 的数据会沿它抵达驱动
+（`IOCTL_HID_SET_FEATURE` → VHF 的 `EvtVhfAsyncOperationSetFeature`），驱动把它**当作输入报告**投递回
+hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（70 字节，见
+`crates/vdev-hid-win/kernel/driver/src/contract.rs:125` 的 `MOUSE_REPORT_DESCRIPTOR`）同理带一条 4 字节
+Feature 管道。
+
+> **通道选型是实测出来的**：最早的 minidriver 版用 Output 报告 + `WriteFile`，改用 VHF 后
+> `WriteFile`/`HidD_SetOutputReport` 在键盘/鼠标顶层集合上恒返回 `ERROR_INVALID_FUNCTION`
+> （管理员与否都一样，Win10 19045 实测），因此把注入管道改成 Feature 报告，见第 3.5 节。
 
 还有一个值得注意的细节：按键码数组的 Usage/Logical Maximum 写到 `0x73`（115）而不是常见的 `0x65`（101），因为 F13–F24 的 usage 落在 0x68–0x73，上限给低了这些键会被 hidclass 静默丢弃——这是审查阶段抓出来的真实 bug（见第 6 节）。
 

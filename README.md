@@ -212,7 +212,7 @@ powershell -File scripts\verify-dist.ps1 -Dist crates\vdev-audio-win\target\dist
 | 各设备怎么写出来的（含踩坑） | [`docs/community/README.md`](docs/community/README.md)（系列总目录） |
 | Windows 声卡（驱动/CLI/GUI/验收） | [`crates/vdev-audio-win/README.md`](crates/vdev-audio-win/README.md) |
 | 显示器驱动构建/签名/CLI/验收 | [`crates/vdev-display-win/README.md`](crates/vdev-display-win/README.md) |
-| 内核 HID（VHF）驱动构建/注入 | [`crates/vdev-hid-win/kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md) |
+| 内核 HID（VHF）驱动构建/注入/验收 | [`crates/vdev-hid-win/README.md`](crates/vdev-hid-win/README.md)（驱动细节见 [`kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md)） |
 | AI 虚拟麦克风 | [`crates/vdev-mic-agent/README.md`](crates/vdev-mic-agent/README.md) |
 | macOS 路线调研 / 选型过程 | [`docs/dev/`](docs/dev) |
 
