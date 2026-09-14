@@ -12,7 +12,7 @@ categories = ["os::windows-apis"]
 [package.metadata.wdk.driver-model]
 driver-type = "KMDF"
 kmdf-version-major = 1
-target-kmdf-version-minor = 33
+target-kmdf-version-minor = 15
 
 [lib]
 name = "vdev_hid"

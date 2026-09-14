@@ -5,7 +5,8 @@ use std::path::Path;
 use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIIRFLAG_FORCE_INF, DiInstallDriverW,
+    CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW,
+    CR_SUCCESS, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIIRFLAG_FORCE_INF, DiInstallDriverW,
     GUID_DEVCLASS_MEDIA, HDEVINFO, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
     SP_DEVINFO_DATA, SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
     SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
@@ -13,6 +14,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDeviceInfoW,
     SetupDiSetDeviceRegistryPropertyW,
 };
+use windows::core::PCWSTR;
 
 pub const HARDWARE_ID: &str = r"Root\vdev-audio";
 
@@ -181,25 +183,7 @@ fn remove_all_nodes() -> Result<usize> {
         }
     }
     for info in &mut to_remove {
-        let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader: windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                cbSize: std::mem::size_of::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS>() as u32,
-                InstallFunction: DIF_REMOVE,
-            },
-            Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
-                devs,
-                Some(info),
-                (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                    .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
-            )
-        }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        remove_subtree(info)?;
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
     Ok(to_remove.len())
@@ -342,29 +326,7 @@ pub fn uninstall() -> Result<bool> {
 
     let result = (|| -> Result<()> {
         let dev_info = open_device(devs, &instance_id)?;
-
-        let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader:
-                windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                    cbSize: std::mem::size_of::<
-                        windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
-                    >() as u32,
-                    InstallFunction: DIF_REMOVE,
-                },
-            Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
-                devs,
-                Some(&dev_info),
-                (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                    .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
-            )
-        }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(&dev_info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        remove_subtree(&dev_info)?;
         Ok(())
     })();
 
@@ -372,6 +334,40 @@ pub fn uninstall() -> Result<bool> {
     result?;
     println!("已移除 vdev 虚拟声卡设备");
     Ok(true)
+}
+
+/// 用配置管理器（CfgMgr）移除设备子树。
+///
+/// 不用 `DIF_REMOVE`：`SetupDiSetDeviceInstallParamsW` 强转 `SP_REMOVEDEVICE_PARAMS`
+/// 在本机必然报 `0x800706F8`（ERROR_INVALID_USER_BUFFER）——与 HID、显示器两侧
+/// 实测同款结论（显示器侧已在 `fix(win-display)` 换成 CfgMgr）。这里沿用
+/// neflib/nefcon 同款做法：`CM_Get_Device_IDW` → `CM_Locate_DevNodeW` →
+/// `CM_Query_And_Remove_SubTreeW`。
+fn remove_subtree(info: &SP_DEVINFO_DATA) -> Result<()> {
+    let mut id_buf = [0u16; 512];
+    // SAFETY: info.DevInst 来自 SetupDi* 枚举；id_buf 可写且有长度
+    let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+    if cr != CR_SUCCESS {
+        bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
+    }
+    let mut devinst = 0u32;
+    // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+    let cr = unsafe {
+        CM_Locate_DevNodeW(
+            &mut devinst,
+            PCWSTR(id_buf.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if cr != CR_SUCCESS {
+        bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
+    }
+    // SAFETY: devinst 有效；不关心 veto 详情
+    let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+    if cr != CR_SUCCESS {
+        bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
+    }
+    Ok(())
 }
 
 /// 设备状态

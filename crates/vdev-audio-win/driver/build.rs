@@ -27,6 +27,10 @@ fn main() {
     println!("cargo:rustc-link-lib=wmilib");
     println!("cargo:rustc-link-lib=stdunk");
     println!("cargo:rustc-link-lib=libcntpr");
+    // hal.lib：KeQueryPerformanceCounter 由 hal 导出（ntoskrnl.lib 里没有），
+    // 位置演算（miniport.rs 的 KSSTATE_RUN 时间锚点）要用到它；缺这一条链接报
+    // LNK2019: unresolved external symbol KeQueryPerformanceCounter。
+    println!("cargo:rustc-link-lib=hal");
     // 内核驱动 PE：入口 DriverEntry，WDM 子系统，不链接用户态 CRT
     println!("cargo:rustc-link-arg=/ENTRY:DriverEntry");
     println!("cargo:rustc-link-arg=/SUBSYSTEM:NATIVE");

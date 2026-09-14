@@ -9,7 +9,8 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW,
+    CR_SUCCESS, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
     DIIRFLAG_FORCE_INF, DiInstallDriverW, GUID_DEVCLASS_HIDCLASS, SETUP_DI_GET_CLASS_DEVS_FLAGS,
     SETUP_DI_REGISTRY_PROPERTY, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SPDRP_DRIVER,
     SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
@@ -19,9 +20,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiSetDeviceRegistryPropertyW,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid,
+    HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid, HidD_SetFeature,
 };
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
@@ -141,32 +142,39 @@ fn remove_all_nodes() -> Result<usize> {
             to_remove.push(info);
         }
     }
+    // 用配置管理器（CfgMgr）移除整棵子树：DIF_REMOVE 那条路在本机不可用——
+    // SetupDiSetDeviceInstallParamsW 强转 SP_REMOVEDEVICE_PARAMS 报 0x800706F8，
+    // 改 SetupDiSetClassInstallParamsW 后同样失败（实测），而 pnputil /remove-device
+    // 能删掉同样的节点。CM_Query_And_Remove_SubTreeW 是 neflib/nefcon 同款做法。
+    let mut removed = 0usize;
     for info in &mut to_remove {
-        let params = windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS {
-            ClassInstallHeader:
-                windows::Win32::Devices::DeviceAndDriverInstallation::SP_CLASSINSTALL_HEADER {
-                    cbSize: std::mem::size_of::<
-                        windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS,
-                    >() as u32,
-                    InstallFunction: DIF_REMOVE,
-                },
-            Scope: windows::Win32::Devices::DeviceAndDriverInstallation::DI_REMOVEDEVICE_GLOBAL,
-            HwProfile: 0,
-        };
-        unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiSetDeviceInstallParamsW(
-                devs,
-                Some(info),
-                (&params as *const windows::Win32::Devices::DeviceAndDriverInstallation::SP_REMOVEDEVICE_PARAMS)
-                    .cast::<windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINSTALL_PARAMS_W>(),
-            )
+        let mut id_buf = [0u16; 512];
+        // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+        let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+        if cr != CR_SUCCESS {
+            bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
         }
-        .context("SetupDiSetDeviceInstallParamsW failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REMOVE, devs, Some(info)) }
-            .with_context(|| "DIF_REMOVE failed")?;
+        let mut devinst = 0u32;
+        // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+        let cr = unsafe {
+            CM_Locate_DevNodeW(
+                &mut devinst,
+                PCWSTR(id_buf.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        if cr != CR_SUCCESS {
+            bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
+        }
+        // SAFETY: devinst 有效；不关心 veto 详情
+        let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        if cr != CR_SUCCESS {
+            bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
+        }
+        removed += 1;
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(to_remove.len())
+    Ok(removed)
 }
 
 /// 创建并注册一个设备节点（硬件 ID 由 INF 模型行匹配到对应安装节，
@@ -240,9 +248,12 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         bail!("找不到 INF: {}", inf_path.display());
     }
 
-    let removed = remove_all_nodes()?;
-    if removed > 0 {
-        println!("已清理 {removed} 个残留设备节点");
+    // 清残留节点是尽力而为：正在工作的虚拟键鼠（HID 子设备被系统占用）可能拒绝移除，
+    // 此时不应阻断安装——DiInstallDriverW 会把驱动包应用到所有匹配设备（含新节点）。
+    match remove_all_nodes() {
+        Ok(0) => {}
+        Ok(n) => println!("已清理 {n} 个残留设备节点"),
+        Err(e) => println!("提示：清理残留设备节点未成功（{e}），继续安装"),
     }
 
     let inf_wide: Vec<u16> = inf_path
@@ -364,8 +375,11 @@ pub fn status() -> Result<DeviceStatus> {
 
 // ---------------- 报告注入（经 HID 接口 WriteFile） ----------------
 
-/// 按 VID/PID 找到 vdev 虚拟键盘/鼠标的 HID 设备路径
-fn find_hid_path(pid: u16) -> Result<String> {
+/// 按 VID/PID 收集 vdev 虚拟键盘/鼠标的**全部** HID 接口路径。
+///
+/// 一个 HID 设备可能有多个顶层集合（TLC）：键/鼠本身，以及厂商注入管道。
+/// 注入只对厂商管道有效，因此这里返回全部候选、由 `write_report` 逐个试写。
+fn find_hid_paths(pid: u16) -> Result<Vec<String>> {
     let hid_guid = unsafe { HidD_GetHidGuid() };
     let devs = unsafe {
         SetupDiGetClassDevsW(
@@ -376,7 +390,7 @@ fn find_hid_path(pid: u16) -> Result<String> {
         )
     }
     .context("SetupDiGetClassDevsW(hid) failed")?;
-    let mut result = None;
+    let mut result: Vec<String> = Vec::new();
     let mut index = 0u32;
     loop {
         let mut iface = SP_DEVICE_INTERFACE_DATA {
@@ -436,10 +450,13 @@ fn find_hid_path(pid: u16) -> Result<String> {
         let path = String::from_utf16_lossy(&path_w);
         // 打开并核对 VID/PID
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // 只请求写权限：键盘/鼠标顶层集合（TLC）被系统限制，非管理员以
+        // GENERIC_READ|GENERIC_WRITE 打开会得到 ERROR_ACCESS_DENIED(5)——实测
+        // `\\?\hid#...#\kbd` 用 rw 打开 err=5、只写打开成功。注入只需要写。
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
+                GENERIC_WRITE.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -456,17 +473,39 @@ fn find_hid_path(pid: u16) -> Result<String> {
         let ok = unsafe { HidD_GetAttributes(handle, &mut attrs) };
         unsafe { CloseHandle(handle) }.ok();
         if ok.as_bool() && attrs.VendorID == VID && attrs.ProductID == pid {
-            result = Some(path);
-            break;
+            result.push(path);
         }
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    result.context("未找到 vdev 虚拟 HID 设备（先安装驱动）")
+    if result.is_empty() {
+        bail!("未找到 vdev 虚拟 HID 设备（先安装驱动）");
+    }
+    Ok(result)
 }
 
 /// 写入一份报告（键盘 8 字节 / 鼠标 4 字节，按下/抬起）
+///
+/// 候选接口可能不止一个（键/鼠 TLC + 厂商注入管道 TLC）；系统只允许对**厂商管道**
+/// 写输出报告，对键/鼠 TLC 写会返回 ERROR_INVALID_FUNCTION。这里逐个试写，
+/// 第一个成功即返回，全部失败才报最后一个错误。
 pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
-    let path = find_hid_path(pid)?;
+    let paths = find_hid_paths(pid)?;
+    let mut last_error = None;
+    for path in &paths {
+        match write_report_to(path, report) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("写入 HID 报告失败：没有可用接口")))
+}
+
+/// 向指定 HID 接口路径写入一份输出报告
+///
+/// 通道优先级：Feature 报告（`HidD_SetFeature`，带/不带 Report ID 前缀各试一次）→
+/// 输出报告（`WriteFile`）。键盘/鼠标顶层集合的输出报告会被系统拒绝
+/// （ERROR_INVALID_FUNCTION），Feature 报告是这条链路上真正可行的注入通道。
+fn write_report_to(path: &str, report: &[u8]) -> Result<()> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let handle = unsafe {
         CreateFileW(
@@ -483,10 +522,25 @@ pub fn write_report(pid: u16, report: &[u8]) -> Result<()> {
     if handle == INVALID_HANDLE_VALUE {
         bail!("打开 vdev 虚拟 HID 设备失败（设备可能未安装或已被占用）");
     }
-    let mut written = 0u32;
-    let ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) };
+
+    // 1) Feature 报告：hidclass 对 VHF 设备把 Report ID 计入报告长度，先试带前缀
+    let mut framed = Vec::with_capacity(report.len() + 1);
+    framed.push(0u8);
+    framed.extend_from_slice(report);
+    let mut ok =
+        unsafe { HidD_SetFeature(handle, framed.as_ptr().cast(), framed.len() as u32) }.as_bool();
+    // 2) Feature 报告：不带前缀
+    if !ok {
+        ok = unsafe { HidD_SetFeature(handle, report.as_ptr().cast(), report.len() as u32) }
+            .as_bool();
+    }
+    // 3) 兜底：输出报告
+    if !ok {
+        let mut written = 0u32;
+        ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) }.is_ok();
+    }
     unsafe { CloseHandle(handle) }.ok();
-    if ok.is_err() {
+    if !ok {
         bail!("写入 HID 报告失败：{}", windows::core::Error::from_win32());
     }
     Ok(())

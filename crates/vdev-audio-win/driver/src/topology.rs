@@ -322,47 +322,22 @@ static RENDER_PINS: [PCPIN_DESCRIPTOR; 2] = [
     },
 ];
 
-/// node0 = VOLUME（KSNODETYPE_VOLUME，名 KSAUDFNAME_MASTER_VOLUME）；
-/// node1 = MUTE（KSNODETYPE_MUTE，名 KSAUDFNAME_MASTER_MUTE）
-static RENDER_NODES: [PCNODE_DESCRIPTOR; 2] = [
-    PCNODE_DESCRIPTOR {
-        Flags: 0,
-        AutomationTable: &AUT_VOLUME as *const PCAUTOMATION_TABLE
-            as *const crate::sys::types::PCAUTOMATION_TABLE,
-        Type: &KSNODETYPE_VOLUME,
-        Name: &KSAUDFNAME_MASTER_VOLUME,
-    },
-    PCNODE_DESCRIPTOR {
-        Flags: 0,
-        AutomationTable: &AUT_MUTE as *const PCAUTOMATION_TABLE
-            as *const crate::sys::types::PCAUTOMATION_TABLE,
-        Type: &KSNODETYPE_MUTE,
-        Name: &KSAUDFNAME_MASTER_MUTE,
-    },
-];
-
-/// sysvad speakertoptable.h:163-169 逐条照抄（pin0→volume→mute→pin1；
-/// 节点 pin 约定：0=输出侧、1=输入侧，与 sysvad 表一致）
-static RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 3] = [
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: PCFILTER_NODE,
-        FromNodePin: 0,
-        ToNode: 0,
-        ToNodePin: 1,
-    },
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: 0,
-        FromNodePin: 0,
-        ToNode: 1,
-        ToNodePin: 1,
-    },
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: 1,
-        FromNodePin: 0,
-        ToNode: PCFILTER_NODE,
-        ToNodePin: 1,
-    },
-];
+/// render 拓扑**直通**（0 节点 + 1 条 pin→pin 连接）。
+///
+/// 回归：原来在 render 拓扑里挂了 VOLUME/MUTE 两个节点（3 条连接）。对照两处可用实现：
+/// 官方 sysvad `speakertoptable.h` 的 `SpeakerTopoMiniportNodes` 长度 0、连接只有
+/// `{PCFILTER_NODE, WAVEOUT_SOURCE, PCFILTER_NODE, LINEOUT_DEST}` 一条；本机可用的
+/// ToDesk 虚拟声卡实测同样是 `TOPO_NODES ret=8（0 节点） / TOPO_CONNECTIONS ret=24（1 条）`。
+/// Win10 里 render 侧音量/静音由 wave 滤波器的 `KSNODETYPE_AUDIO_ENGINE` 节点承担
+/// （`IMiniportAudioEngineNode::Get/SetDeviceChannelVolume|Mute`），拓扑里再挂 volume/mute
+/// 会让端点图出现两个音量节点，引擎建流前的校验因此失败（真机：所有引擎节点方法都调通、
+/// 但 NewStream 从不发生，客户端 GetMixFormat 报 AUDCLNT_E_UNSUPPORTED_FORMAT）。
+static RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
+    FromNode: PCFILTER_NODE,
+    FromNodePin: 0,
+    ToNode: PCFILTER_NODE,
+    ToNodePin: 1,
+}];
 
 pub static RENDER_FILTER_DESCRIPTOR: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     Version: 0,
@@ -370,10 +345,11 @@ pub static RENDER_FILTER_DESCRIPTOR: PCFILTER_DESCRIPTOR = PCFILTER_DESCRIPTOR {
     PinSize: size_of::<PCPIN_DESCRIPTOR>() as ULONG,
     PinCount: 2,
     Pins: &RENDER_PINS[0],
-    NodeSize: size_of::<PCNODE_DESCRIPTOR>() as ULONG,
-    NodeCount: 2,
-    Nodes: &RENDER_NODES[0],
-    ConnectionCount: 3,
+    // 直通：0 节点（对照 sysvad speakertoptable.h / ToDesk 实测）
+    NodeSize: 0,
+    NodeCount: 0,
+    Nodes: core::ptr::null(),
+    ConnectionCount: RENDER_CONNECTIONS.len() as ULONG,
     Connections: &RENDER_CONNECTIONS[0],
     CategoryCount: 0,
     Categories: core::ptr::null(),
@@ -829,17 +805,36 @@ mod tests {
     /// 节点自动化表非空且 PropertyItemSize 合规
     #[test]
     fn descriptor_consistency() {
-        for desc in [&RENDER_FILTER_DESCRIPTOR, &CAPTURE_FILTER_DESCRIPTOR] {
+        for (idx, desc) in [&RENDER_FILTER_DESCRIPTOR, &CAPTURE_FILTER_DESCRIPTOR]
+            .into_iter()
+            .enumerate()
+        {
+            let is_render = idx == 0;
             assert_eq!(desc.PinSize as usize, size_of::<PCPIN_DESCRIPTOR>());
-            assert_eq!(desc.NodeSize as usize, size_of::<PCNODE_DESCRIPTOR>());
+            if is_render {
+                // render 拓扑直通：0 节点（NodeSize 必须为 0、Nodes 为空）、1 条连接
+                // ——对照 sysvad speakertoptable.h 与本机 ToDesk 实测
+                assert_eq!(desc.NodeCount, 0);
+                assert_eq!(desc.NodeSize, 0);
+                assert!(desc.Nodes.is_null());
+                assert_eq!(desc.ConnectionCount, 1);
+            } else {
+                assert_eq!(desc.NodeSize as usize, size_of::<PCNODE_DESCRIPTOR>());
+                assert_eq!(desc.NodeCount as usize, TOPO_NODE_COUNT);
+                assert_eq!(desc.ConnectionCount, 3);
+            }
             let pins = unsafe { core::slice::from_raw_parts(desc.Pins, desc.PinCount as usize) };
-            let nodes = unsafe { core::slice::from_raw_parts(desc.Nodes, desc.NodeCount as usize) };
+            // Nodes 直通时为 NULL + 0 个：from_raw_parts(NULL, 0) 是 UB（本机 debug 断言会炸），
+            // 这里显式用空切片
+            let nodes: &[PCNODE_DESCRIPTOR] = if desc.Nodes.is_null() || desc.NodeCount == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(desc.Nodes, desc.NodeCount as usize) }
+            };
             let conns = unsafe {
                 core::slice::from_raw_parts(desc.Connections, desc.ConnectionCount as usize)
             };
             assert_eq!(pins.len(), 2);
-            assert_eq!(nodes.len(), TOPO_NODE_COUNT);
-            assert_eq!(conns.len(), 3);
             for pin in pins {
                 assert!(pin.KsPinDescriptor.DataRangesCount >= 1);
                 assert!(!pin.KsPinDescriptor.DataRanges.is_null());
@@ -902,14 +897,20 @@ mod tests {
                 &KSCATEGORY_AUDIO
             ));
         }
-        // 节点类型：volume/mute 顺序固定（node0/node1）
-        let render_nodes =
-            unsafe { core::slice::from_raw_parts(RENDER_FILTER_DESCRIPTOR.Nodes, 2) };
+        // 节点布局（回归）：
+        // - render 拓扑**直通**（0 节点）——对照 sysvad speakertoptable.h（NodeCount=0）与
+        //   本机可用 ToDesk 实测（TOPO_NODES 空、TOPO_CONNECTIONS 1 条）；render 侧音量由
+        //   wave 滤波器的 KSNODETYPE_AUDIO_ENGINE 节点承担。
+        // - capture 拓扑仍带 VOLUME/MUTE 两节点（对照 sysvad micarray/bthhfp 的 mic 拓扑）。
+        assert_eq!(RENDER_FILTER_DESCRIPTOR.NodeCount, 0);
+        assert_eq!(RENDER_FILTER_DESCRIPTOR.ConnectionCount, 1);
+        assert_eq!(
+            CAPTURE_FILTER_DESCRIPTOR.NodeCount, 2,
+            "capture 拓扑保留 volume/mute 节点"
+        );
         let capture_nodes =
             unsafe { core::slice::from_raw_parts(CAPTURE_FILTER_DESCRIPTOR.Nodes, 2) };
         unsafe {
-            assert!(guid_eq(&*render_nodes[0].Type, &KSNODETYPE_VOLUME));
-            assert!(guid_eq(&*render_nodes[1].Type, &KSNODETYPE_MUTE));
             assert!(guid_eq(&*capture_nodes[0].Type, &KSNODETYPE_VOLUME));
             assert!(guid_eq(&*capture_nodes[1].Type, &KSNODETYPE_MUTE));
         }

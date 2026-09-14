@@ -20,7 +20,10 @@ Copy-Item (Join-Path $root "kernel\driver\vdev-hid.inf") $dist
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.FriendlyName -eq "vdev-driver" } | Select-Object -First 1
 if (-not $cert) { throw "找不到 vdev-driver 证书" }
 
-& $signtool sign /s my /n $cert.Subject /fd sha256 /q (Join-Path $dist "vdev_hid.sys")
+# 用 /sha1（指纹）选证书，不用 /n：signtool 的 /n 匹配主题 **CN 值**
+# （如 "vdev Virtual Display Driver"），传 $cert.Subject 这种完整 DN（"CN=..."）
+# 会直接报 "No certificates were found that met all the given criteria"。
+& $signtool sign /s my /sha1 $cert.Thumbprint /fd sha256 /q (Join-Path $dist "vdev_hid.sys")
 if ($LASTEXITCODE -ne 0) { throw "signtool sys failed" }
 
 Push-Location $dist
@@ -30,7 +33,7 @@ if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
 
 # signtool /n 按证书主题名匹配：直接用查到的证书自身 Subject，
 # 禁止硬编码名称（原脚本误抄显示驱动的 "vdev Virtual Display Driver"，与 HID 证书不符）
-& $signtool sign /s my /n $cert.Subject /fd sha256 /q (Join-Path $dist "vdev-hid.cat")
+& $signtool sign /s my /sha1 $cert.Thumbprint /fd sha256 /q (Join-Path $dist "vdev-hid.cat")
 if ($LASTEXITCODE -ne 0) { throw "signtool cat failed" }
 
 Write-Host "=== dist ready ==="

@@ -21,9 +21,10 @@ Copy-Item (Join-Path $rel "vdev-audio-win.exe") $dist
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.FriendlyName -eq "vdev-driver" } | Select-Object -First 1
 if (-not $cert) { throw "找不到 vdev-driver 证书" }
 
-# signtool /n 按证书主题名匹配：直接用查到的证书自身 Subject，
-# 禁止硬编码名称（原脚本误抄显示驱动的 "vdev Virtual Display Driver"，与音频证书不符）
-& $signtool sign /s my /n $cert.Subject /fd sha256 /q (Join-Path $dist "vdev_audio.sys")
+# signtool 选择签名证书用 /sha1（指纹）而不是 /n：/n 匹配的是主题 **CN 值**，
+# 传 $cert.Subject（完整 DN，形如 CN=vdev Virtual Display Driver）会直接报
+# "No certificates were found that met all the given criteria"（本机实测）。
+& $signtool sign /s my /sha1 $cert.Thumbprint /fd sha256 /q (Join-Path $dist "vdev_audio.sys")
 if ($LASTEXITCODE -ne 0) { throw "signtool sys failed" }
 
 Push-Location $dist
@@ -31,7 +32,7 @@ Push-Location $dist
 Pop-Location
 if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
 
-& $signtool sign /s my /n $cert.Subject /fd sha256 /q (Join-Path $dist "vdev-audio.cat")
+& $signtool sign /s my /sha1 $cert.Thumbprint /fd sha256 /q (Join-Path $dist "vdev-audio.cat")
 if ($LASTEXITCODE -ne 0) { throw "signtool cat failed" }
 
 Write-Host "=== dist ready ==="

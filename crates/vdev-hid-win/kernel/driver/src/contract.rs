@@ -81,7 +81,7 @@ pub const IOCTL_HID_GET_INPUT_REPORT: u32 = hid_out_ctl_code(104);
 /// 按键码数组范围 0x00-0x73（115）：覆盖注入侧全部 usage——F13-F24 为 0x68-0x73
 ///（USB HID Usage Tables Keyboard/Keypad Page），其余键均 ≤0x65。
 /// 修复记录：原 Usage/Logical Max 0x65 覆盖不了 F13+，注入 F13-F24 会被 hidclass 丢弃。
-pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
+pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 63] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection (Application)
@@ -104,18 +104,25 @@ pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
     0x19, 0x00, //   Usage Minimum (0)
     0x29, 0x73, //   Usage Maximum (115) —— 覆盖 F13-F24
     0x81, 0x00, //   Input (Data, Array) —— 按键码
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
+    // 注入管道：**厂商用法页的 8 字节 Feature 报告**。
+    // 不用 Output 报告：系统对键盘/鼠标顶层集合的输出报告写入一律拒绝
+    // （WriteFile / HidD_SetOutputReport → ERROR_INVALID_FUNCTION，管理员与否都一样，
+    // 本机 Win10 19045 实测）；Feature 报告走 IOCTL_HID_SET_FEATURE 另一条通路。
+    // usage 数须与 Report Count 对齐（Variable 报告 usage 不足会让描述符非法，
+    // 实测 VhfCreate 返回 0xC00000B9）。
+    0x06, 0x00, 0xFF, //   Usage Page (Vendor-Defined 0xFF00)
+    0x19, 0x01, //   Usage Minimum (1)
+    0x29, 0x08, //   Usage Maximum (8) —— 与 Report Count 一致
     0x15, 0x00, //   Logical Minimum (0)
     0x26, 0xFF, 0x00, //   Logical Maximum (255)
     0x75, 0x08, //   Report Size (8)
     0x95, 0x08, //   Report Count (8)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
+    0xB1, 0x02, //   Feature (Data, Variable, Absolute) —— 注入管道
     0xC0, // End Collection
 ];
 
 /// 鼠标 HID 报告描述符：标准鼠标输入（4 字节）+ 厂商 4 字节输出管道（注入）
-pub static MOUSE_REPORT_DESCRIPTOR: [u8; 67] = [
+pub static MOUSE_REPORT_DESCRIPTOR: [u8; 70] = [
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x02, // Usage (Mouse)
     0xA1, 0x01, // Collection (Application)
@@ -142,13 +149,15 @@ pub static MOUSE_REPORT_DESCRIPTOR: [u8; 67] = [
     0x95, 0x03, //     Report Count (3)
     0x81, 0x06, //     Input (Data, Variable, Relative) —— X/Y/滚轮
     0xC0, //   End Collection (Physical)
-    0x05, 0x01, //   Usage Page (Generic Desktop)
-    0x09, 0x00, //   Usage (Undefined)
+    // 同键盘：4 字节 Feature 报告注入管道
+    0x06, 0x00, 0xFF, //   Usage Page (Vendor-Defined 0xFF00)
+    0x19, 0x01, //   Usage Minimum (1)
+    0x29, 0x04, //   Usage Maximum (4) —— 与 Report Count 一致
     0x15, 0x00, //   Logical Minimum (0)
     0x26, 0xFF, 0x00, //   Logical Maximum (255)
     0x75, 0x08, //   Report Size (8)
     0x95, 0x04, //   Report Count (4)
-    0x91, 0x00, //   Output (Data, Array, Absolute) —— 注入管道
+    0xB1, 0x02, //   Feature (Data, Variable, Absolute) —— 注入管道
     0xC0, // End Collection
 ];
 
@@ -223,7 +232,7 @@ mod tests {
     /// M5 回归：键盘描述符 Usage/Logical Max 须覆盖注入侧最大 usage（F24=0x73）
     #[test]
     fn keyboard_descriptor_covers_f24() {
-        assert_eq!(KEYBOARD_REPORT_DESCRIPTOR.len(), 60);
+        assert_eq!(KEYBOARD_REPORT_DESCRIPTOR.len(), 63);
         // Usage Maximum (0x29 0x73) 与 Logical Maximum (0x25 0x73)
         assert!(
             KEYBOARD_REPORT_DESCRIPTOR
@@ -251,6 +260,6 @@ mod tests {
     /// 鼠标描述符长度稳定（驱动 statics 与 hidclass 依赖其字节数）
     #[test]
     fn mouse_descriptor_length() {
-        assert_eq!(MOUSE_REPORT_DESCRIPTOR.len(), 67);
+        assert_eq!(MOUSE_REPORT_DESCRIPTOR.len(), 70);
     }
 }

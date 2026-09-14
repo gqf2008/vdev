@@ -426,6 +426,10 @@ pub const KSPIN_COMMUNICATION_BRIDGE: KSPIN_COMMUNICATION = 4;
 
 // KSINTERFACE_STANDARD
 pub const KSINTERFACE_STANDARD_STREAMING: u32 = 0;
+/// ks.h `KSINTERFACE_STANDARD_LOOPED_STREAMING` = 1：WaveRT 播放/录音 pin 必须暴露的
+/// 接口（环回缓冲流）。sysvad/VDA 的 wave pin 不显式声明 Interfaces（PortCls 默认给这套），
+/// 本机可用的 ToDesk 虚拟声卡实测 `KSPROPERTY_PIN_INTERFACES` 返回的也是 id=1。
+pub const KSINTERFACE_STANDARD_LOOPED_STREAMING: u32 = 1;
 // KSMEDIUM 任意实例
 pub const KSMEDIUM_TYPE_ANYINSTANCE: u32 = 0;
 
