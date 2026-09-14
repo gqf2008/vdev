@@ -126,7 +126,116 @@ fn find_device() -> Result<Option<SP_DEVINFO_DATA>> {
 
 fn remove_all_nodes() -> Result<usize> {
     let devs = open_class_devices()?;
-    let mut to_remove: Vec<SP_DEVINFO_DATA> = Vec::new();
+    let mut to_remove = collect_vdev_nodes(devs)?;
+    // 用配置管理器（CfgMgr）移除整棵子树：DIF_REMOVE 那条路在本机不可用——
+    // SetupDiSetDeviceInstallParamsW 强转 SP_REMOVEDEVICE_PARAMS 报 0x800706F8，
+    // 改 SetupDiSetClassInstallParamsW 后同样失败（实测），而 pnputil /remove-device
+    // 能删掉同样的节点。CM_Query_And_Remove_SubTreeW 是 neflib/nefcon 同款做法。
+    //
+    // 回归（真机，2026-09-14）：单跑一轮 `CM_Query_And_Remove_SubTreeW` 时，部分节点会返回
+    // `ERROR_NOT_READY(0x17)`（设备正被占用/需重启才可移除），而原实现对**一个**节点失败就
+    // `bail!` 整轮退出 —— 结果是"已移除 N 个"但剩下的节点留在系统里，紧接着 `install` 又建一对，
+    // 反复装卸后设备管理器涨到 6 个（键盘×3/鼠标×3）。修法：逐节点**重试 + pnputil 兜底**，
+    // 单个节点失败不再中断整轮；最后断言"没有残留"，有残留就报错并把实例 ID 打出来。
+    let mut removed = 0usize;
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for info in &mut to_remove {
+        let mut id_buf = [0u16; 512];
+        // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+        let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+        if cr != CR_SUCCESS {
+            failures.push((
+                String::from("<unknown>"),
+                format!("CM_Get_Device_IDW 0x{:08X}", cr.0),
+            ));
+            continue;
+        }
+        let instance_id = String::from_utf16_lossy(
+            &id_buf[..id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len())],
+        );
+        let mut devinst = 0u32;
+        // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+        let cr = unsafe {
+            CM_Locate_DevNodeW(
+                &mut devinst,
+                PCWSTR(id_buf.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        if cr != CR_SUCCESS {
+            failures.push((instance_id, format!("CM_Locate_DevNodeW 0x{:08X}", cr.0)));
+            continue;
+        }
+
+        // 1) CfgMgr 直删，最多 3 轮：ERROR_NOT_READY 多为瞬时状态，等一拍再来。
+        // SAFETY: devinst 有效；不关心 veto 详情
+        let mut last = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        for _ in 0..2 {
+            if last == CR_SUCCESS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // SAFETY: 同上
+            last = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        }
+        // **以"节点真的消失"为准**，不看 CM 的返回值：真机上 CM 返回 CR_SUCCESS 而节点仍在
+        // （这正是"卸载报成功、设备管理器里却越堆越多"的根因）。
+        if wait_gone(&instance_id, 4)? {
+            removed += 1;
+            continue;
+        }
+
+        // 2) 兜底：pnputil /remove-device（实测能真正删掉这类节点）。用户态 CLI 里调用系统
+        //    工具不优雅，但"留一堆幽灵 HID 节点"更糟；失败也照旧如实报告。
+        let alt = std::process::Command::new("pnputil")
+            .args(["/remove-device", &instance_id])
+            .output();
+        match alt {
+            Ok(out) if out.status.success() => {
+                if wait_gone(&instance_id, 4)? {
+                    println!(
+                        "  （CfgMgr 回 0x{:08X} 但节点未消失，已用 pnputil 兜底移除）",
+                        last.0
+                    );
+                    removed += 1;
+                } else {
+                    failures.push((instance_id, "pnputil 报成功但节点仍在".to_string()));
+                }
+            }
+            Ok(out) => failures.push((
+                instance_id,
+                format!(
+                    "CfgMgr 0x{:08X}；pnputil exit={:?} {}",
+                    last.0,
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            )),
+            Err(e) => failures.push((
+                instance_id,
+                format!("CfgMgr 0x{:08X}；pnputil 无法执行: {e}", last.0),
+            )),
+        }
+    }
+    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+    if !failures.is_empty() {
+        for (id, why) in &failures {
+            eprintln!("  ! 未能移除 {id}：{why}");
+        }
+        bail!(
+            "有 {} 个 vdev 设备节点未能移除（管理员权限？设备被占用？）",
+            failures.len()
+        );
+    }
+    Ok(removed)
+}
+
+/// 枚举 class 下所有 vdev 的 HID 节点（键盘 + 鼠标）。`remove_all_nodes` 与卸载后的
+/// "无残留"断言共用，避免两处枚举逻辑漂移。
+fn collect_vdev_nodes(
+    devs: windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+) -> Result<Vec<SP_DEVINFO_DATA>> {
+    let mut out: Vec<SP_DEVINFO_DATA> = Vec::new();
     let mut index = 0u32;
     loop {
         let mut info = SP_DEVINFO_DATA {
@@ -139,42 +248,47 @@ fn remove_all_nodes() -> Result<usize> {
         index += 1;
         let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
         if hwid_matches(&hwids, HARDWARE_ID) || hwid_matches(&hwids, MOUSE_HARDWARE_ID) {
-            to_remove.push(info);
+            out.push(info);
         }
     }
-    // 用配置管理器（CfgMgr）移除整棵子树：DIF_REMOVE 那条路在本机不可用——
-    // SetupDiSetDeviceInstallParamsW 强转 SP_REMOVEDEVICE_PARAMS 报 0x800706F8，
-    // 改 SetupDiSetClassInstallParamsW 后同样失败（实测），而 pnputil /remove-device
-    // 能删掉同样的节点。CM_Query_And_Remove_SubTreeW 是 neflib/nefcon 同款做法。
-    let mut removed = 0usize;
-    for info in &mut to_remove {
+    Ok(out)
+}
+
+/// 当前 vdev HID 节点的实例 ID 列表（如 `ROOT\HIDCLASS\0004`）。
+///
+/// 这是"节点是否真的消失"的唯一可信判据：真机实测 `CM_Query_And_Remove_SubTreeW` 会返回
+/// `CR_SUCCESS` 而节点**仍然留在设备树里**（随后 `install` 又建一对，反复装卸就把节点堆起来），
+/// 所以删除后必须按实例 ID 轮询确认。
+pub fn vdev_instance_ids() -> Result<Vec<String>> {
+    let devs = open_class_devices()?;
+    let nodes = collect_vdev_nodes(devs)?;
+    let mut out = Vec::with_capacity(nodes.len());
+    for info in &nodes {
         let mut id_buf = [0u16; 512];
-        // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+        // SAFETY: info.DevInst 来自枚举；id_buf 可写且有长度
         let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
         if cr != CR_SUCCESS {
-            bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
+            continue;
         }
-        let mut devinst = 0u32;
-        // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
-        let cr = unsafe {
-            CM_Locate_DevNodeW(
-                &mut devinst,
-                PCWSTR(id_buf.as_ptr()),
-                CM_LOCATE_DEVNODE_NORMAL,
-            )
-        };
-        if cr != CR_SUCCESS {
-            bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
-        }
-        // SAFETY: devinst 有效；不关心 veto 详情
-        let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
-        if cr != CR_SUCCESS {
-            bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
-        }
-        removed += 1;
+        let end = id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len());
+        out.push(String::from_utf16_lossy(&id_buf[..end]));
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(removed)
+    Ok(out)
+}
+
+/// 轮询等待某个实例 ID 从设备树消失（最多 `tries` × 500ms）
+fn wait_gone(instance_id: &str, tries: usize) -> Result<bool> {
+    for _ in 0..tries {
+        if !vdev_instance_ids()?
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(instance_id))
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(false)
 }
 
 /// 创建并注册一个设备节点（硬件 ID 由 INF 模型行匹配到对应安装节，
@@ -320,6 +434,24 @@ pub fn uninstall() -> Result<bool> {
         return Ok(false);
     }
     println!("已移除 {removed} 个 vdev 虚拟设备节点");
+    // 事后断言：真的没有残留（节点移除是异步的，给它最多 ~3s）。
+    // 真机上出现过"报成功但节点还在"（反复装卸把节点涨到 6 个）——宁可让 CLI 非零退出，
+    // 也不要静默留一堆幽灵节点。
+    let mut left = vdev_instance_ids()?;
+    for _ in 0..6 {
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        left = vdev_instance_ids()?;
+    }
+    if !left.is_empty() {
+        bail!(
+            "卸载后仍有 {} 个 vdev HID 节点残留：{}（可能被占用，请重试或重启后重试）",
+            left.len(),
+            left.join(", ")
+        );
+    }
     Ok(true)
 }
 
