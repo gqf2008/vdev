@@ -3,6 +3,9 @@
 
 #[cfg(windows)]
 mod install;
+#[cfg(windows)]
+mod wasapi;
+mod wav;
 
 use std::path::PathBuf;
 
@@ -18,7 +21,7 @@ use clap::{Parser, Subcommand};
 )]
 struct Args {
     /// JSON 输出
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     json: bool,
 
     #[command(subcommand)]
@@ -37,6 +40,39 @@ enum Command {
     Uninstall,
     /// 查看驱动安装状态
     Status,
+    /// 向「vdev 扬声器」（render 端点）注入音频——宿主推流语义
+    Inject {
+        /// 端点名过滤（不区分大小写）
+        #[arg(long, default_value = "vdev")]
+        endpoint: String,
+        /// 播放 16bit PCM / 32bit float WAV 文件（优先于 --tone）
+        #[arg(long)]
+        wav: Option<PathBuf>,
+        /// 正弦频率 Hz（--wav 未给出时使用）
+        #[arg(long, default_value_t = 1000.0)]
+        tone: f32,
+        /// 正弦幅度 0.0..1.0
+        #[arg(long, default_value_t = 0.5)]
+        amplitude: f32,
+        /// 注入时长（秒）
+        #[arg(long, default_value_t = 3.0)]
+        duration: f64,
+    },
+    /// 从「vdev 麦克风」（capture 端点）采集音频——环回/录音语义
+    Capture {
+        /// 端点名过滤（不区分大小写）
+        #[arg(long, default_value = "vdev")]
+        endpoint: String,
+        /// 采集时长（秒）
+        #[arg(long, default_value_t = 3.0)]
+        duration: f64,
+        /// 跳过开头这么多秒再统计（避开驱动环回积压，默认 0）
+        #[arg(long, default_value_t = 0.0)]
+        skip: f64,
+        /// 存为 16bit PCM WAV
+        #[arg(long)]
+        wav: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,6 +116,69 @@ fn run(args: Args) -> Result<()> {
                 println!(
                     "虚拟声卡设备：未安装（先运行 vdev-audio-win install；内核驱动需测试签名）"
                 );
+            }
+        }
+        Command::Inject {
+            endpoint,
+            wav,
+            tone,
+            amplitude,
+            duration,
+        } => {
+            let source = match &wav {
+                Some(path) => {
+                    let bytes = std::fs::read(path)
+                        .with_context(|| format!("读 WAV 失败：{}", path.display()))?;
+                    Some(wav::parse_wav(&bytes)?)
+                }
+                None => None,
+            };
+            let rep = wasapi::inject(&endpoint, source.as_ref(), tone, amplitude, duration)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!("注入端点：{}", rep.endpoint);
+                println!("  端点 ID：{}", rep.endpoint_id);
+                println!(
+                    "  格式：{} Hz / {} ch（注入 {} 帧 ≈ {:.2}s）",
+                    rep.sample_rate, rep.channels, rep.frames, rep.seconds
+                );
+                println!(
+                    "注入完成：Play 到该端点的声音即被「vdev 麦克风」听到（可用 capture 验证）"
+                );
+            }
+        }
+        Command::Capture {
+            endpoint,
+            duration,
+            skip,
+            wav,
+        } => {
+            let rep = wasapi::capture(&endpoint, duration, skip, wav.as_deref())?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!("采集端点：{}", rep.endpoint);
+                println!("  端点 ID：{}", rep.endpoint_id);
+                println!(
+                    "  格式：{} Hz / {} ch（采集 {} 帧 ≈ {:.2}s）",
+                    rep.sample_rate, rep.channels, rep.frames, rep.seconds
+                );
+                println!(
+                    "  电平：RMS {:.1} dBFS / 峰值 {:.1} dBFS",
+                    rep.rms_dbfs, rep.peak_dbfs
+                );
+                if let Some(p) = &rep.wav {
+                    println!("  已保存：{p}");
+                }
+                // 与 wasapi-loop 验收脚本同一判据：静音约 −100 dBFS，有声音显著抬升
+                if rep.rms_dbfs > -60.0 {
+                    println!("判定：采到有效音频（RMS > −60 dBFS）");
+                } else {
+                    println!(
+                        "判定：接近静音（RMS ≤ −60 dBFS）——若刚注入过，可用 --skip 避开环回积压"
+                    );
+                }
             }
         }
     }
