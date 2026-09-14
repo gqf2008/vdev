@@ -244,15 +244,18 @@ Four things a file-based harness could not answer, and where they live:
   the two is the capture chain, and the model's 20 ms is added to the digital
   number, not to the acoustic one.
 
-**Status: the macOS live path is available; the Windows backend compiles and
-every gate is green (check / `clippy -D warnings` for `x86_64-pc-windows-msvc`,
-plus the macOS-side check + 41 unit tests), but its runtime audio behavior —
-loopback data flow, padding alignment, the acoustic probe — has not been
-verified on a real Windows machine with vdev-audio-win installed (driver-side
-bring-up is on the project author).** Correctness of the Windows-side numbers
-rests on the five `cfg(windows)` unit tests (marker period/start, pending
-pairing, search-window cap, acoustic source semantics), which compile with the
-cross checks and run on a Windows host. macOS still needs the driver installed
+**Status: both live paths are available.** The Windows backend (WASAPI polling +
+kernel loopback) was measured on a real Windows machine on 2026-09-14
+(Win10 19045 x64 with `vdev-audio-win` 0.3.9.0): digital probe p50 10.16 ms with
+zero rejected frames, 20 s of adaptive denoise ran in 20.0014 s of wall clock at
+0.156 % of one core with no dropped ring buffers, and the A/B comparison dropped
+the captured level from −5.8 to −34.1 dBFS. The numbers in the table above come
+from that run. **Still open: the acoustic probe** — it needs a real microphone and
+a room, which the measurement host did not have (Stereo Mix stood in for the
+capture side). Correctness of the Windows-side code paths also rests on the five
+`cfg(windows)` unit tests (marker period/start, pending pairing, search-window
+cap, acoustic source semantics), which compile with the cross checks and run on a
+Windows host. macOS still needs the driver installed
 (`make -C crates/vdev-audio install`): the injection side is a CoreAudio client
 of the HAL plugin, and both probes need a real device to measure.
 
