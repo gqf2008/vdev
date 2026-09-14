@@ -203,42 +203,48 @@ jobs:
         env:
           TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
-          cat > NOTES.md <<EOF
-          ## vdev Windows 驱动与工具（${TAG}）
+          # quoted heredoc：内容原样保留（反引号/星号不会被 shell 解释），最后再用 sed 填 tag
+          cat > NOTES.md <<'EOF'
+          ## vdev Windows 驱动与工具（@TAG@）
 
           包内容：
 
-          - \`vdev-hid-win-*.zip\` — VHF 虚拟键鼠驱动（sys + INF + CAT）+ CLI
-          - \`vdev-audio-win-*.zip\` — PortCls/WaveRT 虚拟声卡驱动 + CLI（inject/capture）
-          - \`vdev-display-win-*.zip\` — IddCx UMDF 虚拟显示器驱动 + CLI
-          - \`vdev-tools-win-*.zip\` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI）
+          - `vdev-hid-win-*.zip` — VHF 虚拟键鼠驱动（sys + INF + CAT）+ CLI
+          - `vdev-audio-win-*.zip` — PortCls/WaveRT 虚拟声卡驱动 + CLI（inject/capture）
+          - `vdev-display-win-*.zip` — IddCx UMDF 虚拟显示器驱动 + CLI
+          - `vdev-tools-win-*.zip` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI）
 
-          每个包内若含 \`vdev-test-signing.cer\`，表示该包为**自签/测试签名**产物。
+          每个包内若含 `vdev-test-signing.cer`，表示该包为**自签/测试签名**产物。
 
           安装（测试签名模式，管理员 PowerShell）：
 
-          \`\`\`powershell
+          ```powershell
           certutil -addstore -f TrustedPublisher vdev-test-signing.cer
           certutil -addstore -f Root            vdev-test-signing.cer
           bcdedit /set testsigning on        # 需重启
-          .\\vdev-audio-win.exe install --inf-dir .
-          .\\vdev-audio-win.exe status
-          .\\vdev-audio-win.exe inject --tone 1000 --duration 4
-          .\\vdev-audio-win.exe capture --duration 6 --skip 4
-          \`\`\`
+          .\vdev-audio-win.exe install --inf-dir .
+          .\vdev-audio-win.exe status
+          .\vdev-audio-win.exe inject --tone 1000 --duration 4
+          .\vdev-audio-win.exe capture --duration 6 --skip 4
+          ```
 
           自签产物仅供开发/测试机使用；对外分发需微软认可的签名（attestation/WHQL）。
-          下载校验：\`sha256sum -c SHA256SUMS.txt\`。
+          下载校验：`sha256sum -c SHA256SUMS.txt`。
           EOF
+          sed -i "s/@TAG@/${TAG}/" NOTES.md
+          head -8 NOTES.md
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
           PRE: ${{ github.event_name == 'workflow_dispatch' && '--prerelease' || '' }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+          # 本 job 没有 checkout（只下载 artifacts）→ gh 必须显式带 --repo，否则报
+          # "failed to run git: fatal: not a git repository"。
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --repo "$REPO" --clobber
           else
-            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt --repo "$REPO" \
               --title "$TAG" --notes-file NOTES.md $PRE
           fi
