@@ -716,6 +716,8 @@ static SIGNAL_PROC_VTABLE: IMiniportAudioSignalProcessingVtbl =
 // 槽序与签名严格对照 portcls.h `DECLARE_INTERFACE_(IMiniportAudioEngineNode, IUnknown)`。
 
 /// portcls.h `IID_IMiniportAudioEngineNode` = {2EBF536C-EF57-4C64-BEDC-25C1A6D668E6}
+/// （实验 B 期间未暴露该接口；保留常量与实现以便随时切回"引擎模式"对比）
+#[allow(dead_code)]
 static IID_IMINIPORT_AUDIO_ENGINE_NODE: GUID = GUID {
     data1: 0x2ebf_536c,
     data2: 0xef57,
@@ -1382,12 +1384,6 @@ unsafe extern "system" fn miniport_qi(
             interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
             dbg_inc(&DBG_QI_OK);
             STATUS_SUCCESS
-        } else if is_equal_guid(iid, &IID_IMINIPORT_AUDIO_ENGINE_NODE) {
-            // 子对象：IMiniportAudioEngineNode（Windows 10 音频引擎）
-            *obj = core::ptr::addr_of_mut!((*this).engine_node_obj).cast::<c_void>();
-            interlocked_increment(core::ptr::addr_of_mut!((*this).refcount));
-            dbg_inc(&DBG_QI_OK);
-            STATUS_SUCCESS
         } else {
             // minor e：COM 约定 E_NOINTERFACE
             *obj = core::ptr::null_mut();
@@ -1668,11 +1664,70 @@ static KSNODETYPE_MICROPHONE: GUID = GUID {
     data4: [0xb9, 0x17, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96],
 };
 
+/// ks.h `KSDATARANGE_ATTRIBUTES`（=1<<KSDATARANGE_BIT_ATTRIBUTES）：
+/// 置位表示"本范围后面在指针数组里紧跟一个属性列表（KSATTRIBUTE_LIST）"。
+const KSDATARANGE_ATTRIBUTES: u32 = 0x0000_0002;
+/// ks.h `KSDATAFORMAT_ATTRIBUTES`：值缓冲里"格式后面跟属性列表"的同一标志。
+const KSDATAFORMAT_ATTRIBUTES: u32 = 0x0000_0002;
+
+/// ks.h `KSATTRIBUTE`：{ ULONG Size; ULONG Flags; GUID Attribute; }
+#[repr(C)]
+pub struct KsAttribute {
+    pub Size: u32,
+    pub Flags: u32,
+    pub Attribute: GUID,
+}
+
+/// ks.h `KSATTRIBUTE_LIST`：{ ULONG Count; PKSATTRIBUTE* Attributes; }
+#[repr(C)]
+pub struct KsAttributeList {
+    pub Count: u32,
+    pub Attributes: *const *const KsAttribute,
+}
+// SAFETY: 静态只读数据，仅被 PortCls / KS 读取，永不写入
+unsafe impl Sync for KsAttributeList {}
+
+/// 属性指针数组本身含裸指针 → !Sync，包一层只读描述符静态（同 SyncDataRanges 手法）
+struct SyncAttributePtrs([*const KsAttribute; 1]);
+// SAFETY: 静态只读数据，元素指向不可变静态，永不写入
+unsafe impl Sync for SyncAttributePtrs {}
+
+/// ksmedia.h `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE`
+/// = {E1F89EB5-5F46-419B-967B-FF6770B98401}
+static KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE: GUID = GUID {
+    data1: 0xe1f8_9eb5,
+    data2: 0x5f46,
+    data3: 0x419b,
+    data4: [0x96, 0x7b, 0xff, 0x67, 0x70, 0xb9, 0x84, 0x01],
+};
+
+/// streaming pin 的数据范围属性（sysvad `endpoints.h::PinDataRangeSignalProcessingModeAttribute` /
+/// VDA 同款）：一个"本范围带音频信号处理模式属性"的裸 KSATTRIBUTE（24 字节，不带具体模式值，
+/// 表示该范围对默认模式有效）。ToDesk 虚拟声卡二进制里也是这一形状。
+static STREAM_RANGE_MODE_ATTRIBUTE: KsAttribute = KsAttribute {
+    Size: size_of::<KsAttribute>() as u32,
+    Flags: 0,
+    Attribute: KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE,
+};
+static STREAM_RANGE_MODE_ATTRIBUTE_PTRS: SyncAttributePtrs =
+    SyncAttributePtrs([&raw const STREAM_RANGE_MODE_ATTRIBUTE]);
+static STREAM_RANGE_MODE_ATTRIBUTE_LIST: KsAttributeList = KsAttributeList {
+    Count: 1,
+    Attributes: STREAM_RANGE_MODE_ATTRIBUTE_PTRS.0.as_ptr(),
+};
+
 /// PCM 16bit / 48kHz / 2ch 数据范围
+///
+/// Flags 必须置 `KSDATARANGE_ATTRIBUTES`：Win10 音频引擎（audiodg/EndpointBuilder）
+/// 在给端点定"设备格式 / 混音格式"时会按**信号处理模式**匹配数据范围；范围上没有
+/// 模式属性列表时匹配不到任何 (模式, 格式) 组合，客户端 `IAudioClient::GetMixFormat` /
+/// `Initialize` 直接报 0x80070491（ERROR_NO_MATCH，「no match for the specified key in
+/// the index」）/ 0x88890008。sysvad `speakerwavtable.h` 的每个 streaming 范围、
+/// VDA、以及本机可用的 ToDesk 虚拟声卡（二进制实测 Flags=0x2）都带这个属性列表。
 static AUDIO_DATA_RANGE: KSDATARANGE_AUDIO = KSDATARANGE_AUDIO {
     DataRange: KSDATARANGE {
         FormatSize: size_of::<KSDATARANGE_AUDIO>() as u32,
-        Flags: 0,
+        Flags: KSDATARANGE_ATTRIBUTES,
         SampleSize: 0,
         Reserved: 0,
         MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
@@ -1688,11 +1743,17 @@ static AUDIO_DATA_RANGE: KSDATARANGE_AUDIO = KSDATARANGE_AUDIO {
 
 /// 数据范围指针数组——静态共享要求 Sync，本工具链对含裸指针的类型不自动满足，
 /// 故保留显式 Sync 包装（原实现同款）
-struct SyncDataRanges([*const KSDATARANGE; 1]);
+struct SyncDataRanges<const N: usize>([*const KSDATARANGE; N]);
 // SAFETY: 静态只读数据，永不写入
-unsafe impl Sync for SyncDataRanges {}
+unsafe impl<const N: usize> Sync for SyncDataRanges<N> {}
 
-static DATA_RANGES: SyncDataRanges = SyncDataRanges([&raw const AUDIO_DATA_RANGE.DataRange]);
+/// streaming pin 的范围表：**2 项**——范围本身 + 属性列表指针。
+/// （KS 约定：范围 Flags 带 KSDATARANGE_ATTRIBUTES 时，指针数组的下一项指向
+/// KSATTRIBUTE_LIST；插槽类型仍是 PKSDATARANGE，故此处做指针类型转换。）
+static DATA_RANGES: SyncDataRanges<2> = SyncDataRanges([
+    &raw const AUDIO_DATA_RANGE.DataRange,
+    (&raw const STREAM_RANGE_MODE_ATTRIBUTE_LIST).cast::<KSDATARANGE>(),
+]);
 
 /// bridge pin 的数据范围：TYPE_AUDIO / SUBTYPE_ANALOG / SPECIFIER_NONE
 /// （对照 sysvad speakertoptable.h 与 ToDesk 虚拟声卡 wave 滤波器 pin1 实测值）
@@ -1705,11 +1766,20 @@ static AUDIO_BRIDGE_RANGE: KSDATARANGE = KSDATARANGE {
     SubFormat: KSDATAFORMAT_SUBTYPE_ANALOG,
     Specifier: KSDATAFORMAT_SPECIFIER_NONE,
 };
-static BRIDGE_DATA_RANGES: SyncDataRanges = SyncDataRanges([&raw const AUDIO_BRIDGE_RANGE]);
+static BRIDGE_DATA_RANGES: SyncDataRanges<1> = SyncDataRanges([&raw const AUDIO_BRIDGE_RANGE]);
 
+/// 开流 pin 的接口表：**必须是 KSINTERFACE_STANDARD_LOOPED_STREAMING(1)**。
+///
+/// 回归（本轮真机定位）：原来写的是 KSINTERFACE_STANDARD_STREAMING(0)，而
+/// audiodg/AudioEndpointBuilder 打开 WaveRT 端点时按 `KSPIN_INTERFACE
+/// {KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_LOOPED_STREAMING}` 选接口，
+/// 找不到就返回 STATUS_NO_MATCH → 客户端拿到 0x80070491（ERROR_NO_MATCH）：
+/// 实测 `IAudioClient::Activate` 成功、紧接着 `GetDevicePeriod` 就报 0x80070491
+/// （ToDesk/Realtek 同一步 hr=0），之后 GetMixFormat/IsFormatSupported/Initialize
+/// 全盘失败。ToDesk 端点同属性实测 id=1。
 static PIN_INTERFACES: [KSPIN_INTERFACE; 1] = [KSPIN_INTERFACE {
     Set: KSINTERFACESETID_STANDARD,
-    Id: KSINTERFACE_STANDARD_STREAMING,
+    Id: KSINTERFACE_STANDARD_LOOPED_STREAMING,
     Flags: 0,
 }];
 
@@ -1851,118 +1921,263 @@ unsafe extern "system" fn wave_format_property_handler(req: *mut PCPROPERTY_REQU
     let verb = r.Verb;
 
     if verb & KSPROPERTY_TYPE_BASICSUPPORT != 0 {
-        if r.ValueSize < 4 {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        // SAFETY: ValueSize >= 4
-        unsafe {
-            core::ptr::write(
-                r.Value.cast::<u32>(),
-                KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
-            );
-        }
-        r.ValueSize = 4;
-        return STATUS_SUCCESS;
+        return proposed_format_basicsupport(r);
     }
-
-    let need = size_of::<KsDataFormatWaveFormatExtensible>() as u32;
     if verb & KSPROPERTY_TYPE_GET != 0 {
-        dbg_inc(&DBG_PROPOSED_GET);
-        // 官方契约（sysvad minwavert.cpp::PropertyHandlerProposedFormat2）：
-        //   cbMinSize = DefaultFormat->FormatSize 向上取 8 对齐，**再加上实例里的属性列表长度**
-        //   （KSATTRIBUTE 链，承载 AUDIO_SIGNALPROCESSINGMODE 等），value = [格式][属性列表]。
-        // 0 长度缓冲 = "只问需要多大" → 回 STATUS_BUFFER_OVERFLOW + ValueSize；
-        // 不足 → BUFFER_TOO_SMALL；足够 → 拷格式 + 原样回拷属性列表。
-        // 回归：原实现只拷 104 字节格式、0 长度也回 BUFFER_TOO_SMALL，引擎会反复提案。
-        const KSP_PIN_SIZE: usize = 32; // KSPROPERTY(24) + PinId(4) + Reserved(4)
-        let attr_len = (r.InstanceSize as usize).saturating_sub(KSP_PIN_SIZE);
-        let fmt_size = need as usize;
-        let need_total = ((fmt_size + 7) & !7) + attr_len;
-        if r.ValueSize == 0 {
-            r.ValueSize = need_total as u32;
-            DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
-            return STATUS_BUFFER_OVERFLOW;
-        }
-        if (r.ValueSize as usize) < need_total {
-            r.ValueSize = need_total as u32;
-            DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        // SAFETY: 目标缓冲区 >= need_total；源为只读静态（DEVICE_FORMAT 永不改写）
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (&raw const DEVICE_FORMAT).cast::<u8>(),
-                r.Value.cast::<u8>(),
-                fmt_size,
-            );
-            if attr_len > 0 && !r.Instance.is_null() {
-                core::ptr::copy_nonoverlapping(
-                    (r.Instance as *const u8).add(KSP_PIN_SIZE),
-                    r.Value.cast::<u8>().add(fmt_size),
-                    attr_len,
-                );
-            }
-        }
-        DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
-        DBG_PROPOSED_ATTR_LEN.store(attr_len as u32, Ordering::Relaxed);
-        r.ValueSize = need_total as u32;
-        return STATUS_SUCCESS;
+        return proposed_format_get(r);
     }
-
     if verb & KSPROPERTY_TYPE_SET != 0 {
-        // 接受引擎提出的任何 PCM 形状（WAVEFORMATEX 或 WAVEFORMATEXTENSIBLE）：
-        // 设备格式由本驱动的数据范围/INF OEMFormat 决定，这里拒绝只会让引擎判定
-        // "设备不可用"（实测：严格只收 16bit/48k 时端点仍拿不到设备格式）。
-        // 真正的播放/录音格式校验在下游 stream_set_format / data_range_intersection。
-        if r.ValueSize < 16 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        // SAFETY: ValueSize >= 16，逐字段 read_unaligned 不要求对齐
-        let p = r.Value.cast::<u8>();
-        // 值可能是 KSDATAFORMAT_WAVEFORMATEX(TENSIBLE)（offset 0 是 FormatSize，
-        // wFormatTag 在 KSDATAFORMAT 之后 = offset 64），也可能是裸 WAVEFORMATEX（tag 在 0）。
-        // 回归（真机计数器：prop_set=1883、prop_last_tag=104=FormatSize）：原来一律按裸
-        // WAVEFORMATEX 在 offset 0 取 tag，于是把 104 当 tag、每次回
-        // STATUS_INVALID_PARAMETER —— 引擎反复提案却永远拿不到确认，端点因此打不开。
-        let tag_off = if r.ValueSize >= (size_of::<KSDATAFORMAT>() + 16) as u32 {
-            size_of::<KSDATAFORMAT>()
-        } else {
-            0
-        };
-        let tag = unsafe { core::ptr::read_unaligned(p.add(tag_off).cast::<u16>()) };
-        dbg_inc(&DBG_PROPOSED_SET);
-        DBG_PROPOSED_LAST_TAG.store(u32::from(tag), Ordering::Relaxed);
-        if tag != 1 && tag != 0xFFFE {
-            return STATUS_INVALID_PARAMETER;
-        }
-        // KSPROPERTY_PIN_PROPOSEDATAFORMAT / 2 的 Value 是**输入输出**缓冲：驱动必须把
-        // "实际会用的格式"写回去（引擎据此定设备格式）。只回 success 不回填时，引擎读到
-        // 的还是它自己提的形状、于是反复重试（真机计数器实测 prop_set=2070 且循环不止）。
-        let base = if tag_off == 0 {
-            // 裸 WAVEFORMATEX：就地升级为 KSDATAFORMAT_WAVEFORMATEXTENSIBLE（若缓冲够）
-            if r.ValueSize < need {
-                return STATUS_SUCCESS; // 缓冲太小：接受但不回填（引擎会另取设备格式）
-            }
-            0usize
-        } else {
-            tag_off - size_of::<KSDATAFORMAT>()
-        };
-        if (r.ValueSize as usize) >= base + need as usize {
-            // SAFETY: 目标缓冲 >= base + 104 字节
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (&raw const DEVICE_FORMAT).cast::<u8>(),
-                    p.add(base),
-                    need as usize,
-                );
-            }
-            r.ValueSize = (base as u32) + need;
-        }
-        dbg_inc(&DBG_PROPOSED_SET_OK);
-        return STATUS_SUCCESS;
+        return proposed_format_set(r);
     }
 
     STATUS_INVALID_PARAMETER
+}
+
+/// BASICSUPPORT：回本属性能用的 verb 位（PortCls 据此应答 KSPROPERTY_TYPE_BASICSUPPORT）。
+unsafe fn proposed_format_basicsupport(r: &mut PCPROPERTY_REQUEST) -> NTSTATUS {
+    if r.ValueSize < 4 {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: ValueSize >= 4
+    unsafe {
+        core::ptr::write(
+            r.Value.cast::<u32>(),
+            KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+        );
+    }
+    r.ValueSize = 4;
+    STATUS_SUCCESS
+}
+
+/// ks.h `KSP_PIN` = KSPROPERTY(24) + PinId(4) + Reserved(4)
+const KSP_PIN_SIZE: usize = 32;
+
+/// pin 角色（sysvad::PropertyHandlerProposedFormat 的 IsSystemRenderPin/IsBridgePin 判定）
+enum PinKind {
+    Stream,
+    Bridge,
+    Invalid,
+}
+
+/// 判定 pin 是开流用的 host pin、物理连接的 bridge pin，还是不存在。
+/// `MajorTarget` 对滤波器级属性就是本滤波器的 miniport（portcls.h 约定）。
+unsafe fn stream_pin_kind(major: PVOID, pin: u32) -> PinKind {
+    if major.is_null() {
+        return PinKind::Invalid;
+    }
+    // SAFETY: MajorTarget 由 PortCls 保证是 MiniportWaveRT*
+    let capture = unsafe { (*(major.cast::<MiniportWaveRT>())).capture };
+    // render：pin0=host(pin1=bridge)；capture：pin0=bridge(pin1=host)
+    let (stream_pin, bridge_pin) = if capture { (1u32, 0u32) } else { (0u32, 1u32) };
+    if pin == stream_pin {
+        PinKind::Stream
+    } else if pin == bridge_pin {
+        PinKind::Bridge
+    } else {
+        PinKind::Invalid
+    }
+}
+
+/// 从实例（KSP_PIN 之后的 KSMULTIPLE_ITEM 属性列表）里取音频信号处理模式。
+/// 与 sysvad `GetAttributesFromAttributeList` 同款：没有属性列表 → DEFAULT；
+/// 属性 ID 不是 AUDIOSIGNALPROCESSING_MODE、或尺寸不符 → 调用方按 NOT_SUPPORTED 应答。
+unsafe fn mode_from_instance(r: &PCPROPERTY_REQUEST) -> Result<GUID, NTSTATUS> {
+    let mut mode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    let cb_items = (r.InstanceSize as usize).saturating_sub(KSP_PIN_SIZE);
+    if cb_items == 0 || r.Instance.is_null() {
+        return Ok(mode);
+    }
+    // KSMULTIPLE_ITEM{ Count, Size } 之后是 KSATTRIBUTE 链，每个按 8 字节对齐
+    let mut off = size_of::<KsMultipleItem>();
+    while off + size_of::<KsAttribute>() <= cb_items {
+        // SAFETY: 已确认 off + sizeof(KSATTRIBUTE) <= cb_items
+        let attr = unsafe {
+            &*(r.Instance as *const u8)
+                .add(KSP_PIN_SIZE + off)
+                .cast::<KsAttribute>()
+        };
+        let cb_attr = ((attr.Size as usize) + 7) & !7;
+        if attr.Attribute != KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        if (attr.Size as usize) != size_of::<KsAttributeMode>() || off + cb_attr > cb_items {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        // SAFETY: KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE 已按尺寸校验
+        let full = unsafe {
+            &*(r.Instance as *const u8)
+                .add(KSP_PIN_SIZE + off)
+                .cast::<KsAttributeMode>()
+        };
+        mode = full.SignalProcessingMode;
+        off += cb_attr;
+    }
+    Ok(mode)
+}
+
+/// 引擎提出的格式是否就是本驱动的设备格式（sysvad `IsFormatSupported` 的等价判定）：
+/// 2ch / 48kHz / 16bit / PCM（WAVEFORMATEX 或 WAVEFORMATEXTENSIBLE+PCM）。
+unsafe fn proposed_format_matches_device(value: *const u8, size: u32) -> bool {
+    let dsf = size_of::<KSDATAFORMAT>();
+    let wfx = size_of::<WAVEFORMATEX>();
+    if size as usize >= dsf + wfx {
+        // SAFETY: 缓冲至少含一个 KSDATAFORMAT
+        let df = unsafe { &*value.cast::<KSDATAFORMAT>() };
+        if df.MajorFormat != KSDATAFORMAT_TYPE_AUDIO || df.SubFormat != KSDATAFORMAT_SUBTYPE_PCM {
+            return false;
+        }
+        // SAFETY: 缓冲至少含 KSDATAFORMAT + WAVEFORMATEX
+        let wf = unsafe { &*value.add(dsf).cast::<WAVEFORMATEX>() };
+        if wf.nChannels != 2 || wf.nSamplesPerSec != 48_000 || wf.wBitsPerSample != 16 {
+            return false;
+        }
+        return match wf.wFormatTag {
+            1 => true, // WAVE_FORMAT_PCM
+            0xFFFE => {
+                if (size as usize) < dsf + size_of::<WaveFormatExtensible>() {
+                    return false;
+                }
+                // SAFETY: 缓冲至少含完整 WAVEFORMATEXTENSIBLE；packed 结构只能按字段
+                // 偏移做 read_unaligned（对 packed 结构取字段引用是 UB）
+                let sub: GUID = unsafe {
+                    core::ptr::read_unaligned(
+                        value
+                            .add(dsf + core::mem::offset_of!(WaveFormatExtensible, sub_format))
+                            .cast::<GUID>(),
+                    )
+                };
+                sub == KSDATAFORMAT_SUBTYPE_PCM
+            }
+            _ => false,
+        };
+    }
+    // 裸 WAVEFORMATEX（sysvad 不支持，这里宽松接受同参数的 PCM）
+    if (size as usize) < wfx {
+        return false;
+    }
+    // SAFETY: 缓冲至少含一个 WAVEFORMATEX
+    let wf = unsafe { &*value.cast::<WAVEFORMATEX>() };
+    wf.wFormatTag == 1
+        && wf.nChannels == 2
+        && wf.nSamplesPerSec == 48_000
+        && wf.wBitsPerSample == 16
+}
+
+/// ksmedia.h `KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE`：KSATTRIBUTE + GUID
+#[repr(C)]
+struct KsAttributeMode {
+    pub header: KsAttribute,
+    pub SignalProcessingMode: GUID,
+}
+
+/// GET（KSPROPERTY_PIN_PROPOSEDATAFORMAT2）——官方契约（sysvad
+/// minwavert.cpp::PropertyHandlerProposedFormat2）：
+///   cbMinSize = DefaultFormat->FormatSize 向上取 8 对齐，**再加上实例里的属性列表长度**
+///   （KSATTRIBUTE 链，承载 AUDIO_SIGNALPROCESSINGMODE 等），value = [格式][属性列表]。
+/// 0 长度缓冲 = "只问需要多大" → 回 STATUS_BUFFER_OVERFLOW + ValueSize；
+/// 不足 → BUFFER_TOO_SMALL；足够 → 拷格式 + 原样回拷属性列表。
+/// 回归：原实现只拷 104 字节格式、0 长度也回 BUFFER_TOO_SMALL，引擎会反复提案。
+unsafe fn proposed_format_get(r: &mut PCPROPERTY_REQUEST) -> NTSTATUS {
+    dbg_inc(&DBG_PROPOSED_GET);
+    // 模式必须是本驱动 GetModes 报过的那些；未知模式 → NOT_SUPPORTED（sysvad 同款）
+    let mode = match unsafe { mode_from_instance(r) } {
+        Ok(m) => m,
+        Err(status) => return status,
+    };
+    if !SUPPORTED_MODES.contains(&mode) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let fmt_size = size_of::<KsDataFormatWaveFormatExtensible>();
+    let attr_len = (r.InstanceSize as usize).saturating_sub(KSP_PIN_SIZE);
+    let need_total = ((fmt_size + 7) & !7) + attr_len;
+    if r.ValueSize == 0 {
+        r.ValueSize = need_total as u32;
+        DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if (r.ValueSize as usize) < need_total {
+        r.ValueSize = need_total as u32;
+        DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: 目标缓冲区 >= need_total；源为只读静态（DEVICE_FORMAT 永不改写）
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (&raw const DEVICE_FORMAT).cast::<u8>(),
+            r.Value.cast::<u8>(),
+            fmt_size,
+        );
+        if attr_len > 0 && !r.Instance.is_null() {
+            core::ptr::copy_nonoverlapping(
+                (r.Instance as *const u8).add(KSP_PIN_SIZE),
+                r.Value.cast::<u8>().add(fmt_size),
+                attr_len,
+            );
+            // 值里带了属性列表 → 格式头必须置 KSDATAFORMAT_ATTRIBUTES
+            // （sysvad::PropertyHandlerProposedFormat2 同款），否则引擎会认为
+            // 属性列表无效、匹配不到模式。
+            core::ptr::write(
+                r.Value.cast::<u8>().add(4).cast::<u32>(),
+                KSDATAFORMAT_ATTRIBUTES,
+            );
+        }
+    }
+    DBG_PROPOSED_GET_SIZE.store(need_total as u32, Ordering::Relaxed);
+    DBG_PROPOSED_ATTR_LEN.store(attr_len as u32, Ordering::Relaxed);
+    r.ValueSize = need_total as u32;
+    STATUS_SUCCESS
+}
+
+/// SET（KSPROPERTY_PIN_PROPOSEDATAFORMAT）：按设备格式**校验**引擎提出的格式 ——
+/// 支持回 SUCCESS，不支持回 NO_MATCH（sysvad `PropertyHandlerProposedFormat` 的
+/// `IsFormatSupported` 语义）。
+///
+/// 回归：原实现"接受任何 tag∈{PCM,EXTENSIBLE} 的提案并把设备格式写回缓冲"，
+/// 等于对引擎的每个候选格式都说"行"，真机实测引擎（AEB）据此反复提案 1600+ 次、
+/// 最终仍报 0x80070491。参考实现只回状态、不回填缓冲。
+unsafe fn proposed_format_set(r: &mut PCPROPERTY_REQUEST) -> NTSTATUS {
+    let need = size_of::<KsDataFormatWaveFormatExtensible>() as u32;
+    if (r.InstanceSize as usize) < KSP_PIN_SIZE || r.Instance.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: 实例至少含 KSP_PIN 的 PinId 字段
+    let pin = unsafe { core::ptr::read_unaligned((r.Instance as *const u8).add(24).cast::<u32>()) };
+    match unsafe { stream_pin_kind(r.MajorTarget, pin) } {
+        PinKind::Stream => {}
+        // 只对开流 pin 有效（sysvad：bridge pin 回 NOT_SUPPORTED、其它 pin 回 INVALID_PARAMETER）
+        PinKind::Bridge => return STATUS_NOT_SUPPORTED,
+        PinKind::Invalid => return STATUS_INVALID_PARAMETER,
+    }
+    if r.ValueSize == 0 {
+        r.ValueSize = need;
+        return STATUS_BUFFER_OVERFLOW;
+    }
+    if r.ValueSize < need {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    // 真机诊断：记录引擎最近提出的格式形状（tag / 采样率 / 位深 / 校验结果）
+    // SAFETY: ValueSize >= 104，缓冲至少含 KSDATAFORMAT + WAVEFORMATEX
+    let (tag, rate, bits) = unsafe {
+        let df = r.Value.cast::<u8>();
+        let wf = &*df.add(size_of::<KSDATAFORMAT>()).cast::<WAVEFORMATEX>();
+        (
+            u32::from(wf.wFormatTag),
+            wf.nSamplesPerSec,
+            u32::from(wf.wBitsPerSample),
+        )
+    };
+    dbg_inc(&DBG_PROPOSED_SET);
+    DBG_PROPOSED_LAST_TAG.store(tag, Ordering::Relaxed);
+    DBG_PROPOSED_LAST_RATE.store(rate, Ordering::Relaxed);
+    DBG_PROPOSED_LAST_BITS.store(bits, Ordering::Relaxed);
+    let ok = unsafe { proposed_format_matches_device(r.Value.cast::<u8>(), r.ValueSize) };
+    if ok {
+        dbg_inc(&DBG_PROPOSED_SET_OK);
+        STATUS_SUCCESS
+    } else {
+        dbg_inc(&DBG_PROPOSED_SET_REJECT);
+        STATUS_NO_MATCH
+    }
 }
 
 static WAVE_PROPERTY_ITEMS: [PCPROPERTY_ITEM; 3] = [
@@ -2020,6 +2235,10 @@ static DBG_PROPOSED_SET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_GET: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_LAST_TAG: AtomicU32 = AtomicU32::new(0);
 static DBG_PROPOSED_SET_OK: AtomicU32 = AtomicU32::new(0);
+/// 引擎最后一次提案的形状 + 被拒次数（严格校验后用来判断"引擎到底想要什么"）
+static DBG_PROPOSED_LAST_RATE: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_LAST_BITS: AtomicU32 = AtomicU32::new(0);
+static DBG_PROPOSED_SET_REJECT: AtomicU32 = AtomicU32::new(0);
 /// 音频引擎节点方法调用计数（看引擎走的是哪条路）
 static DBG_AE_GET_MIX_FORMAT: AtomicU32 = AtomicU32::new(0);
 static DBG_AE_GET_DEVICE_FORMAT: AtomicU32 = AtomicU32::new(0);
@@ -2111,8 +2330,8 @@ static KSPROPSETID_VDEV_DEBUG: GUID = GUID {
     data4: [0x8f, 0x2a, 0x1d, 0x2c, 0x3b, 0x4a, 0x5e, 0x60],
 };
 const KSPROPERTY_VDEV_DEBUG_STATS: ULONG = 0;
-/// 计数器快照长度：32 个 u32
-const DBG_STATS_LEN: usize = 50 * 4;
+/// 计数器快照长度：53 个 u32（前 53 个是标量计数，其后紧跟 16 个引擎节点方法计数）
+const DBG_STATS_LEN: usize = 53 * 4;
 
 unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUEST) -> NTSTATUS {
     // SAFETY: PortCls 保证 req 有效
@@ -2176,6 +2395,9 @@ unsafe extern "system" fn vdev_debug_property_handler(req: *mut PCPROPERTY_REQUE
             DBG_MODES_CALLS.load(Ordering::Relaxed),
             DBG_MODES_LAST_PIN.load(Ordering::Relaxed),
             DBG_MODES_LAST_COUNT.load(Ordering::Relaxed),
+            DBG_PROPOSED_LAST_RATE.load(Ordering::Relaxed),
+            DBG_PROPOSED_LAST_BITS.load(Ordering::Relaxed),
+            DBG_PROPOSED_SET_REJECT.load(Ordering::Relaxed),
         ];
         // SAFETY: ValueSize >= DBG_STATS_LEN 已校验；逐元素 unaligned 写入
         unsafe {
@@ -2212,50 +2434,38 @@ const STATUS_BUFFER_OVERFLOW: NTSTATUS = i32::from_ne_bytes(0x8000_0005u32.to_ne
 // 更新（Win10 音频引擎节点）：按 sysvad speakerwavtable.h 的形状经
 // KSNODETYPE_AUDIO_ENGINE 节点中转 —— host pin → node 输入(pin 1)；node 输出(pin 0) → bridge pin。
 // 音频引擎节点是 Win10 端点"应用可用"的前提（引擎会 QI IMiniportAudioEngineNode）。
-static WAVE_RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 2] = [
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: PCFILTER_NODE,
-        FromNodePin: crate::endpoint_names::WAVE_RENDER_HOST_PIN,
-        ToNode: 0, // KSNODE_WAVE_AUDIO_ENGINE
-        ToNodePin: 1,
-    },
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: 0,
-        FromNodePin: 0,
-        ToNode: PCFILTER_NODE,
-        ToNodePin: crate::endpoint_names::WAVE_RENDER_BRIDGE_PIN,
-    },
-];
-static WAVE_CAPTURE_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 2] = [
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: PCFILTER_NODE,
-        FromNodePin: crate::endpoint_names::WAVE_CAPTURE_BRIDGE_PIN,
-        ToNode: 0,
-        ToNodePin: 1,
-    },
-    PCCONNECTION_DESCRIPTOR {
-        FromNode: 0,
-        FromNodePin: 0,
-        ToNode: PCFILTER_NODE,
-        ToNodePin: crate::endpoint_names::WAVE_CAPTURE_HOST_PIN,
-    },
-];
+/// 实验 B：无引擎节点 → 连接回到 host ↔ bridge 直连（ToDesk 实测就是 1 条连接）
+static WAVE_RENDER_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
+    FromNode: PCFILTER_NODE,
+    FromNodePin: crate::endpoint_names::WAVE_RENDER_HOST_PIN,
+    ToNode: PCFILTER_NODE,
+    ToNodePin: crate::endpoint_names::WAVE_RENDER_BRIDGE_PIN,
+}];
+static WAVE_CAPTURE_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; 1] = [PCCONNECTION_DESCRIPTOR {
+    FromNode: PCFILTER_NODE,
+    FromNodePin: crate::endpoint_names::WAVE_CAPTURE_BRIDGE_PIN,
+    ToNode: PCFILTER_NODE,
+    ToNodePin: crate::endpoint_names::WAVE_CAPTURE_HOST_PIN,
+}];
 
 /// ksmedia.h `KSNODETYPE_AUDIO_ENGINE` = {35CAF6E4-F3B3-4168-BB4B-55E77A461C7E}
+/// （实验 B 不再声明引擎节点；保留常量以便切回）
+#[allow(dead_code)]
 static KSNODETYPE_AUDIO_ENGINE: GUID = GUID {
     data1: 0x35ca_f6e4,
     data2: 0xf3b3,
     data3: 0x4168,
     data4: [0xbb, 0x4b, 0x55, 0xe7, 0x7a, 0x46, 0x1c, 0x7e],
 };
-/// 音频引擎节点（AutomationTable 留空：PortCls 把 KSPROPSETID_AudioEngine 属性转发到
-/// miniport 的 IMiniportAudioEngineNode 接口，sysvad 同款）
-static WAVE_NODES: [PCNODE_DESCRIPTOR; 1] = [PCNODE_DESCRIPTOR {
-    Flags: 0,
-    AutomationTable: core::ptr::null(),
-    Type: &raw const KSNODETYPE_AUDIO_ENGINE,
-    Name: core::ptr::null(),
-}];
+/// 实验 B（basic 模式）：**不声明音频引擎节点**。
+///
+/// 依据：本机可用的 ToDesk 虚拟声卡 wave 滤波器就是 `nodes=0`（无引擎节点），端点在
+/// Win10 上走"basic 模式"由 audiodg 自行处理（实测其共享模式 AUTOCONVERTPCM 开流 hr=0）；
+/// 而我们声明引擎节点后，引擎会要求完整的引擎能力（GetSupportedDeviceFormats /
+/// GetBufferSizeRange / 建流前的校验），本驱动只实现了其中一部分，实测引擎方法全调通但
+/// 从不建流、客户端报 AUDCLNT_E_UNSUPPORTED_FORMAT。先回到 basic 模式把端点跑通。
+/// （引擎节点相关代码与接口仍保留在文件里，仅不在此声明/不在此暴露 QI。）
+static WAVE_NODES: [PCNODE_DESCRIPTOR; 0] = [];
 
 /// render 小端口 pin 表（2 pin，对照 ToDesk 虚拟声卡逐 pin 实测值 / sysvad speakerwavtable.h）
 ///
@@ -2276,7 +2486,7 @@ static PINS_RENDER: [PCPIN_DESCRIPTOR; 2] = [
             Interfaces: PIN_INTERFACES.as_ptr(),
             MediumsCount: 1,
             Mediums: PIN_MEDIUMS.as_ptr(),
-            DataRangesCount: 1,
+            DataRangesCount: DATA_RANGES.0.len() as u32,
             DataRanges: DATA_RANGES.0.as_ptr(),
             DataFlow: KSPIN_DATAFLOW_IN,
             Communication: KSPIN_COMMUNICATION_SINK,
@@ -2344,7 +2554,7 @@ static PINS_CAPTURE: [PCPIN_DESCRIPTOR; 2] = [
             Interfaces: PIN_INTERFACES.as_ptr(),
             MediumsCount: 1,
             Mediums: PIN_MEDIUMS.as_ptr(),
-            DataRangesCount: 1,
+            DataRangesCount: DATA_RANGES.0.len() as u32,
             DataRanges: DATA_RANGES.0.as_ptr(),
             DataFlow: KSPIN_DATAFLOW_OUT,
             Communication: KSPIN_COMMUNICATION_SINK,
