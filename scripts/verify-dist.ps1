@@ -38,10 +38,15 @@ if ($RequireCer) {
 foreach ($f in @($Binary, $Cat)) {
     $p = Join-Path $Dist $f
     Write-Host "== signtool verify /pa $f"
-    & $signtool verify /pa /v $p | Out-String -Stream |
+    # 先把输出与退出码都收下来，再筛选打印：`& native | Select-Object -First N` 会因为
+    # 下游提前停止而**杀掉原生进程**，把 $LASTEXITCODE 变成非 0（CI 上表现为
+    # "Successfully verified" 之后仍然 [FAIL]，本地因匹配行不足 4 行反而不会触发）。
+    $out = & $signtool verify /pa /v $p 2>&1
+    $code = $LASTEXITCODE
+    $out | Out-String -Stream |
         Where-Object { $_ -match 'Successfully verified|Issued to|Hash of file' } |
         Select-Object -First 4 | ForEach-Object { "     " + $_.Trim() }
-    Check ($LASTEXITCODE -eq 0) "$f 通过 /pa 校验"
+    Check ($code -eq 0) "$f 通过 /pa 校验"
 }
 
 if ($script:fail -gt 0) { throw "装机包自检失败：$script:fail 项" }
