@@ -237,7 +237,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
-          PRE: ${{ github.event_name == 'workflow_dispatch' && '--prerelease' || '' }}
+          # workflow_dispatch 出的都算预发布；带 `-` 的 tag（v0.1.0-rc1 / v0.0.0-dev.1）也标预发布
+          PRE: ${{ (github.event_name == 'workflow_dispatch' || contains(github.ref_name, '-')) && '--prerelease' || '' }}
         run: |
           # 本 job 没有 checkout（只下载 artifacts）→ gh 必须显式带 --repo，否则报
           # "failed to run git: fatal: not a git repository"。
