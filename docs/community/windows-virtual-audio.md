@@ -297,14 +297,12 @@ CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 f
 - **位置走轮询**：无硬件位置寄存器（明确返回 `STATUS_NOT_SUPPORTED`），依赖 PortCls 的轮询模式 + QPC 时间锚。**时钟能否推进取决于 `NewStream` 里有没有拿到格式**（案例十）。
 - **音量/静音是"记事本"**：采集 topology 的节点属性真实可读写，但没有 DSP 效果（渲染拓扑直通，音量由引擎软件混音层处理）。
 - **环回有固定积压**：两个流共享 1 MB 非分页环形缓冲，48 kHz/32bit/2ch 下约 **1.36 s**。所以"顺序执行：先注入、再采集"读到的多是环里的历史数据；要量当次注入必须**并发**采集（CLI 与 GUI 的环回自测都是这么做的），或把缓冲调小。
-- **驱动本身没有用户态注入接口**：环回纯内核内完成，驱动不暴露 IOCTL/WriteFile 面（安全面干净）。宿主"注音"是从**端点侧**完成的——`vdev-audio-win inject` 就是往「vdev 扬声器」推流（WASAPI 共享模式 + 端点混音格式），`capture` 从「vdev 麦克风」拉流：
+- **驱动本身没有用户态注入接口**：环回纯内核内完成，驱动不暴露 IOCTL/WriteFile 面（安全面干净）。宿主"注音"是从**端点侧**完成的——`vdev-audio-win inject` 就是往「vdev 扬声器」推流（WASAPI 共享模式 + 端点混音格式），`capture` 从「vdev 麦克风」拉流；两者并发就是环回自测，GUI 的「环回自测」按钮把它做成了一键（后台线程跑 CLI，结果回填面板与日志）：
 
-  ```powershell
-  vdev-audio-win inject --tone 1000 --amplitude 0.5 --duration 4   # 也可 --wav file.wav 循环播放
-  vdev-audio-win capture --duration 6 --skip 4 --json               # 报 RMS/峰值 dBFS，可 --wav 存盘
-  ```
-
-  两者并发就是环回自测；GUI 的「环回自测」按钮把这件事做成了一键（后台线程跑 CLI，结果回填面板与日志）。
+```powershell
+vdev-audio-win inject --tone 1000 --amplitude 0.5 --duration 4   # 也可 --wav file.wav 循环播放
+vdev-audio-win capture --duration 6 --skip 4 --json               # 报 RMS/峰值 dBFS，可 --wav 存盘
+```
 - **待办**：Driver Verifier 专项（special pool + DDI compliance）还没跑；环形缓冲积压（1.36 s）可按需调小；多虚拟屏场景未涉及（本设备与显示器无关）。
 
 ## 九、写在最后：内核驱动"编译过 ≠ 能跑"
