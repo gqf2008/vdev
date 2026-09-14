@@ -53,7 +53,7 @@ pub static KEYBOARD_REPORT_DESCRIPTOR: [u8; 60] = [
 ];
 `
 
-这个 8 字节的 Output 字段声明了一个输出管道：用户态对 HID 接口 `WriteFile` 的数据会沿它抵达驱动（`IOCTL_HID_WRITE_REPORT`）。驱动把它**当作输入报告**投递回 hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（67 字节，）同理带一条 4 字节输出管道。
+这个 8 字节的 Output 字段声明了一个输出管道：用户态对 HID 接口 `WriteFile` 的数据会沿它抵达驱动（`IOCTL_HID_WRITE_REPORT`）。驱动把它**当作输入报告**投递回 hidclass——于是"写进去一个键，系统就收到一个键"。鼠标描述符（70 字节）同理带一条 4 字节输出管道。
 
 还有一个值得注意的细节：按键码数组的 Usage/Logical Maximum 写到 `0x73`（115）而不是常见的 `0x65`（101），因为 F13–F24 的 usage 落在 0x68–0x73，上限给低了这些键会被 hidclass 静默丢弃——这是审查阶段抓出来的真实 bug（见第 6 节）。
 
