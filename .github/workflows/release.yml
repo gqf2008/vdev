@@ -1,0 +1,244 @@
+name: release
+
+# 发版：打 tag（v*）时构建 + 签名 + 装机包自检 + 打包 + 挂 GitHub Release。
+# 也可手动 workflow_dispatch（出一份 prerelease，便于验证流水线本身）。
+#
+# 签名模式（同一套脚本，靠环境变量切换，见 scripts/sign-common.ps1）：
+#   * 默认：CI 里现生成自签代码签名证书 → 签 .sys/.cat → 公钥导出成
+#     `vdev-test-signing.cer` 打进每个包。**目标机需信任该证书并开测试签名**
+#     （`bcdedit /set testsigning on`），与 README 的本机验收方式一致。
+#   * 官方签名：仓库 secrets 提供 `VDEV_SIGN_PFX_BASE64` + `VDEV_SIGN_PFX_PASSWORD`
+#     时改用该证书（EV/Trusted Signing 证书可走微软 attestation 提交流程；
+#     提交流程本身需要 Partner Center 凭据，属后续接线点）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（留空则用 v0.0.0-dev.<run_number>）"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------- 三个内核驱动：构建 → stage+sign → 自检 → 打包 ----------
+  windows-drivers:
+    name: 驱动 ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vdev-hid-win
+            build-dir: crates/vdev-hid-win/kernel
+            build: cargo build --release --target x86_64-pc-windows-msvc
+            cache: crates/vdev-hid-win/kernel
+            stage: crates/vdev-hid-win/scripts/stage-sign-hid.ps1
+            dist: crates/vdev-hid-win/target/dist
+            inf: vdev-hid.inf
+            binary: vdev_hid.sys
+            cat: vdev-hid.cat
+            extra-dir: crates/vdev-hid-win
+            extra: cargo build --release --target x86_64-pc-windows-msvc -p vdev-hid-win
+            extra-file: crates/vdev-hid-win/target/x86_64-pc-windows-msvc/release/vdev-hid-win.exe
+          - name: vdev-audio-win
+            build-dir: crates/vdev-audio-win
+            build: cargo build --release --features kernel -p vdev-audio-driver --target x86_64-pc-windows-msvc
+            cache: crates/vdev-audio-win
+            stage: crates/vdev-audio-win/scripts/stage-sign-audio.ps1
+            dist: crates/vdev-audio-win/target/dist
+            inf: vdev-audio.inf
+            binary: vdev_audio.sys
+            cat: vdev-audio.cat
+            extra-dir: crates/vdev-audio-win
+            extra: cargo build --release --target x86_64-pc-windows-msvc -p vdev-audio-win
+            extra-file: crates/vdev-audio-win/target/x86_64-pc-windows-msvc/release/vdev-audio-win.exe
+          - name: vdev-display-win
+            build-dir: crates/vdev-display-win
+            build: cargo build --release --target x86_64-pc-windows-msvc -p vdev-display-driver -p vdev-display-win
+            cache: crates/vdev-display-win
+            stage: crates/vdev-display-win/scripts/stage-sign.ps1
+            dist: crates/vdev-display-win/target/dist
+            inf: vdev-display.inf
+            binary: vdev_display.dll
+            cat: vdev-display.cat
+            extra-dir: .
+            extra: ""
+            extra-file: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.cache }}
+      - name: 安装 WDK + LLVM（bindgen 与 signtool/Inf2Cat）
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --silent --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::WDK winget 安装失败 (exit=$LASTEXITCODE)" }
+          winget list --id LLVM.LLVM --exact > $null
+          if ($LASTEXITCODE -ne 0) { winget install --id LLVM.LLVM --exact --silent --accept-package-agreements --accept-source-agreements }
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin"
+          exit 0
+      - name: 准备签名证书
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.VDEV_SIGN_PFX_BASE64 }}
+          PFX_PWD: ${{ secrets.VDEV_SIGN_PFX_PASSWORD }}
+        run: |
+          if ($env:PFX_B64) {
+            $pfx = Join-Path $env:RUNNER_TEMP "vdev-sign.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_PFX=$pfx"
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_PFX_PASSWORD=$($env:PFX_PWD)"
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_TRUST=1"
+            Write-Host "签名模式：仓库 secrets 提供的 PFX"
+          } else {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+              -Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
+              -CertStoreLocation Cert:\CurrentUser\My -KeyUsage DigitalSignature `
+              -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+            $alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+            $plain = -join (1..32 | ForEach-Object { $alphabet[(Get-Random -Maximum $alphabet.Length)] })
+            $pfx = Join-Path $env:RUNNER_TEMP "vdev-selfsigned.pfx"
+            Export-PfxCertificate -Cert $cert -FilePath $pfx `
+              -Password (ConvertTo-SecureString -String $plain -AsPlainText -Force) | Out-Null
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_PFX=$pfx"
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_PFX_PASSWORD=$plain"
+            Add-Content $env:GITHUB_ENV "VDEV_SIGN_TRUST=1"
+            Write-Host "签名模式：CI 现生成自签证书（产物需目标机装 .cer 并开测试签名）"
+          }
+      - name: 构建驱动
+        shell: pwsh
+        working-directory: ${{ matrix.build-dir }}
+        run: ${{ matrix.build }}
+      - name: 构建附属 CLI
+        if: ${{ matrix.extra != '' }}
+        shell: pwsh
+        working-directory: ${{ matrix.extra-dir }}
+        run: ${{ matrix.extra }}
+      - name: 打包 + 签名
+        shell: pwsh
+        run: pwsh -NoProfile -File ${{ matrix.stage }}
+      - name: 装机包自检（文件 + signtool verify /pa）
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify-dist.ps1 `
+            -Dist "${{ matrix.dist }}" -Inf "${{ matrix.inf }}" `
+            -Binary "${{ matrix.binary }}" -Cat "${{ matrix.cat }}" -RequireCer
+      - name: 组装 zip
+        id: pack
+        shell: pwsh
+        run: |
+          $dist = "${{ matrix.dist }}"
+          if ("${{ matrix.extra-file }}" -ne "") { Copy-Item "${{ matrix.extra-file }}" $dist }
+          $tag = if ("${{ github.event.inputs.tag }}") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $zip = Join-Path $env:RUNNER_TEMP "${{ matrix.name }}-$tag.zip"
+          Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip -Force
+          Get-ChildItem $dist | Select-Object Name, Length
+          Add-Content $env:GITHUB_OUTPUT "zip=$zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error
+
+  # ---------- 用户态工具（免签名）：摄像头 CLI + 宿主 GUI ----------
+  windows-tools:
+    name: 用户态工具
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/vdev-camera-win
+            crates/vdev-app-win
+      - name: 构建
+        shell: pwsh
+        run: |
+          Push-Location crates/vdev-camera-win
+          cargo build --release --target x86_64-pc-windows-msvc
+          Pop-Location
+          Push-Location crates/vdev-app-win
+          cargo build --release --target x86_64-pc-windows-msvc
+          Pop-Location
+      - name: 组装 zip
+        id: pack
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item crates/vdev-camera-win/target/x86_64-pc-windows-msvc/release/vdev-camera-win.exe $out
+          Copy-Item crates/vdev-app-win/target/x86_64-pc-windows-msvc/release/vdev-app-win.exe $out
+          $tag = if ("${{ github.event.inputs.tag }}") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $zip = Join-Path $env:RUNNER_TEMP "vdev-tools-win-$tag.zip"
+          Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip -Force
+          Add-Content $env:GITHUB_OUTPUT "zip=$zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdev-tools-win
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error
+
+  # ---------- 发布 ----------
+  publish:
+    name: 发布 Release
+    needs: [windows-drivers, windows-tools]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 生成 SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: 写发版说明
+        env:
+          TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        run: |
+          cat > NOTES.md <<EOF
+          ## vdev Windows 驱动与工具（${TAG}）
+
+          包内容：
+
+          - \`vdev-hid-win-*.zip\` — VHF 虚拟键鼠驱动（sys + INF + CAT）+ CLI
+          - \`vdev-audio-win-*.zip\` — PortCls/WaveRT 虚拟声卡驱动 + CLI（inject/capture）
+          - \`vdev-display-win-*.zip\` — IddCx UMDF 虚拟显示器驱动 + CLI
+          - \`vdev-tools-win-*.zip\` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI）
+
+          每个包内若含 \`vdev-test-signing.cer\`，表示该包为**自签/测试签名**产物。
+
+          安装（测试签名模式，管理员 PowerShell）：
+
+          \`\`\`powershell
+          certutil -addstore -f TrustedPublisher vdev-test-signing.cer
+          certutil -addstore -f Root            vdev-test-signing.cer
+          bcdedit /set testsigning on        # 需重启
+          .\\vdev-audio-win.exe install --inf-dir .
+          .\\vdev-audio-win.exe status
+          .\\vdev-audio-win.exe inject --tone 1000 --duration 4
+          .\\vdev-audio-win.exe capture --duration 6 --skip 4
+          \`\`\`
+
+          自签产物仅供开发/测试机使用；对外分发需微软认可的签名（attestation/WHQL）。
+          下载校验：\`sha256sum -c SHA256SUMS.txt\`。
+          EOF
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+          PRE: ${{ github.event_name == 'workflow_dispatch' && '--prerelease' || '' }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+              --title "$TAG" --notes-file NOTES.md $PRE
+          fi

@@ -164,6 +164,42 @@ bcdedit /set testsigning on                              # 声卡 / 内核 HID �
 cd crates\vdev-app-win; cargo build --release; .\target\release\vdev-app-win.exe
 ```
 
+## 发版与签名
+
+**打 tag 即发版**（`.github/workflows/release.yml`）：CI 在 Windows runner 上装 WDK + LLVM、
+构建三个内核驱动与用户态工具、调用各 crate 的 `scripts/stage-sign*.ps1` 打包签名、
+跑 `scripts/verify-dist.ps1` 自检（文件齐全 + `signtool verify /pa`）、压 zip 并挂到 GitHub Release
+（同时生成 `SHA256SUMS.txt`）。手动触发 `workflow_dispatch` 会出一份 prerelease，用于验证流水线本身。
+
+```bash
+git tag v0.3.9.0 && git push origin v0.3.9.0     # 触发 release.yml
+```
+
+发布包（每个 zip 内含已签名的驱动 + INF + CAT + 对应 CLI，可能含 `vdev-test-signing.cer`）：
+`vdev-hid-win-*.zip`、`vdev-audio-win-*.zip`、`vdev-display-win-*.zip`、`vdev-tools-win-*.zip`。
+
+**两种签名模式**（同一套脚本，见 `scripts/sign-common.ps1`）：
+
+| 模式 | 证书来源 | 产物能装在哪 |
+|---|---|---|
+| 测试签名（默认） | CI 现生成自签证书，公钥导出成包内 `vdev-test-signing.cer` | 目标机需 `certutil -addstore` 信任该证书 **且**开启 `bcdedit /set testsigning on` |
+| 官方签名 | 仓库 secrets `VDEV_SIGN_PFX_BASE64` + `VDEV_SIGN_PFX_PASSWORD`（EV / Azure Trusted Signing 证书） | 任意默认配置的 Windows——需先走微软 attestation/WHQL 提交流程把 `.cat` 交给微软重签 |
+
+本地等价操作（不依赖 CI，也不依赖某个 worktree——任意检出都能跑）：
+
+```powershell
+# 证书来源由环境变量决定；不设则用 CurrentUser\My 里 FriendlyName=vdev-driver 的证书
+$env:VDEV_SIGN_PFX = "C:\path\to\vdev.pfx"     # 可选：用 PFX（配 VDEV_SIGN_PFX_PASSWORD）
+$env:VDEV_SIGN_TRUST = "1"                     # 可选：同时导入 LocalMachine 的 TrustedPublisher+Root（管理员）
+
+powershell -File crates\vdev-audio-win\scripts\stage-sign-audio.ps1       # → target\dist
+powershell -File scripts\verify-dist.ps1 -Dist crates\vdev-audio-win\target\dist `
+  -Inf vdev-audio.inf -Binary vdev_audio.sys -Cat vdev-audio.cat -RequireCer
+```
+
+> 自签产物仅供开发/测试机使用；对外分发必须由微软签名（attestation signing 不需要 HLK，
+> 但要 EV 证书或 Azure Trusted Signing，并持有 Partner Center 提交凭据——这一步目前是手工/后续接线点）。
+
 ## 文档导航
 
 文档分两层：[`docs/README.md`](docs/README.md) 是索引。**`docs/community/` 是对外发布的社区系列**
