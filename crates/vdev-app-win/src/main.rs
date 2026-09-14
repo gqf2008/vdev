@@ -284,6 +284,176 @@ fn set_audio_status(ui: &MainWindow, glyph: &str, title: &str, detail: &str) {
     g.set_audio_detail(detail.into());
 }
 
+/// `vdev-audio-win capture --json` 的输出（只取电平字段用于 GUI 显示）
+#[derive(Debug, serde::Deserialize)]
+struct AudioLevelOut {
+    rms_dbfs: f64,
+    peak_dbfs: f64,
+    frames: u64,
+    seconds: f64,
+}
+
+/// 从 GUI 的字符串输入里取数值，非法时回退默认值（GUI 不因手输错字就卡住）
+fn num_or<T: std::str::FromStr + Copy>(s: &str, default: T) -> T {
+    s.trim().parse::<T>().unwrap_or(default)
+}
+
+/// 注入 / 环回自测（在后台线程跑 CLI，避免阻塞 UI 事件循环）。
+///
+/// `loopback=true` 时并发做「capture ‖ inject」——顺序执行会读到环形缓冲里的历史数据
+/// （驱动侧环回有 1 MB ≈ 1.36 s 积压），只有并发才能量出本次注入的电平。
+fn spawn_audio_test(ui: &MainWindow, logs: &Logs, loopback: bool) {
+    let Some(exe) = audio_cli() else {
+        append_log(
+            ui,
+            logs,
+            "❌ 未找到 vdev-audio-win.exe（设置 VDEV_AUDIO_WIN_EXE 或放到 GUI 同目录）",
+        );
+        return;
+    };
+    let g = ui.global::<AppState>();
+    let tone = num_or(&g.get_audio_tone(), 1000.0f64);
+    let duration = num_or(&g.get_audio_duration(), 3.0f64).clamp(0.2, 30.0);
+    let amplitude = num_or(&g.get_audio_amplitude(), 0.5f64).clamp(0.0, 1.0);
+    g.set_audio_busy(true);
+    let busy_text = if loopback {
+        "环回自测中：并发 注入 → 采集（约需时长 + 2 秒）…"
+    } else {
+        "注入中…"
+    };
+    g.set_audio_level_text(busy_text.into());
+    append_log(
+        ui,
+        logs,
+        if loopback {
+            format!(
+                "环回自测：{tone:.0} Hz / 幅度 {amplitude:.2} / {duration:.1}s（capture ‖ inject）"
+            )
+        } else {
+            format!("注入音频：{tone:.0} Hz / 幅度 {amplitude:.2} / {duration:.1}s")
+        },
+    );
+
+    let weak = ui.as_weak();
+    let logs2 = logs.clone();
+    let injected = format!("{tone}");
+    let spawned = std::thread::Builder::new()
+        .name("vdev-app-win-audio".into())
+        .spawn(move || {
+            let dur = format!("{duration}");
+            let amp = format!("{amplitude}");
+            // 环回：先起采集（skip 1s 避开起播瞬间），0.5s 后开始注入，再等采集收工
+            let result: Result<Option<AudioLevelOut>, String> = if loopback {
+                let dur_cap = format!("{}", duration + 2.0);
+                let capture = std::process::Command::new(&exe)
+                    .args(["capture", "--duration", &dur_cap, "--skip", "1", "--json"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+                match capture {
+                    Err(e) => Err(format!("启动 capture 失败：{e}")),
+                    Ok(child) => {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let inj = std::process::Command::new(&exe)
+                            .args([
+                                "inject",
+                                "--tone",
+                                &injected,
+                                "--amplitude",
+                                &amp,
+                                "--duration",
+                                &dur,
+                            ])
+                            .output();
+                        match inj {
+                            Err(e) => Err(format!("运行 inject 失败：{e}")),
+                            Ok(inj) if !inj.status.success() => Err(format!(
+                                "inject 失败：{}",
+                                String::from_utf8_lossy(&inj.stderr).trim()
+                            )),
+                            Ok(_) => match child.wait_with_output() {
+                                Err(e) => Err(format!("等待 capture 失败：{e}")),
+                                Ok(out) => {
+                                    let text = String::from_utf8_lossy(&out.stdout).to_string();
+                                    match serde_json::from_str::<AudioLevelOut>(text.trim()) {
+                                        Ok(lv) => Ok(Some(lv)),
+                                        Err(e) => Err(format!(
+                                            "解析 capture 输出失败：{e}（原始：{}）",
+                                            text.trim()
+                                        )),
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            } else {
+                std::process::Command::new(&exe)
+                    .args([
+                        "inject",
+                        "--tone",
+                        &injected,
+                        "--amplitude",
+                        &amp,
+                        "--duration",
+                        &dur,
+                    ])
+                    .output()
+                    .map(|_| None)
+                    .map_err(|e| format!("运行 inject 失败：{e}"))
+            };
+
+            // 回到 UI 事件循环更新界面（Slint 跨线程 setter 不可靠）
+            let weak2 = weak.clone();
+            let logs3 = logs2.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak2.upgrade() else { return };
+                let g = ui.global::<AppState>();
+                g.set_audio_busy(false);
+                match result {
+                    Ok(Some(lv)) => {
+                        let verdict = if lv.rms_dbfs > -60.0 {
+                            "通过（采到有效音频）"
+                        } else {
+                            "未通过（接近静音：确认已安装驱动且端点未被独占）"
+                        };
+                        g.set_audio_level_text(
+                            format!(
+                                "环回自测 {verdict}：RMS {:.1} dBFS / 峰值 {:.1} dBFS（{} 帧 ≈ {:.2}s）",
+                                lv.rms_dbfs, lv.peak_dbfs, lv.frames, lv.seconds
+                            )
+                            .into(),
+                        );
+                        append_log(
+                            &ui,
+                            &logs3,
+                            format!(
+                                "环回自测：RMS {:.1} dBFS / 峰值 {:.1} dBFS → {verdict}",
+                                lv.rms_dbfs, lv.peak_dbfs
+                            ),
+                        );
+                    }
+                    Ok(None) => {
+                        g.set_audio_level_text(
+                            "注入完成（未做采集）。点「环回自测」可一键验证环回。".into(),
+                        );
+                        append_log(&ui, &logs3, "注入完成");
+                    }
+                    Err(e) => {
+                        g.set_audio_level_text(format!("测试失败：{e}").into());
+                        append_log(&ui, &logs3, format!("❌ {e}"));
+                    }
+                }
+            });
+        });
+    if let Err(e) = spawned {
+        ui.global::<AppState>().set_audio_busy(false);
+        ui.global::<AppState>()
+            .set_audio_level_text(format!("创建测试线程失败：{e}").into());
+        append_log(ui, logs, format!("创建测试线程失败: {e}"));
+    }
+}
+
 /// 刷新声卡状态：跑 vdev-audio-win --json status 并解析
 fn refresh_audio_status(ui: &MainWindow, logs: &Logs) {
     append_log(ui, logs, "刷新声卡状态…");
@@ -705,6 +875,22 @@ fn wire_ui(ui: &MainWindow, logs: &Logs) {
         ui.on_audio_refresh(move || {
             let Some(ui) = weak.upgrade() else { return };
             refresh_audio_status(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_audio_inject(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            spawn_audio_test(&ui, &logs, false);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_audio_loopback(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            spawn_audio_test(&ui, &logs, true);
         });
     }
     // M1：HID 回调注册必须在 wire_ui 一次性完成——此前写在 toggle_push 里，

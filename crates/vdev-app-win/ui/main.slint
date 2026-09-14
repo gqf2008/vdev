@@ -27,6 +27,11 @@ export global AppState {
     in-out property <string> audio_detail: "点击「安装虚拟声卡」安装 PortCls 内核驱动（需管理员，先开测试签名）。";
     in-out property <bool> audio_can_install: true;
     in-out property <bool> audio_can_uninstall: false;
+    in-out property <string> audio_tone: "1000";
+    in-out property <string> audio_duration: "3";
+    in-out property <string> audio_amplitude: "0.5";
+    in-out property <string> audio_level_text: "尚未测试：点「环回自测」一键验证（注入正弦 → 从 vdev 麦克风采回并报电平）";
+    in-out property <bool> audio_busy: false;
     // HID 键盘
     in-out property <string> hid_glyph: "○";
     in-out property <string> hid_title: "虚拟键盘未安装";
@@ -59,6 +64,8 @@ export component MainWindow inherits Window {
     callback audio-install();
     callback audio-uninstall();
     callback audio-refresh();
+    callback audio-inject();
+    callback audio-loopback();
     callback hid-install();
     callback hid-uninstall();
     callback hid-refresh();
@@ -184,12 +191,31 @@ export component MainWindow inherits Window {
                     PixelText { text: AppState.audio_detail; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
                 }
             }
-            HorizontalLayout { spacing: 8px;
-                PixelButton { text: "安装虚拟声卡"; enabled: AppState.audio_can_install; clicked => { audio-install(); } }
-                PixelButton { text: "卸载虚拟声卡"; enabled: AppState.audio_can_uninstall; clicked => { audio-uninstall(); } }
-                PixelButton { text: "刷新状态"; clicked => { audio-refresh(); } }
-            }
-        }
+             HorizontalLayout { spacing: 8px;
+                 PixelButton { text: "安装虚拟声卡"; enabled: AppState.audio_can_install; clicked => { audio-install(); } }
+                 PixelButton { text: "卸载虚拟声卡"; enabled: AppState.audio_can_uninstall; clicked => { audio-uninstall(); } }
+                 PixelButton { text: "刷新状态"; clicked => { audio-refresh(); } }
+             }
+             PixelPanel {
+                 title: "注入 / 环回测试";
+                 VerticalLayout {
+                     spacing: 8px;
+                     HorizontalLayout { spacing: 8px;
+                         PixelText { text: "频率 Hz"; font-size: 12px; vertical-alignment: center; }
+                         TextInput { text <=> AppState.audio_tone; font-size: 14px; width: 90px; }
+                         PixelText { text: "时长 s"; font-size: 12px; vertical-alignment: center; }
+                         TextInput { text <=> AppState.audio_duration; font-size: 14px; width: 70px; }
+                         PixelText { text: "幅度"; font-size: 12px; vertical-alignment: center; }
+                         TextInput { text <=> AppState.audio_amplitude; font-size: 14px; width: 70px; }
+                     }
+                     HorizontalLayout { spacing: 8px;
+                         PixelButton { text: "注入音频"; enabled: !AppState.audio_busy; clicked => { audio-inject(); } }
+                         PixelButton { text: "环回自测"; enabled: !AppState.audio_busy; clicked => { audio-loopback(); } }
+                     }
+                     PixelText { text: AppState.audio_level_text; font-size: 12px; color: PixelTheme.dim; wrap: word-wrap; }
+                 }
+             }
+         }
 
         // ============ Tab 3: 虚拟键盘（内核 HID） ============
         if AppState.current_tab == 3 : VerticalLayout {
