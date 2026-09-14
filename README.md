@@ -60,7 +60,7 @@ cargo build -p vdev-app --release         # 宿主 App（摄像头推流 / 虚�
 | `vdev-screen` | macOS | ✅ 可用 | 私有 API，仅供学习；不同 macOS 版本行为可能不同 |
 | `vdev-camera-ext` | macOS | ✅ 可用 | 实测 macOS 26.5：QuickTime/会议可见，1920×1080@60 稳定 |
 | `vdev-audio` | macOS | ✅ 可用 | 两台设备 A/B，输出环回输入 |
-| `vdev-mic-agent` | 双平台 | macOS 可用 / Windows 门禁绿、真机音频行为待验 | 端侧 RNNoise 降噪注入虚拟麦克风（其 Windows 依赖的 `vdev-audio-win` 环回驱动已真机验证） |
+| `vdev-mic-agent` | 双平台 | ✅ 可用 | 端侧 RNNoise 降噪注入虚拟麦克风。Windows 侧 2026-09-14 live 实测（Win10 19045）：数字探针 p50 **10.16 ms**、降噪 20 s 实时（帧时 p50 26.8 µs、CPU 0.156 % 单核）、直通→降噪 A/B **−5.8 → −34.1 dBFS**；声学探针仍需真实麦克风与房间 |
 | `vdev-camera-win` | Windows | ✅ 可用 | 用户态 COM，免签名，`install` 即用 |
 | `vdev-display-win` | Windows | ✅ 可用 | IddCx UMDF，自签名通常即可；`add/list/set-mode/remove` 需管理员（管道 SDDL 只给 BA/SY） |
 | `vdev-audio-win` | Windows | ✅ 可用 | PortCls/WaveRT WDM，需测试签名；CLI `inject`/`capture` + GUI 环回自测 |
