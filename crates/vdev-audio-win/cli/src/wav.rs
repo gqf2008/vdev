@@ -89,18 +89,26 @@ pub fn parse_wav(bytes: &[u8]) -> Result<Wav> {
     if channels == 0 {
         bail!("WAV 声道数为 0");
     }
+    // 用 `as_chunks`（1.88 起稳定）而不是 `chunks_exact(常量)`：
+    // clippy 1.98 起 `chunks_exact_to_as_chunks` 是默认 lint，CI 的 `-D warnings` 会直接拦下。
     let samples: Vec<f32> = match (tag, bits) {
         (1, 16) => data
-            .chunks_exact(2)
-            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from(i16::from_le_bytes(*c)) / 32768.0)
             .collect(),
         (3, 32) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         (1, 32) => data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32 / 2_147_483_648.0)
             .collect(),
         _ => bail!("不支持的 WAV 格式：tag={tag} bits={bits}（支持 16bit PCM / 32bit float）"),
     };
