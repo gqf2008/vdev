@@ -33,6 +33,8 @@
 | `hid-injection-verify.ps1` | 记事本实弹打字 + `WM_GETTEXT` 读回文本，再验鼠标三件事 | 普通 |
 | `hid-uninstall-regression.ps1` | 故意造重复节点 → `uninstall` → 断言 0 残留 → 装回一对 | **管理员** |
 | `hid-converge.ps1` | 把幽灵节点收敛成"键盘/鼠标各一个"（CLI uninstall + `pnputil /remove-device` 兜底 + 重装 + 注入冒烟） | **管理员** |
+| `hid-reinstall.ps1` | **干净重装**：删掉 store 里的 `vdev-hid.inf` 包（同版本不删不会替换文件）→ 重新安装 → 断言恰好一对 | **管理员** |
+| `hid-channel-probe.py` | 逐条通道试写鼠标报告（SetFeature 帧化/裸、WriteFile），打印 API 结果、`errno` 与光标位移，用来区分"写没到驱动"与"到了没进系统" | 普通 |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\acceptance\hid-keyboard-verify.ps1
@@ -40,6 +42,16 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\hid-uninstall-regres
 ```
 
 边界：键盘/鼠标是**相对**注入——鼠标移动上限 ±127、滚轮按 120 的倍数、没有绝对坐标模式。
+
+### 注入不生效时的排查顺序（2026-09-14 实机踩过一遍）
+
+1. `python scripts\acceptance\hid-enum.py`：vdev 的接口在不在、能不能只写打开（`vid=0x5644`）；
+2. `python scripts\acceptance\hid-channel-probe.py`：Feature 通道是否"受理且光标动"。
+   实机基准：`SetFeature(帧化 5B) → api_ok=True, err=0, dx=+22`；裸 4B 报 `err=87`；`WriteFile` 报 `err=1`；
+3. 若通道"err=0 但光标不动"：多半是**装置状态脏**（反复装卸留下的幽灵/重复节点让写入落到无效实例）——
+   先 `hid-converge.ps1` 清节点，不行再 `hid-reinstall.ps1`（删包重装，能同时刷新驱动文件）；
+4. 复盘判据：`hid-keyboard-verify.ps1` / `hid-mouse-verify.ps1` 必须 exit=0 才算过；
+   键盘脚本在拿不到前台焦点时会**中止并报红**（避免把按键打进用户的其它窗口）。
 
 ## 声卡（环回 / 时延 / KS 属性）
 
