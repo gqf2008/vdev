@@ -24,6 +24,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace Win -Name Api3 -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 '@ -ReferencedAssemblies System.Drawing, System.Windows.Forms
 
 $exe = $HidCli
@@ -41,6 +42,19 @@ $form.Add_KeyDown({ param($s, $e) Add-Content -LiteralPath $log ("KeyDown " + $e
 $form.Add_KeyPress({ param($s, $e) Add-Content -LiteralPath $log ("KeyPress '" + $e.KeyChar + "' (" + [int][char]$e.KeyChar + ")") })
 
 $script:step = 0
+# 注入前必须确认观察窗是前台窗口：否则按键会打进"当时前台的那个窗口"（可能是用户的编辑器），
+# 而且日志会变成"零事件"的假失败。拿不到焦点就停止计时器并让整个脚本 exit 1。
+$script:focusLost = $false
+function Confirm-Foreground([System.Windows.Forms.Form]$f) {
+    for ($i = 0; $i -lt 10; $i++) {
+        if ([Win.Api3]::GetForegroundWindow() -eq $f.Handle) { return $true }
+        [void][Win.Api3]::SetForegroundWindow($f.Handle)
+        $f.Activate()
+        $f.Focus()
+        Start-Sleep -Milliseconds 200
+    }
+    return ([Win.Api3]::GetForegroundWindow() -eq $f.Handle)
+}
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1200
 $timer.Add_Tick({
@@ -48,10 +62,12 @@ $timer.Add_Tick({
     switch ($script:step) {
         1 {
             [void][Win.Api3]::SetCursorPos(710, 470)
-            $form.Activate()
-            $form.Focus()
-            Start-Sleep -Milliseconds 250
-            Add-Content -LiteralPath $log ("foreground_is_form=" + ([Win.Api3]::GetForegroundWindow() -eq $form.Handle))
+            if (-not (Confirm-Foreground $form)) {
+                Add-Content -LiteralPath $log 'foreground_is_form=False（拿不到焦点，已中止，未注入任何按键）'
+                $script:focusLost = $true
+                $timer.Stop(); $form.Close(); return
+            }
+            Add-Content -LiteralPath $log 'foreground_is_form=True'
             & $exe kernel key a 2>&1 | Out-Null
         }
         2 { & $exe kernel key b 2>&1 | Out-Null }
@@ -68,6 +84,10 @@ Get-Content -LiteralPath $log | ForEach-Object { "    $_" }
 
 # 判定：观察窗必须真的收到 KeyDown/KeyPress。空日志 = 注入没生效（别把"CLI 打印已注入"当通过）。
 $keyEvents = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Where-Object { $_ -match '^Key' })
+if ($script:focusLost) {
+    Write-Output '❌ 观察窗没拿到前台焦点：已中止注入（避免打进别的窗口）。请关掉抢占焦点的窗口后重跑。'
+    exit 1
+}
 if ($keyEvents.Count -eq 0) {
     Write-Output '❌ 未记录到任何按键事件：注入未生效（或观察窗没拿到前台焦点）'
     exit 1
