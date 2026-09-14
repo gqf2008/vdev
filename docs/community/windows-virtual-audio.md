@@ -94,7 +94,12 @@ pub const fn split_ring_span(start: usize, n: usize, size: usize) -> (usize, usi
 
 这是审查抓出的第 7 个 blocker 之外、但同样致命的一课：**只有 Wave 子设备时，设备管理器里能看到声卡，控制面板里却没有播放/录音设备**。Windows 音频端点（AudioEndpointBuilder/WASAPI 可枚举的那层）需要每个端点配一个 topology filter，把 Wave 的桥接 pin 连到音量/静音终端节点，音频栈才能建成端点。
 
-所以驱动实现了完整的 `IMiniportTopology`（`topology.rs`，约千行）：渲染表照抄 sysvad `speakertoptable.h`——pin0 自 Wave 汇入（`KSCATEGORY_AUDIO`）、pin1 出至物理扬声器（`KSNODETYPE_SPEAKER`），中间串 VOLUME、MUTE 两个节点；连接表条目 `PCFILTER_NODE → volume → mute → PCFILTER_NODE` 逐条照抄 sysvad 的三行。节点挂着真实的 KS 自动化表：`KSPROPERTY_AUDIO_VOLUMELEVEL`（Id=4）与 `KSPROPERTY_AUDIO_MUTE`（Id=13）各一项，共用一个属性处理器，按 `Verb` 分派 GET/SET/BASICSUPPORT 三路（BASICSUPPORT 按 KS 协议两级应答：40 字节出完整 `KSPROPERTY_DESCRIPTION`，4 字节只出 AccessFlags）。音量/静音值用 `AtomicI32` 存内存——属性语义是真的，DSP 效果是假的，这对虚拟声卡刚好够用。
+所以驱动实现了完整的 `IMiniportTopology`（`topology.rs`，约千行）。**渲染与采集的拓扑形状不一样，且必须以同机可用设备的实测为准**：
+
+- **渲染拓扑直通**：`NodeCount=0` + 一条 pin→pin 连接（对照 sysvad `speakertoptable.h` 的 `NodeCount=0`，以及同机第三方虚拟声卡实测——`KSPROPERTY_TOPOLOGY_NODES` 返回空、`KSPROPERTY_TOPOLOGY_CONNECTIONS` 只 1 条）。渲染侧的音量/静音由音频引擎在软件混音层处理，驱动不需要替它做节点；
+- **采集拓扑串音量/静音**：`NodeCount=2`、3 条连接（`PCFILTER_NODE → volume → mute → PCFILTER_NODE`），节点挂 `KSPROPERTY_AUDIO_VOLUMELEVEL`（Id=4）与 `KSPROPERTY_AUDIO_MUTE`（Id=13）各一项，共用一个属性处理器，按 `Verb` 分派 GET/SET/BASICSUPPORT 三路（BASICSUPPORT 按 KS 协议两级应答：40 字节出完整 `KSPROPERTY_DESCRIPTION`，4 字节只出 AccessFlags）。音量/静音值用 `AtomicI32` 存内存——属性语义是真的，DSP 效果是假的，这对虚拟声卡刚好够用。
+
+> 这一条是**装机之后**才纠过来的：第一版按 sysvad 的"节点中转"形状写渲染拓扑（经 `KSNODETYPE_AUDIO_ENGINE` 节点），端点能枚举但打不开（见案例七～十一）。把渲染拓扑改成直通、`NodeCount` 归零之后，端点才真正可用。
 
 最后用 `PcRegisterPhysicalConnection` 把 wave↔topology 两对桥接 pin 接成物理连接（渲染路径 wave→topology，捕获路径 topology→wave），任一步失败沿注册逆序 teardown：先 `IUnregisterPhysicalConnection` 解除物理连接，再 `IUnregisterSubdevice` 注销子设备，否则已注册的 port 反向引用即将被释放的适配器内存，是一个窗口期 UAF（`crates/vdev-audio-win/driver/src/adapter.rs:447–498`）。
 
@@ -189,7 +194,60 @@ fn ks_pin_descriptor_layout_x64() {
 
 顺带一提同批修复的两个小案例：`PcAddAdapterDevice` 绑定少写了一个参数，x64 调用约定下第 6 参从栈上未初始化槽位读入野值（对照 `portcls.h` 补全 5 参签名，`crates/vdev-audio-win/driver/src/sys/portcls.rs:130–143`）；无硬件位置寄存器时 `GetPositionRegister` 曾返回 `STATUS_SUCCESS` + 空寄存器，可能诱使 PortCls 进入寄存器模式对地址 0 做 MMIO 读——改为返回 `STATUS_NOT_SUPPORTED` 退回轮询模式（`crates/vdev-audio-win/driver/src/miniport.rs:427–441`）。
 
-## 六、构建与安装
+## 六、装机之后：五个"能枚举却打不开"的运行时缺陷
+
+上一批是静态审查抓出来的，这一批正好相反：**门禁全绿、设备管理器里有声卡、控制面板里两个端点都在，`IMMDevice::Activate` 也成功——但第一个真正要打开 KS pin 的调用就失败**。它们只在真机上暴露，靠三件事定位：逐调用探测、跟同机可用设备做 KS 属性对照、必要时扫第三方驱动的二进制描述符（方法见本章末）。
+
+### 案例七：wave 开流 pin 没暴露 WaveRT 的环回流接口
+
+**现象**：`IAudioClient::Activate` 返回 `S_OK`，紧接着的 `GetDevicePeriod` 返回 `0x80070491`（`ERROR_NO_MATCH`，KS 的 `STATUS_NO_MATCH` 映射），之后 `GetMixFormat` / `IsFormatSupported` / `Initialize`（共享与独占）全部失败。同机 ToDesk/Realtek 端点同一步是 `hr=0`（`default=100000, min=30000`）。
+
+**根因**：`KSPROPERTY_PIN_INTERFACES` 返回的是 `KSINTERFACE_STANDARD_STREAMING(0)`，而 audiodg 打开 WaveRT 端点时按 `KSPIN_INTERFACE{KSINTERFACESETID_Standard, KSINTERFACE_STANDARD_LOOPED_STREAMING}` 选接口——选不到就 `STATUS_NO_MATCH`。对照：同机第三方虚拟声卡该属性实测 `id=1`；sysvad/VDA 干脆不声明 `Interfaces`（`InterfacesCount=0`），由 PortCls 补默认集（默认集里含 LOOPED_STREAMING）。
+
+**修法**：`PIN_INTERFACES` 的 `Id` 改成 `KSINTERFACE_STANDARD_LOOPED_STREAMING`（`crates/vdev-audio-win/driver/src/miniport.rs`）。
+
+### 案例八：数据范围缺"音频信号处理模式"属性列表
+
+Win10 的音频引擎给端点定"设备格式/混音格式"时，会按**信号处理模式**匹配数据范围；范围上没有模式属性列表就匹配不到任何 (模式, 格式) 组合。参考实现（sysvad `endpoints.h::PinDataRangeSignalProcessingModeAttribute`）的做法是：
+
+```c
+// 数据范围本身置 KSDATARANGE_ATTRIBUTES，且 DataRanges 指针数组为 [范围, KSATTRIBUTE_LIST]
+static KSATTRIBUTE PinDataRangeSignalProcessingModeAttribute =
+    { sizeof(KSATTRIBUTE), 0, STATICGUIDOF(KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE) };
+```
+
+我们补齐了 `KSDATARANGE_ATTRIBUTES(2)` + 一条 `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE`（`E1F89EB5-…`）属性，并把 `DataRangesCount` 从 1 改成 2。
+
+### 案例九：`KSPROPERTY_PIN_PROPOSEDATAFORMAT` 的 SET 被当成"照单全收"
+
+**现象**：引擎对这个属性的 **SET 调用计数一路涨到 1600+ 次**（自定义只读计数器实测 `prop_set=1624`），却始终不调 `NewStream`（`new_stream=0`）。
+
+**根因**：参考实现（sysvad `PropertyHandlerProposedFormat → IsFormatSupported`）里，SET 是**校验语义**——按驱动自己的设备格式表回状态：支持回 `STATUS_SUCCESS`、不支持回 `STATUS_NO_MATCH`，**不回填缓冲**。我们第一版为了"别让引擎判定设备不可用"，对任何 PCM/EXTENSIBLE 提案都回成功、还把设备格式写回缓冲，等于对每个候选格式都说"行"。
+
+**修法**：改成校验语义（只回状态），并按实例里的属性列表校验请求的模式。改完这一批提案**直接归零**（`prop_set=0`）。
+
+### 案例十：WaveRT 的格式随 `NewStream` 传入，stream `SetFormat` 根本不会被调
+
+**现象**：端点已经能开流（`Initialize`、`Start` 全部 `S_OK`），但**不出声**：渲染侧 `GetCurrentPadding` 恒等于缓冲满值（实测 48000 不变）、采集侧 `GetNextPacketSize` 恒为 0。计数器现场很直白：`new_stream=17` 而 `set_format=0`。
+
+**根因**：WaveRT 模型里格式是随 `IMiniportWaveRT::NewStream(..., DataFormat)` 传进来的（sysvad 也是如此：`NewStream → stream->Init(..., DataFormat, ...)`），PortCls 之后不会再下发 stream `SetFormat`。只把格式解析写在 `SetFormat` 里，`bytes_per_sec` 就永远为 0，`GetPosition` 里的 QPC 推进被判为不可用、位置恒 0——引擎看不到数据流动，于是缓冲永不排空。
+
+**修法**：抽出 `apply_stream_format(stream, data_format)`，`SetFormat` 与 `NewStream` 两条路径都调用；NewStream 里格式非法时释放刚建的流并返回错误。
+
+### 案例十一：KS 结构的"线上长度"不能用 Rust 的 `size_of`
+
+`KSDATAFORMAT_WAVEFORMATEX` 的**线上长度**是 `64 + 18 = 82` 字节；Rust 侧同名结构体因为 `KSDATAFORMAT` 的 8 字节对齐会被 padding 成 84/88。用 `size_of::<KSDATAFORMAT_WAVEFORMATEX>()` 当阈值，会把引擎发来的合法 82 字节设备格式（16bit/48k/2ch PCM）判死——现场特征是 `set_format=54` 但 `set_format_ok=16`，`last_size=0x52`。改成显式常量 82 之后，独占模式也随即可用（`Initialize(exclusive)` 从 `0x8889000F` 变 `S_OK`）。
+
+> 同族提醒：`WAVEFORMATEX`/`WAVEFORMATEXTENSIBLE` 在 `windows` crate 里是 1 字节对齐（packed）类型，既不能取字段引用（E0793），也不能"把 18 字节结构拷到栈上再去读偏移 24 的 SubFormat"——那是越界读栈垃圾。CLI 里这个 bug 的现场是：float32 混音格式被误判成"位深 32 不支持"。
+
+### 定位方法论（比这五个缺陷更值钱）
+
+1. **逐调用探测**：按 `Activate → GetDevicePeriod → GetMixFormat → IsFormatSupported → GetBufferSize → Initialize → GetService → Start → Initialize(exclusive)` 的顺序逐个打印 HRESULT，找**第一个**失败的调用。接口方法要加 `[PreserveSig]`（C#）或等价手段，否则 COM 互操作会把非 0 HRESULT 抛成异常，看不到是哪一步。
+2. **跟同机可用设备做逐属性对照**：`IOCTL_KS_PROPERTY` 对同一 pin 查 `CINSTANCES / DATAFLOW / COMMUNICATION / CATEGORY / INTERFACES / MEDIUMS / DATARANGES / PROPOSEDATAFORMAT(2) / DATAINTERSECTION`，与可用的第三方虚拟声卡逐格 diff——**"别人的设备回什么"比"文档说该回什么"更快**。
+3. **必要时扫第三方驱动的二进制**：按结构里 GUID 的内存字节序搜（如 `KSDATAFORMAT_TYPE_AUDIO` = `61 75 64 73 00 00 10 00 80 00 00 aa 00 38 9b 71`），看 GUID 前 16 字节的 `FormatSize/Flags`，就能还原对方声明了什么。
+4. **判定顺序**：①接口/属性形状（KS 层 diff）→ ②`GetDevicePeriod` 是否 0 → ③`GetMixFormat`/`Initialize` 是否 0 → ④`GetCurrentPadding` 是否下降 → ⑤capture 是否有包。每一步都能独立归因，不要一次改多处。
+
+## 七、构建与安装
 
 前置：Windows 机器 + Visual Studio 2022（C++ 桌面负载）+ WDK 10.0.26100 + Rust stable（MSVC target）。仓库的 `crates/vdev-audio-win` 是独立 workspace。
 
@@ -210,24 +268,46 @@ cargo build --release --features kernel -p vdev-audio-driver
 ```text
 vdev-audio-win.exe install --inf-dir target\dist   # 装驱动（需管理员）
 vdev-audio-win.exe status                          # 查看安装状态（--json 出机器可读格式）
+vdev-audio-win.exe inject --tone 1000 --duration 4 # 向「vdev 扬声器」注入（宿主推流）
+vdev-audio-win.exe capture --duration 6 --skip 4   # 从「vdev 麦克风」采集并报电平
 vdev-audio-win.exe uninstall                       # 卸载
 ```
 
+宿主 GUI（`crates/vdev-app-win`，独立 workspace）的「虚拟声卡」页把上面这套做成按钮：安装/卸载/刷新 +
+「注入音频」/「环回自测」（后者并发跑 `capture ‖ inject` 并把 RMS/峰值写回面板与日志）。
+GUI 不直接调驱动，而是委托 `vdev-audio-win.exe`（找不到时设 `VDEV_AUDIO_WIN_EXE` 或放到同目录）。
+
 INF 是 Media 类（`ClassGuid={4d36e96c-…}`）、`Root\vdev-audio` 硬件 ID，`Include=ks.inf,wdmaudio.inf` 借用系统注册节。有个值得单独说的细节：**INF 必须是 UTF-16 LE（带 BOM）**——SetupAPI 只认这个编码，仓库的宿主单测会读 INF 字节流校验 BOM、CRLF 行尾，以及四个 `KSNAME_*` 接口模板与驱动里 `PcRegisterSubdevice` 注册名逐字节一致（这个 INF 曾是 UTF-8+双 BOM，还是审查抓出来的）。
+
+> 装机时记得升 `DriverVer`：`pnputil /add-driver /install` 对"版本没变"的包会直接报
+> `Driver package is up-to-date on device`，`System32\drivers\vdev_audio.sys` 时间戳不变——
+> 看着装上了，跑的还是旧驱动。
 
 CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 fmt/check/test/clippy（默认 feature，纯逻辑测试全部可跑）；依赖 WDK 的驱动本体构建由 `windows-driver-wdk` job 覆盖（runner 上装 WDK + LLVM 后 `cargo check --workspace`），该 job 起初以 `continue-on-error` 顾问形式上线、已于 2026-09 升为**硬门禁**。
 
-## 七、现状与局限
+## 八、现状与局限
 
 如实交底：
 
-- **构建与门禁全绿，真机验证仍在进行中。** 交叉编译通过、宿主单测（环形缓冲性质测试、布局断言、描述符一致性、GUID 字节比对、INF 编码契约）全部通过；但 PortCls filter 图构建、端点枚举、WASAPI 实录实放这些运行时行为，只能装到开了测试签名的真机上验证，这一步尚未完成。
-- **格式固定**：48 kHz / 16 bit / 双声道 PCM，`stream_set_format` 硬校验，别的不收。
-- **位置走轮询**：无硬件位置寄存器（B7 修复后明确返回 `STATUS_NOT_SUPPORTED`），依赖 PortCls 的轮询模式 + QPC 时间锚。
-- **音量/静音是"记事本"**：topology 节点属性真实可读写，但没有 DSP 效果。
-- **没有用户态注入接口**：环回纯内核内完成，驱动没有任何 IOCTL/WriteFile 面（安全面上是干净的，但"宿主程序直接往环形缓冲注音"目前做不到，README 里的相关 CLI 描述超前于实现）。
+- **已真机验证通过（2026-09-14，Win10 19045 x64 + 测试签名）。** 端点从"能枚举但打不开"修到**完全可用**：
+  - 渲染/采集端点与同机 Realtek / ToDesk 端点**逐调用一致**：`GetDevicePeriod hr=0`（`default=10ms / min=3ms`）、`GetMixFormat` 返回 float32/48k、`IsFormatSupported`、`Initialize`（共享 `AUTOCONVERTPCM` 与独占）、`GetBufferSize=48000`、`GetService`、`Start` 全 `S_OK`；
+  - **环回实测通过**：向「vdev 扬声器」注入 0.5 幅度 1 kHz 正弦，从「vdev 麦克风」采回 **RMS −6.0 dBFS / 峰值 −6.0 dBFS**（正是 0.5 幅度正弦的理论值，逐样本搬运），基线静音 −93.8 dBFS；
+  - CLI 有了注入/采集入口（见下），GUI 有「虚拟声卡」页。
+- **格式固定**：48 kHz / 16 bit / 双声道 PCM，`apply_stream_format` 硬校验，别的不收（引擎负责在混音格式与设备格式之间转换）。
+- **位置走轮询**：无硬件位置寄存器（明确返回 `STATUS_NOT_SUPPORTED`），依赖 PortCls 的轮询模式 + QPC 时间锚。**时钟能否推进取决于 `NewStream` 里有没有拿到格式**（案例十）。
+- **音量/静音是"记事本"**：采集 topology 的节点属性真实可读写，但没有 DSP 效果（渲染拓扑直通，音量由引擎软件混音层处理）。
+- **环回有固定积压**：两个流共享 1 MB 非分页环形缓冲，48 kHz/32bit/2ch 下约 **1.36 s**。所以"顺序执行：先注入、再采集"读到的多是环里的历史数据；要量当次注入必须**并发**采集（CLI 与 GUI 的环回自测都是这么做的），或把缓冲调小。
+- **驱动本身没有用户态注入接口**：环回纯内核内完成，驱动不暴露 IOCTL/WriteFile 面（安全面干净）。宿主"注音"是从**端点侧**完成的——`vdev-audio-win inject` 就是往「vdev 扬声器」推流（WASAPI 共享模式 + 端点混音格式），`capture` 从「vdev 麦克风」拉流：
 
-## 八、写在最后：内核驱动"编译过 ≠ 能跑"
+  ```powershell
+  vdev-audio-win inject --tone 1000 --amplitude 0.5 --duration 4   # 也可 --wav file.wav 循环播放
+  vdev-audio-win capture --duration 6 --skip 4 --json               # 报 RMS/峰值 dBFS，可 --wav 存盘
+  ```
+
+  两者并发就是环回自测；GUI 的「环回自测」按钮把这件事做成了一键（后台线程跑 CLI，结果回填面板与日志）。
+- **待办**：Driver Verifier 专项（special pool + DDI compliance）还没跑；环形缓冲积压（1.36 s）可按需调小；多虚拟屏场景未涉及（本设备与显示器无关）。
+
+## 九、写在最后：内核驱动"编译过 ≠ 能跑"
 
 这个驱动的六次蓝屏级缺陷，没有一个是编译器能抓的：栈悬垂是合法的裸指针运算，回绕公式错是合法的下标，vtable 少一级间接是合法的转型，NTSTATUS 错值是合法的 i32，KS 描述符错布局是合法的 `repr(C)`。`unsafe` 的自由把类型系统的保护全部让渡给了 ABI——而 ABI 的权威不在任何一门语言里，只在 WDK 头文件和官方样例里。
 
@@ -235,7 +315,9 @@ CI 现状：GitHub Actions 的 Windows 用户态矩阵对 `vdev-audio-win` 跑 f
 
 1. **官方样例与 WDK 头文件是唯一权威。** sysvad 的安装顺序、连接表条目、端点拓扑，逐行照抄不丢人；结构布局、GUID、NTSTATUS、vtable 槽序，逐字段对照头文件，注释里写明行号来源。
 2. **把"内核才能验证的"压缩到最小，其余全部下沉为宿主可测。** 纯数学抽模块（`position.rs`）、纯常量抽模块（`endpoint_names.rs`）、布局断言进 `#[cfg(test)]`——本驱动最终有 6 个驱动测试模块（含 CLI 共 7 个）可以在 macOS 宿主跑，其中两个（回绕性质测试、NTSTATUS/GUID 值回归）正是案例二和案例五的疫苗。静态描述符这类"数据即 ABI"的东西，再加一层描述符自洽性断言（计数、越界、DataFlow 方向）。
-3. **装上 Driver Verifier 再上真机。** special pool + DDI compliance 会把池越界和 IRQL 违规在第一时间变成可定位的 bugcheck，而不是等池损坏在别处爆炸。这一步是我们接下来真机验证的第一件事。
+3. **"能枚举"离"能用"很远，真机验证要按调用链一层层量。** 前六个缺陷是审查抓的，后面五个只有真机才暴露：设备管理器有节点、控制面板有端点、`Activate` 返回 `S_OK`——但 `GetDevicePeriod` 就已经在报 `0x80070491` 了。**别把"看得见"当"验证过"**：把 HRESULT 打印到第一个失败点，再拿同机可用设备逐属性对照，比读文档猜快得多。
+4. **官方样例也要对版本与平台核对。** sysvad 的"节点中转"拓扑、`MsHidKmdf.inf`（Win11 才有）这类依赖，在 Win10 上要么装不上、要么能用但没必要；`KSPROPERTY_PIN_PROPOSEDATAFORMAT` 的语义只有读源码才对得准。
+5. **Driver Verifier 仍要做。** special pool + DDI compliance 会把池越界和 IRQL 违规在第一时间变成可定位的 bugcheck，而不是等池损坏在别处爆炸。功能链路（装机、枚举、开流、环回）已验证，Verifier 专项是下一步。
 
 内核驱动的世界没有"先跑起来再说"。每一个凭记忆写出的字节，最终都会以蓝屏的形式找你复核。
 

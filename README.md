@@ -7,13 +7,16 @@
 
 | 虚拟设备 | macOS（Apple Silicon） | Windows（x64） |
 |---|---|---|
-| 键盘 / 鼠标 | CGEventPost 用户态注入（`vdev-hid`）✅ | SendInput 用户态 + KMDF 内核 HID（`vdev-hid-win`）🔧 |
+| 键盘 / 鼠标 | CGEventPost 用户态注入（`vdev-hid`）✅ | 用户态 CLI + **VHF 虚拟 HID 内核驱动**（`vdev-hid-win`）✅ |
 | 摄像头 | CMIOExtension，100% Rust（`vdev-camera-ext`）✅ | DirectShow 源过滤器，用户态免签名（`vdev-camera-win`）✅ |
-| 显示器 | CGVirtualDisplay 私有 API（`vdev-screen`）✅ | IddCx UMDF 间接显示驱动（`vdev-display-win`）🔧 |
-| 声卡 | CoreAudio HAL AudioServerPlugIn（`vdev-audio`）✅ | PortCls / WaveRT miniport，WDM 内核（`vdev-audio-win`）🔧 |
+| 显示器 | CGVirtualDisplay 私有 API（`vdev-screen`）✅ | IddCx UMDF 间接显示驱动（`vdev-display-win`）✅ |
+| 声卡 | CoreAudio HAL AudioServerPlugIn（`vdev-audio`）✅ | PortCls / WaveRT miniport，WDM 内核（`vdev-audio-win`）✅ |
 
-> **状态图例**：✅ 已可用（实测）　🔧 代码已合入 main、构建与自测通过；**真机安装验证进行中**
-> （Windows 驱动需签名）。逐个组件的现状与局限见 [文档导航](#文档导航) 与 [docs/](docs/README.md)。
+> **状态图例**：✅ 已可用（真机实测）　🔧 代码已合入 main、构建与自测通过（真机验证进行中）
+> 　🚧 开发中。**双平台四类设备当前均为 ✅**：Windows 侧四个驱动都在 Win10 19045 x64
+> （测试签名）上装机验证过——显示器出第二块屏、声卡端点可开流且环回有数据、键盘鼠标出现在
+> 设备管理器且实弹注入生效、摄像头 ffmpeg/VLC 可取流。逐个组件的现状与局限见
+> [文档导航](#文档导航) 与 [docs/](docs/README.md)。
 
 **为什么不用 kext / DriverKit**：kext 在 Apple Silicon 上已死（需关 SIP，Intel-only）；
 DriverKit 只支持 C++，Rust 只能做 C ABI 内核、工程成本高。macOS 虚拟设备的正统玩法是
@@ -57,12 +60,12 @@ cargo build -p vdev-app --release         # 宿主 App（摄像头推流 / 虚�
 | `vdev-screen` | macOS | ✅ 可用 | 私有 API，仅供学习；不同 macOS 版本行为可能不同 |
 | `vdev-camera-ext` | macOS | ✅ 可用 | 实测 macOS 26.5：QuickTime/会议可见，1920×1080@60 稳定 |
 | `vdev-audio` | macOS | ✅ 可用 | 两台设备 A/B，输出环回输入 |
-| `vdev-mic-agent` | 双平台 | macOS 可用 / Windows 真机待验 | 端侧 RNNoise 降噪注入虚拟麦克风 |
+| `vdev-mic-agent` | 双平台 | macOS 可用 / Windows 门禁绿、真机音频行为待验 | 端侧 RNNoise 降噪注入虚拟麦克风（其 Windows 依赖的 `vdev-audio-win` 环回驱动已真机验证） |
 | `vdev-camera-win` | Windows | ✅ 可用 | 用户态 COM，免签名，`install` 即用 |
-| `vdev-display-win` | Windows | 🔧 装机验证中 | IddCx UMDF，自签名通常即可 |
-| `vdev-audio-win` | Windows | 🔧 装机验证中 | PortCls/WaveRT WDM，需测试签名 |
-| `vdev-hid-win` | Windows | 🔧 装机验证中 | KMDF HID minidriver，需测试签名 |
-| `vdev-app-win` | Windows | 🚧 收尾中 | 宿主 GUI，显示器页单屏操作待补 |
+| `vdev-display-win` | Windows | ✅ 可用 | IddCx UMDF，自签名通常即可；`add/list/set-mode/remove` 需管理员（管道 SDDL 只给 BA/SY） |
+| `vdev-audio-win` | Windows | ✅ 可用 | PortCls/WaveRT WDM，需测试签名；CLI `inject`/`capture` + GUI 环回自测 |
+| `vdev-hid-win` | Windows | ✅ 可用 | VHF 虚拟 HID 驱动（Win10/11 通用），需测试签名；键鼠注入实测生效 |
+| `vdev-app-win` | Windows | ✅ 可用 | 宿主 GUI：摄像头推流 / 显示器增删 / 声卡注入与环回自测 / 键鼠注入 |
 
 CI（`.github/workflows/ci.yml`）全部为**硬门禁**：macOS 主 workspace 的
 fmt / check / test / clippy `-D warnings` / `build --release`；Windows 五个用户态 workspace
@@ -89,7 +92,7 @@ crates/*-win/       # Windows 侧：各自独立 workspace
   vdev-camera-win/  摄像头：DirectShow 源过滤器（用户态 COM）
   vdev-display-win/ 显示器：IddCx UMDF 驱动 + CLI + driver-ipc
   vdev-audio-win/   声卡：PortCls/WaveRT miniport（WDM）+ CLI
-  vdev-hid-win/     键盘/鼠标：SendInput + KMDF HID minidriver
+  vdev-hid-win/     键盘/鼠标：SendInput 用户态 + VHF 虚拟 HID 内核驱动
   vdev-app-win/     Windows 宿主 App（Rust + Slint）
 docs/                文档：README.md 索引；community/ 对外系列；dev/ 内部开发笔记
 ```
@@ -124,26 +127,42 @@ cargo build --release
 .\target\release\vdev-camera-win.exe install
 ffmpeg -f dshow -list_devices true -i dummy     # 应看到 "vdev-camera"
 
-# 显示器 / 声卡 / HID 驱动：需先签名（见下），再 install
-vdev-display-win.exe install --inf-dir target\dist
-vdev-display-win.exe add 1920x1080                      # 增删改查虚拟屏
-vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0
+  # 显示器 / 声卡 / HID 驱动：需先签名（见下），再 install
+  vdev-display-win.exe install --inf-dir target\dist
+  vdev-display-win.exe add 1920x1080                      # 增删改查虚拟屏（需管理员）
+  vdev-display-win.exe list / set-mode 0 2560x1440@144 / remove 0
+
+  # 虚拟声卡：装机后可直接注入 / 采集验证（一条命令跑环回自测）
+  cd crates\vdev-audio-win; cargo build --release
+  vdev-audio-win.exe inject --tone 1000 --amplitude 0.5 --duration 4   # 注入到「vdev 扬声器」
+  vdev-audio-win.exe capture --duration 6 --skip 4                     # 从「vdev 麦克风」采集并报电平
+
+  # 内核 HID（VHF）：装好后即可注入
+  vdev-hid-win.exe kernel install && vdev-hid-win.exe kernel status
+  vdev-hid-win.exe kernel key a / vdev-hid-win.exe kernel mouse move 20 0
 ```
 
 驱动签名（一次性制备证书，Subject / FriendlyName 必须与 `crates/*/scripts/stage-sign*.ps1`
 的选择条件一致）：
 
 ```powershell
-$cert = New-SelfSignedCertificate -Type CodeSigningCert `
-  -Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
+  $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+    -Subject "CN=vdev Virtual Display Driver" -FriendlyName "vdev-driver" `
   -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
   -KeySpec Signature -KeyUsage DigitalSignature `
   -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
 Export-Certificate -Cert $cert -FilePath vdev-cert.cer
-certutil -addstore -f TrustedPublisher vdev-cert.cer     # 管理员
-certutil -addstore -f Root vdev-cert.cer                 # 管理员
-bcdedit /set testsigning on                              # 声卡 / 内核 HID 需要，重启生效
-```
+  certutil -addstore -f TrustedPublisher vdev-cert.cer     # 管理员
+  certutil -addstore -f Root vdev-cert.cer                 # 管理员
+  bcdedit /set testsigning on                              # 声卡 / 内核 HID 需要，重启生效
+  ```
+
+  宿主 GUI（`vdev-app-win`）四个页签对应四类设备：摄像头推流、显示器增删、声卡注入/环回自测、
+  键鼠注入。它不直接调驱动，而是委托各 `*-win` CLI（找不到 exe 时设 `VDEV_*_EXE` 或放到同目录）：
+
+  ```powershell
+  cd crates\vdev-app-win; cargo build --release; .\target\release\vdev-app-win.exe
+  ```
 
 ## 文档导航
 
@@ -155,8 +174,9 @@ bcdedit /set testsigning on                              # 声卡 / 内核 HID �
 |---|---|
 | 快速了解项目能做什么 | [`docs/community/announcement-ai-mic.md`](docs/community/announcement-ai-mic.md) |
 | 各设备怎么写出来的（含踩坑） | [`docs/community/README.md`](docs/community/README.md)（系列总目录） |
-| 显示器驱动构建/签名/CLI/验收 | [`crates/vdev-display-win/README.md`](crates/vdev-display-win/README.md) |
-| 内核 HID 驱动构建/注入 | [`crates/vdev-hid-win/kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md) |
+  | Windows 声卡（驱动/CLI/GUI/验收） | [`crates/vdev-audio-win/README.md`](crates/vdev-audio-win/README.md) |
+  | 显示器驱动构建/签名/CLI/验收 | [`crates/vdev-display-win/README.md`](crates/vdev-display-win/README.md) |
+  | 内核 HID（VHF）驱动构建/注入 | [`crates/vdev-hid-win/kernel/driver/README.md`](crates/vdev-hid-win/kernel/driver/README.md) |
 | AI 虚拟麦克风 | [`crates/vdev-mic-agent/README.md`](crates/vdev-mic-agent/README.md) |
 | macOS 路线调研 / 选型过程 | [`docs/dev/`](docs/dev) |
 
@@ -164,10 +184,13 @@ bcdedit /set testsigning on                              # 声卡 / 内核 HID �
 
 - [x] macOS：HID / 屏幕 / 摄像头（CMIOExtension 全链路）/ 声卡 可用
 - [x] macOS：虚拟屏 + 摄像头串流 + SFU 端到端；设备侧滤镜（美颜 / 背景替换）
-- [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
-- [x] Windows：IddCx UMDF 显示器 / PortCls WaveRT 声卡 / KMDF HID —— 代码与门禁就绪
-- [ ] Windows：三驱动真机安装验证（测试签名）
-- [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
+  - [x] Windows：DirectShow 虚拟摄像头（用户态免签名）可用
+  - [x] Windows：IddCx UMDF 显示器 / PortCls WaveRT 声卡 / VHF 虚拟 HID —— 代码与门禁就绪
+  - [x] Windows：三驱动真机安装验证（测试签名）——显示器第二块屏、声卡端点可开流且环回有数据、
+        键鼠出现在设备管理器且实弹注入生效
+  - [x] Windows：CLI `inject`/`capture` 与 GUI「虚拟声卡」页（注入 + 一键环回自测）
+  - [ ] Windows：虚拟声卡环回固定延迟从 1.36s 调小（当前 = 1 MB 环形缓冲）
+  - [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
 
 ## 内容与授权
 

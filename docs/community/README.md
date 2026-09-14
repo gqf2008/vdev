@@ -10,19 +10,19 @@
 | 4 | [macOS 虚拟显示器](macos-virtual-display.md) | macOS 26+ | CGVirtualDisplay 私有 API | 私有框架造一块假屏：描述符、HiDPI、镜像与推流配合 |
 | 5 | [Windows 虚拟摄像头](windows-virtual-camera.md) | Windows x64 | DirectShow Source Filter（用户态 COM） | 免签名的虚拟摄像头：纯 Rust 写 COM、共享内存双缓冲防撕裂 |
 | 6 | [Windows 虚拟显示器](windows-virtual-display.md) | Windows x64 | IddCx UMDF 间接显示驱动 | bindgen 直取 WDK 头做绑定层、零初始化上下文的 UB 防御 |
-| 7 | [Windows 虚拟声卡](windows-virtual-audio.md) | Windows x64 | PortCls WaveRT（WDM 内核驱动） | no_std 内核音频驱动：7 个 BSOD 级踩坑实录与"编译过≠能跑"方法论 |
-| 8 | [Windows 虚拟 HID](windows-virtual-hid.md) | Windows x64 | KMDF HID minidriver | 硬件级键鼠注入：HID 三重契约（INF 接线 / IOCTL 契约 / 结构布局） |
-| 9 | [AI 虚拟麦克风](ai-virtual-mic.md) | macOS + Windows（Windows 真机验证中） | RNNoise + CoreAudio 客户端 / WASAPI 轮询 + 内核环回（用户态） | 物理麦克风 → 端侧降噪 → 注入 vdev 麦克风端点：SPSC 环、自适应干湿、延迟探针 |
+| 7 | [Windows 虚拟声卡](windows-virtual-audio.md) | Windows x64 | PortCls WaveRT（WDM 内核驱动） | no_std 内核音频驱动：6 个蓝屏级 + 5 个"能枚举却打不开"的运行时踩坑，含真机环回实测 |
+| 8 | [Windows 虚拟 HID](windows-virtual-hid.md) | Windows x64 | Virtual HID Framework（VHF） | 硬件级键鼠注入：从 KMDF minidriver 失败路径到 VHF，三重契约 + 跨版本选型约束 |
+| 9 | [AI 虚拟麦克风](ai-virtual-mic.md) | macOS + Windows（Windows live 待实测） | RNNoise + CoreAudio 客户端 / WASAPI 轮询 + 内核环回（用户态） | 物理麦克风 → 端侧降噪 → 注入 vdev 麦克风端点：SPSC 环、自适应干湿、延迟探针 |
 
 ## 阅读建议
 
 - **只想快速了解项目能干什么**：从[发布公告](announcement-ai-mic.md)开始——它与下面第 9 篇是同一件事的两层：**公告只讲结果**（能干什么、数字、怎么上手、边界），[AI 虚拟麦克风](ai-virtual-mic.md) 讲**机制与复现**（无锁环、自适应干湿、双探针延迟、踩坑与构建参数）。两篇不重叠、不重复发布。
 - **想快速判断各条路线的难度**：先读每篇第 1-2 节的"路线选型"，九篇合起来是一张跨平台的虚拟设备路线图。
 - **只想看踩坑**：每篇都有独立"踩坑实录"章节，可跳跃阅读；其中 Windows 声卡篇（环形缓冲栈悬垂、回绕公式、NTSTATUS 手算错）与 HID 篇（三重契约）案例最密集。
-- **想动手复现**：每篇"构建与运行"的命令都与仓库 README 一致；注意 Windows 三个内核驱动需要 WDK + 测试签名（各篇现状章节有如实说明）。只想跑通降噪链路的话，公告的"快速上手"就够；参数细节与平台差异在 AI 虚拟麦克风篇。
-- **关于平台拆分**：AI 虚拟麦克风是**跨平台单篇**（一份 DSP 核心 + 两套接线层），Windows 通路是其中一节。待 Windows 真机实测数据（loopback / padding 对齐 / 声学探针）攒够，该节会升级为独立一篇，届时再在本索引追加。
+- **想动手复现**：每篇"构建与运行"的命令都与仓库 README 一致。Windows 侧四类设备均已在 Win10 19045 真机验证：摄像头免签名即用，显示器自签名即可，**声卡与内核 HID（VHF）需要测试签名**（`bcdedit /set testsigning on` + 重启）。只想跑通降噪链路的话，公告的"快速上手"就够；参数细节与平台差异在 AI 虚拟麦克风篇。
+- **关于平台拆分**：AI 虚拟麦克风是**跨平台单篇**（一份 DSP 核心 + 两套接线层），Windows 通路是其中一节。它依赖的 `vdev-audio-win` 环回链路**已在真机验证**（注入 0.5 幅度正弦 → 采回 RMS −6.0 dBFS），但 mic-agent 自身在 Windows 上的 live 行为（loopback 数据流、padding 对齐、声学探针）仍待实测；等那批数字攒够，该节会升级为独立一篇，届时再在本索引追加。
 
 ## 相关仓库内文档
 
-- `README.md` — 项目总览、构建矩阵与各驱动状态框（✅ 已可用 / 🔧 构建与自测通过、真机验证进行中）
+- `README.md` — 项目总览、构建矩阵与各驱动状态框（**双平台四类设备当前均为 ✅ 已真机实测**）
 - `docs/dev/` — 内部开发笔记：`windows-camera-design.md`、`windows-display-audio-design.md`（Windows 设计/联调）、`macos-route-survey.md`（macOS 路线调研）、`macos-route-ideas.md` / `windows-route-ideas.md`（选题线索）

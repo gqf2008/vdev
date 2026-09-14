@@ -19,7 +19,7 @@
 | 平台 | live 降噪 | 探针 | 状态 |
 |---|---|---|---|
 | macOS 26+（Apple Silicon） | ✅ CoreAudio 回调 | 数字 + 声学 | **可用（实测）** |
-| Windows x64 | ✅ WASAPI 轮询 + 内核环回 | 数字 + 声学 | 门禁全绿，**真机音频验证进行中** |
+| Windows x64 | ✅ WASAPI 轮询 + 内核环回 | 数字 + 声学 | 门禁全绿；依赖的 `vdev-audio-win` 环回驱动**已真机验证**，mic-agent 自身的 Windows live 行为待实测 |
 
 v1 边界（如实）：WASAPI 端点需 48 kHz（shared 模式不重采样，非 48k 明确报错给指引）；无设备热拔插自动恢复。Windows 驱动侧装机需测试签名。
 

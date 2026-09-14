@@ -233,11 +233,11 @@ cargo clippy -p vdev-mic-agent --all-targets --target x86_64-pc-windows-msvc -- 
 cargo test -p vdev-mic-agent
 ```
 
-**状态如实说：编译与全部门禁已绿（fmt / check / clippy -D warnings 交叉 Windows 目标，macOS 侧 check + 41 项单测），但运行时音频行为——loopback 数据流、padding 对齐、声学探针——尚未在真实 Windows + vdev-audio-win 机器上验证；驱动侧装机由项目作者在真机验证。** Windows 侧数字正确性由那 5 项单测覆盖（marker 周期与起始、pending 配对、搜索窗口封顶、声学源语义）。
+**状态如实说：编译与全部门禁已绿（fmt / check / clippy -D warnings 交叉 Windows 目标，macOS 侧 check + 41 项单测）。** 它依赖的**驱动侧已真机验证**——`vdev-audio-win` 的端点可开流、环回实测通过（注入 0.5 幅度 1 kHz 正弦，从 vdev 麦克风采回 RMS −6.0 dBFS / 峰值 −6.0 dBFS，基线静音 −93.8 dBFS，见 [Windows 虚拟声卡](windows-virtual-audio.md) 第八节），且 CLI 已有 `inject`/`capture`、GUI 有「环回自测」按钮可供端到端对照。**仍未验证的是 mic-agent 自身在 Windows 上的 live 行为**（loopback 数据流、padding 对齐、声学探针实测）——那需要一台装了驱动的真机跑 `live`，属于下一步。Windows 侧数字正确性由那 5 项单测覆盖（marker 周期与起始、pending 配对、搜索窗口封顶、声学源语义）。
 
 ## 八、现状与局限
 
-如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时 macOS 实跑 41 项通过，另有 5 项 Windows 后端单测仅随 Windows 目标编译）；macOS live 已可用，Windows live 门禁已绿、真机音频行为待验证。** macOS 侧还欠的是探针的真机数字：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；Windows 侧需要装了 `vdev-audio-win`（测试签名）的真机确认 loopback 与 padding 行为；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS + Windows 双后端（Windows 门禁绿、真机待验证，见第七节）；`cpu_seconds()` 是 Windows 实现，macOS 的 CPU 列印 `n/a`（离线与 `live` 报告同口径）。已知的"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。Windows 侧还有三条 v1 边界：无重采样（端点默认格式非 48 kHz 直接拒绝并给出修复指引）、无设备热拔插/格式变化恢复（运行中拔设备以带上下文的错误退出）、只走 shared + 轮询（无独占模式与事件驱动，40 ms 端点缓冲是延迟与抖动免疫的折中，计入探针 `interpretation`）。
+如实说：**这个 crate 编译通过、单元测试在 Windows 与 macOS 上全绿（本文写作时 macOS 实跑 41 项通过，另有 5 项 Windows 后端单测仅随 Windows 目标编译）；macOS live 已可用，Windows live 门禁已绿；其依赖的 `vdev-audio-win` 环回驱动已真机验证（见 [Windows 虚拟声卡](windows-virtual-audio.md) 第八节），mic-agent 自身的 Windows live 行为待实测。** macOS 侧还欠的是探针的真机数字：数字探针的期望值是"设备缓冲 + 插件环"，量出来接近即算通过；Windows 侧仍需要 mic-agent 自己在装了 `vdev-audio-win`（测试签名）的真机上确认 loopback 与 padding 行为（驱动侧的端点/环回已验）；两条探针都需要真实设备才有意义。平台支持面是：离线 `run`/`bench`/`diff` 跨平台可用，`live` 及双探针 macOS + Windows 双后端（Windows 门禁绿；驱动侧已验，mic-agent 侧待实测，见第七节）；`cpu_seconds()` 是 Windows 实现，macOS 的 CPU 列印 `n/a`（离线与 `live` 报告同口径）。已知的"特性级"限制：纯静音参考 WAV 会得到 `segSNR = NaN`，JSON 无法表示，`run --reference`/`bench` 以序列化错误退出——这是预期行为（对数字静音谈 SNR 无意义）；CPU 时间未接 `task_info`/`clock_gettime` 前，macOS 的单核占比与"每核流数"两列缺位。Windows 侧还有三条 v1 边界：无重采样（端点默认格式非 48 kHz 直接拒绝并给出修复指引）、无设备热拔插/格式变化恢复（运行中拔设备以带上下文的错误退出）、只走 shared + 轮询（无独占模式与事件驱动，40 ms 端点缓冲是延迟与抖动免疫的折中，计入探针 `interpretation`）。
 
 往前看还有四件事：双平台探针的真机延迟实测；AEC（本方案没有扬声器回传路径，真正的免提场景需要虚拟扬声器提供的远端参考，排二期，可复用 vox-seat）；引擎分层（DeepFilterNet3 约 9 倍 CPU 换明显更好的音质，档位是产品决策不是代码决策）；以及主观盲听 A/B——目前所有数字都是客观指标，欠听众一个裁决。
 
