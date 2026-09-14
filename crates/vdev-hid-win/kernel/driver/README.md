@@ -52,3 +52,6 @@ vdev-hid-win kernel uninstall
 ```
 
 内核驱动需开启测试签名（`bcdedit /set testsigning on` 后重启）或已签名证书。
+
+> CLI 用法、验收脚本与「注入不生效怎么查」的完整排查顺序见 crate README
+> [`../../README.md`](../../README.md)。
