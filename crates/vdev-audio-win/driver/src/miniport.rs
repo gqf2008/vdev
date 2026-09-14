@@ -220,9 +220,16 @@ unsafe fn apply_stream_format(this: *mut WaveRTStream, data_format: PKSDATAFORMA
         u32::from(ksdm.WaveFormatEx.wBitsPerSample),
         Ordering::Relaxed,
     );
+    /// `KSDATAFORMAT_WAVEFORMATEX` 的**线上长度** = 64 + 18 = 82（ksmedia.h）。
+    ///
+    /// Rust 侧同名字段结构体会被 8 字节对齐 padding 成 84/88，不能拿
+    /// `size_of::<KSDATAFORMAT_WAVEFORMATEX>()` 当阈值：真机实测引擎就是用 82 字节
+    /// （16bit/48k/2ch PCM 设备格式）来开流的，用结构体尺寸比较会把合法格式判死
+    /// （计数器表现为 `set_format=54` 而 `set_format_ok=16`）。
+    const KSDATAFORMAT_WAVEFORMATEX_WIRE_SIZE: u32 = 82;
     if ksdm.DataFormat.SubFormat != KSDATAFORMAT_SUBTYPE_PCM
         || ksdm.DataFormat.Specifier != KSDATAFORMAT_SPECIFIER_WAVEFORMATEX
-        || ksdm.DataFormat.FormatSize < size_of::<KSDATAFORMAT_WAVEFORMATEX>() as u32
+        || ksdm.DataFormat.FormatSize < KSDATAFORMAT_WAVEFORMATEX_WIRE_SIZE
     {
         DBG_LAST_STATUS.store(status_bits(STATUS_INVALID_PARAMETER), Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
