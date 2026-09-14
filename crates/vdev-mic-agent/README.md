@@ -76,8 +76,9 @@ Realtek 输出播 1 kHz / 0.5 幅度正弦，链路为 *Realtek 出音 → Stere
 | 端到端 A/B（同一信号） | `--mix 0` 直通：vdev 麦克风 **RMS −5.8 dBFS / peak 0.0 dBFS**；`--adaptive` 降噪后：**RMS −34.1 dBFS / peak −29.7 dBFS**（纯音被 RNNoise 判为噪声，抑制约 28 dB） |
 
 > 延迟口径别混：探测器的 ~10 ms 量的是 **WASAPI 对渲染端点的 loopback 捕获**；
-> 而「vdev 扬声器 → 驱动环形缓冲 → vdev 麦克风」这条路有约 **1.36 s** 的固定积压
-> （1 MB 环形缓冲，见 Windows 虚拟声卡篇）。两者是不同路径。
+> 而「vdev 扬声器 → 驱动环形缓冲 → vdev 麦克风」是另一条路径：driver 0.3.9.0 的 1 MB 环形缓冲
+> 对应约 **5.46 s** 积压（实测 ≈5.14 s，按设备格式 16bit/48k/2ch = 192000 B/s 算）；
+> 0.3.10.0 起缓冲改为 256 KB，对应约 **1.37 s**。两者是不同路径。
 
 构建提示：本机无 MSYS2，RNNoise 用 **Strawberry Perl 自带的 MinGW GCC** 从 `xiph/rnnoise`
 v0.1.1 构建（`gcc -shared -o librnnoise-0.dll ... -DRNNOISE_BUILD -DDLL_EXPORT`，

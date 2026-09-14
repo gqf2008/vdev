@@ -225,7 +225,7 @@ powershell -File scripts\verify-dist.ps1 -Dist crates\vdev-audio-win\target\dist
 - [x] Windows：三驱动真机安装验证（测试签名）——显示器第二块屏、声卡端点可开流且环回有数据、
   键鼠出现在设备管理器且实弹注入生效
 - [x] Windows：CLI `inject`/`capture` 与 GUI「虚拟声卡」页（注入 + 一键环回自测）
-- [ ] Windows：虚拟声卡环回固定延迟从 1.36s 调小（当前 = 1 MB 环形缓冲）
+- [x] Windows：虚拟声卡环回积压从 5.46 s（1 MB）调到 1.37 s（256 KB，0.3.10.0）
 - [ ] 双平台 UI 宿主统一（`vdev-app` ↔ `vdev-app-win`）
 
 ## 内容与授权

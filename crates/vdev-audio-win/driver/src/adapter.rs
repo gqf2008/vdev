@@ -165,10 +165,18 @@ unsafe extern "system" fn adapter_init(
         return st;
     }
     (*this).physical_device_object = pdo;
-    // 分配共享环形缓冲（1 MB）——B1：单块池分配（RingBuffer 头 + 数据区），
+    // 分配共享环形缓冲——B1：单块池分配（RingBuffer 头 + 数据区），
     // 结构体 ptr::write 到池基址。旧实现在栈上构造 RingBuffer 后存其地址，
     // init 返回即悬垂，首次使用必蓝屏。
-    const RING_SIZE: usize = 1024 * 1024;
+    //
+    // 容量即"渲染写入 → 采集读出"的积压上限。**注意单位**：环里搬的是**设备格式**
+    // （16bit/48k/2ch = 192000 B/s），不是 32bit 浮点混音格式（384000 B/s）——
+    // 按后者算会把秒数少一半（早期文档里的 "1.36 s" 就是这么错的）：
+    //   1 MB   ≈ 5.46 s   ← 原值；真机实测（agent 连续写满环 + 标记音后沿）≈ 5.14 s
+    //   256 KB ≈ 1.37 s   ← 现值：把环回积压压到交互可接受，同时仍远大于
+    //                       一个 20 ms 引擎缓冲 + 一个 DMA 周期，留足抖动余量
+    // 再小（64 KB ≈ 0.34 s）开始受调度抖动影响，故不继续压。
+    const RING_SIZE: usize = 256 * 1024;
     let pool = ExAllocatePool2_np(0x40, (size_of::<RingBuffer>() + RING_SIZE) as u64, TAG);
     if pool.is_null() {
         return STATUS_INSUFFICIENT_RESOURCES;

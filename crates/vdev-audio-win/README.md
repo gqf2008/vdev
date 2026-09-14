@@ -71,7 +71,8 @@ $exe = ".\target\x86_64-pc-windows-msvc\release\vdev-audio-win.exe"
 & $exe capture --duration 6 --skip 4 --json              # 从「vdev 麦克风」采集，报 RMS/峰值 dBFS
 ```
 
-**顺序执行读不到当次注入**：两个流共享 1 MB 非分页环形缓冲（48 kHz/32bit/2ch 下约 1.36 s 积压），
+**顺序执行读不到当次注入**：两个流共享非分页环形缓冲（0.3.9.0 = 1 MB，按设备格式
+16bit/48k/2ch = 192000 B/s 约 **5.46 s** 积压；0.3.10.0 起 256 KB ≈ 1.37 s），
 所以"先注入再采集"读到的是环里的历史数据。要量当次注入就**并发**跑：一个进程 `capture`、
 另一个进程 `inject`（`--skip` 用来跳过起播瞬间）。参考实测：
 
@@ -90,7 +91,7 @@ $exe = ".\target\x86_64-pc-windows-msvc\release\vdev-audio-win.exe"
 ## 已知限制
 
 - 格式固定 **48 kHz / 16 bit / 双声道 PCM**（引擎负责混音格式↔设备格式转换）；
-- 环回固定积压 ≈ 1.36 s（环形缓冲 1 MB，可按需调小）；
+- 环回积压：0.3.9.0 的 1 MB 环形缓冲 ≈ **5.46 s**；0.3.10.0 起 256 KB ≈ **1.37 s**（可按需再调）；
 - 音量/静音只有采集 topology 有节点（"记事本"语义，无 DSP 效果）；渲染拓扑直通；
 - 驱动不暴露 IOCTL/WriteFile 面；宿主注音走端点推流（`inject`）；
 - Driver Verifier（special pool + DDI compliance）专项尚未跑。
