@@ -60,8 +60,29 @@ below). On any other host it prints why and exits, rather than pretending to run
 | platform | `run` / `bench` / `diff` | `live` + probes | status |
 |---|---|---|---|
 | macOS | ✅ | ✅ CoreAudio callbacks | live available |
-| Windows | ✅ | ✅ WASAPI polling + kernel loopback | new — gates green, real-machine audio pending |
+| Windows | ✅ | ✅ WASAPI polling + kernel loopback | **已真机实测（2026-09-14，Win10 19045 x64）** |
 | other | ✅ | ❌ prints why and exits | — |
+
+### Windows live 实测数字（2026-09-14，Win10 19045 x64 + vdev-audio-win 0.3.9.0）
+
+本机没有物理麦克风，输入源用 Realtek 的 **Stereo Mix**（系统输出环回）代替；扬声器侧往
+Realtek 输出播 1 kHz / 0.5 幅度正弦，链路为 *Realtek 出音 → Stereo Mix 采 → RNNoise →
+注入 vdev 扬声器 → 驱动环回 → vdev 麦克风*，`vdev-audio-win capture` 在末端量电平：
+
+| 项 | 结果 |
+|---|---|
+| `live --probe digital`（不需要 RNNoise） | 20 s 内 65 次往返、0 rejected；**latency min 0.00 / mean 9.96 / p50 10.16 / p95 11.16 / max 21.15 ms（stdev 2.02）** |
+| `live --adaptive`（完整降噪） | 20.000 s 音频在 20.0014 s 内跑完（实时）；帧时 **p50 26.8 µs / p95 39.4 / p99 46.2 / max 120.6 µs**；CPU 0.0312 s = **0.156 % 单核**；ring dropped 0 |
+| 端到端 A/B（同一信号） | `--mix 0` 直通：vdev 麦克风 **RMS −5.8 dBFS / peak 0.0 dBFS**；`--adaptive` 降噪后：**RMS −34.1 dBFS / peak −29.7 dBFS**（纯音被 RNNoise 判为噪声，抑制约 28 dB） |
+
+> 延迟口径别混：探测器的 ~10 ms 量的是 **WASAPI 对渲染端点的 loopback 捕获**；
+> 而「vdev 扬声器 → 驱动环形缓冲 → vdev 麦克风」这条路有约 **1.36 s** 的固定积压
+> （1 MB 环形缓冲，见 Windows 虚拟声卡篇）。两者是不同路径。
+
+构建提示：本机无 MSYS2，RNNoise 用 **Strawberry Perl 自带的 MinGW GCC** 从 `xiph/rnnoise`
+v0.1.1 构建（`gcc -shared -o librnnoise-0.dll ... -DRNNOISE_BUILD -DDLL_EXPORT`，
+导出 `rnnoise_create/destroy/process_frame`），放到 `crates/vdev-mic-agent/third_party/native/`
+即被加载器命中；上游 master 需要生成头文件、MSVC 编不过，故用 v0.1.1。
 
 ```bash
 # live denoise into the virtual microphone, recording both sides
