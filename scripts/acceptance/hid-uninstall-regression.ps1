@@ -27,8 +27,14 @@ if (-not $isAdmin) {
         '-RepoRoot', "`"$RepoRoot`"", '-OutDir', "`"$OutDir`"")
     if ($HidCli) { $fwd += @('-HidCli', "`"$HidCli`"") }
     if ($HidDist) { $fwd += @('-HidDist', "`"$HidDist`"") }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $fwd
-    exit 0
+    # 用 -Wait -PassThru 把**子进程的退出码**透传出去（UAC 被取消时不能静默 exit 0）
+    try {
+        $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $fwd -Wait -PassThru
+        exit $child.ExitCode
+    } catch {
+        Write-Output ("❌ 提权失败或被取消：{0}（未做任何改动）" -f $_.Exception.Message)
+        exit 1
+    }
 }
 
 Start-Transcript -Path (Join-Path $OutDir 'hid-uninstall-regression.log') -Force | Out-Null
