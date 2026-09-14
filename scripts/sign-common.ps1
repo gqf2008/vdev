@@ -29,8 +29,13 @@ function Import-VdevPfx {
     $cert = Import-PfxCertificate -FilePath $Path -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
     if ($env:VDEV_SIGN_TRUST -eq "1") {
         # 让"装了这张证书"的机器能直接 pnputil 安装（CI 里用于自检装机包；本地一般已在 TrustedPublisher/Root）
-        certutil -addstore -f TrustedPublisher $Path | Out-Null
-        certutil -addstore -f Root $Path | Out-Null
+        # 注意：certutil -addstore 收的是**证书文件**，不能直接喂 .pfx（那样等于没装、链仍不受信，
+        # CI 上表现为 `signtool verify /pa` 报 "certificate chain ... terminated in a root"）。
+        $cer = Join-Path $env:RUNNER_TEMP "vdev-sign-public.cer"
+        if (-not $env:RUNNER_TEMP) { $cer = Join-Path ([IO.Path]::GetTempPath()) "vdev-sign-public.cer" }
+        Export-Certificate -Cert $cert -FilePath $cer -Type CERT -Force | Out-Null
+        certutil -addstore -f TrustedPublisher $cer | Out-Null
+        certutil -addstore -f Root $cer | Out-Null
     }
     return $cert
 }
