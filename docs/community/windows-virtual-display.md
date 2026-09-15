@@ -113,11 +113,11 @@ enum ArcPointer<T> {
 
 ## 五、数据面：swap chain 线程、MMCSS 与命名管道 IPC
 
-**Swap chain 处理。** OS 把 swap chain 指派给显示器时（`crates/vdev-display-win/driver/src/callbacks.rs:396–419` 的 `assign_swap_chain`），驱动为它起一条专用线程（`crates/vdev-display-win/driver/src/swap_chain_processor.rs:47–92`）。线程先给自己挂 MMCSS（Multimedia Class Scheduler Service）优先级——`AvSetMmThreadCharacteristicsW(w!("Distribution"), ...)`，让高 CPU 负载下帧处理仍被调度器优待——然后进入核心循环：`IddCxSwapChainReleaseAndAcquireBuffer` 取帧，返回 `E_PENDING` 说明新帧未就绪，就 `WaitForSingleObject` 最多 16 ms 等事件或超时后重试；拿到缓冲就调 `IddCxSwapChainFinishedProcessingFrame` 归还。线程退出时负责 `WdfObjectDelete` 掉 swap chain 对象；`SwapChainProcessor` 的 `Drop` 实现置一个 `AtomicBool` 终止标志并 `join` 线程，保证指派/取消指派的干净交接。注意当前实现是**直通**——拿到帧立即归还，尚未做画面注入或捕获，这是留给推流场景的扩展点。
+**Swap chain 处理。** OS 把 swap chain 指派给显示器时（`crates/vdev-display-win/driver/src/callbacks.rs:405–428` 的 `assign_swap_chain`），驱动为它起一条专用线程（`crates/vdev-display-win/driver/src/swap_chain_processor.rs:47–92`）。线程先给自己挂 MMCSS（Multimedia Class Scheduler Service）优先级——`AvSetMmThreadCharacteristicsW(w!("Distribution"), ...)`，让高 CPU 负载下帧处理仍被调度器优待——然后进入核心循环：`IddCxSwapChainReleaseAndAcquireBuffer` 取帧，返回 `E_PENDING` 说明新帧未就绪，就 `WaitForSingleObject` 最多 16 ms 等事件或超时后重试；拿到缓冲就调 `IddCxSwapChainFinishedProcessingFrame` 归还。线程退出时负责 `WdfObjectDelete` 掉 swap chain 对象；`SwapChainProcessor` 的 `Drop` 实现置一个 `AtomicBool` 终止标志并 `join` 线程，保证指派/取消指派的干净交接。注意当前实现是**直通**——拿到帧立即归还，尚未做画面注入或捕获，这是留给推流场景的扩展点。
 
 一个小而典型的修复：MMCSS 挂失败时原实现直接 `return`，跳过了后面的 `WdfObjectDelete(swap_chain)`，泄漏整个 swap chain 对象；现在降级为普通优先级继续跑，收尾清理照常（`crates/vdev-display-win/driver/src/swap_chain_processor.rs:61–73` 注释）。
 
-**命名管道 IPC。** 驱动在 `adapter_init_finished` 回调里启动 listener 线程（`crates/vdev-display-win/driver/src/ipc.rs:136`），在 `\\.\pipe\vdev-display` 上循环接受连接。协议是 `driver-ipc` 定义的一组 serde 类型（`DriverCommand::{Notify,Remove,RemoveAll}` / `RequestCommand::State`，见 `crates/vdev-display-win/driver-ipc/src/core.rs:25-51`），JSON 序列化、以 `0x04`（EOT）字节分帧；多客户端间用 tokio broadcast 通道广播变更事件。
+**命名管道 IPC。** 驱动在 `adapter_init_finished` 回调里启动 listener 线程（`crates/vdev-display-win/driver/src/ipc.rs:137`），在 `\\.\pipe\vdev-display` 上循环接受连接。协议是 `driver-ipc` 定义的一组 serde 类型（`DriverCommand::{Notify,Remove,RemoveAll}` / `RequestCommand::State`，见 `crates/vdev-display-win/driver-ipc/src/core.rs:25-51`），JSON 序列化、以 `0x04`（EOT）字节分帧；多客户端间用 tokio broadcast 通道广播变更事件。
 
 这个管道曾经是这个驱动**最大的本地攻击面**，修复分三步，都写在 `ipc.rs`：
 
@@ -134,7 +134,7 @@ enum ArcPointer<T> {
 
 2. **管道抢占防护**（`crates/vdev-display-win/driver/src/ipc.rs:180–201`）。恶意进程可以先建同名管道（pipe squatting），让我们的实例创建失败、或让客户端连到攻击者的管道。修复是给第一个实例加 `FILE_FLAG_FIRST_PIPE_INSTANCE` 语义（tokio `ServerOptions::first_pipe_instance(true)`）：首实例创建成功后其余实例才允许建，抢注者反而会让**我们**的首建失败——但此时不再 panic，而是记日志 + 每秒退避重试（原实现在这里是无条件 `unwrap`，抢注场景等于远程击落驱动宿主）。SDDL 转换失败同样直接放弃启动 listener，绝不退回无保护管道。
 
-3. **输入校验收进驱动**。新增的 `driver/src/validate.rs` 是一个零依赖纯函数模块，把所有上限集中定义（`crates/vdev-display-win/driver/src/validate.rs:14–36`）：显示器 ≤16、每显示器模式 ≤64、每模式刷新率 ≤64、分辨率 ∈ [64, 16384]、刷新率 ∈ [1, 1000]、单条消息 ≤512 KiB（512 KiB 是按最坏合法 Notify 的 JSON 体量 378,748 字节推算出来的，有一个单测 `worst_case_legal_notify_fits_in_max_msg_bytes` 把这个数字固化）。读循环里字节积累超限即清空缓冲（`crates/vdev-display-win/driver/src/ipc.rs:250–256`），防无界内存增长；模式数值溢出全部改到 `u64`/`checked`/`saturating` 域计算（`crates/vdev-display-win/driver/src/callbacks.rs:82–98`，像素时钟公式在大分辨率高刷新率下会击穿 u32，注释里给了具体组合：2160p@1000Hz ≈ 4.68e9 ≥ u32::MAX）。
+3. **输入校验收进驱动**。新增的 `driver/src/validate.rs` 是一个零依赖纯函数模块，把所有上限集中定义（`crates/vdev-display-win/driver/src/validate.rs:14–36`）：显示器 ≤16、每显示器模式 ≤64、每模式刷新率 ≤64、分辨率 ∈ [64, 16384]、刷新率 ∈ [1, 1000]、单条消息 ≤512 KiB（512 KiB 是按最坏合法 Notify 的 JSON 体量 378,748 字节推算出来的，有一个单测 `worst_case_legal_notify_fits_in_max_msg_bytes` 把这个数字固化）。读循环里字节积累超限即清空缓冲（`crates/vdev-display-win/driver/src/ipc.rs:246–257`），防无界内存增长；模式数值溢出全部改到 `u64`/`checked`/`saturating` 域计算（`crates/vdev-display-win/driver/src/callbacks.rs:92–107`，像素时钟公式在大分辨率高刷新率下会击穿 u32，注释里给了具体组合：2160p@1000Hz ≈ 4.68e9 ≥ u32::MAX）。
 
 纯函数化的副产品：`validate.rs` 不依赖任何 FFI 类型，可以在 macOS 宿主上用 `rustc --test` 直接跑回归测试——这个 workspace 整体只能在 Windows 主机构建，宿主测试能力是刻意设计出来的（下文《构建》节详述）。
 
@@ -142,7 +142,7 @@ enum ArcPointer<T> {
 
 **INF 的关键段**（`driver/vdev-display.inf`）：设备类是 Display（`ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}`）；`.hw` 段把 `IndirectKmd` 挂成上层过滤器——这是 IddCx 的内核侧伴生驱动，UMDF 驱动必须借它才接到显示栈；`[*.Wdf]` 段声明 `UmdfService=vdev-display` 与 `UmdfLibraryVersion=2.31.0`、`UmdfExtensions = IddCx0102`。这里有一处真实修复：INF 原来写 `UmdfLibraryVersion=2.25.0`，而 build.rs 链接的是 UMDF 2.31 的 stub（代码经 `WdfFunctions_02031` 函数表调用）——版本声明低于实际链接版本，Windows 可能按错误的宿主版本加载导致驱动装不上。修复时顺带核对了微软官方 `IddSampleDriver.inf`：`IddCx0102` 的写法与官方样例一致；而 `IddMinimumVersionRequired` 是 IddCx stub 要求的**链接期符号**（本项目在 `wdf-umdf-sys/src/bindings.rs` 以 `#[no_mangle] static = 4` 提供，对应 IddCx 1.4），不是 INF 指令，不应写进 INF（`vdev-display.inf:48-62` 的注释完整记录了这三个结论）。`DriverVer` 也与 `driver/Cargo.toml` 的 `0.4.0` 做了同步。
 
-**安装流程**（`crates/vdev-display-win/cli/src/install.rs:170–260`）走 SetupAPI 五步：`SetupDiGetINFClassW` 从 INF 取类 GUID/类名 → `SetupDiCreateDeviceInfoList` 建设备信息集 → `SetupDiCreateDeviceInfoW`（`DICD_GENERATE_ID` 自动生成实例 ID）→ `SetupDiSetDeviceRegistryPropertyW` 设硬件 ID `Root\vdev-display` → `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)` 注册节点 → `DiInstallDriverW` 把 INF 装入驱动存储并安装。安装前先清残留设备节点，保证 IddCx 单实例语义。
+**安装流程**（`crates/vdev-display-win/cli/src/install.rs:199–308`）走 SetupAPI 五步：`SetupDiGetINFClassW` 从 INF 取类 GUID/类名 → `SetupDiCreateDeviceInfoList` 建设备信息集 → `SetupDiCreateDeviceInfoW`（`DICD_GENERATE_ID` 自动生成实例 ID）→ `SetupDiSetDeviceRegistryPropertyW` 设硬件 ID `Root\vdev-display` → `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)` 注册节点 → `DiInstallDriverW` 把 INF 装入驱动存储并安装。安装前先清残留设备节点，保证 IddCx 单实例语义。
 
 **UAC 自提权**（`crates/vdev-display-win/cli/src/main.rs:276–345`）有三个容易踩的坑，修复后的实现都处理了：
 

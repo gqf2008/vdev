@@ -206,8 +206,8 @@ unsafe fn retrieve_packet(
 以 `vdev-hid-win kernel key a` 为例，整条链路是：
 
 1. **纯逻辑层**（windows-free，macOS 也能跑单测）：`key_to_hid("a")` 把键名映射为 usage `0x04`（`crates/vdev-hid-win/src/report.rs:30`），`make_report` 组装 8 字节报告 `[0,0,0x04,0,0,0,0,0]`（修饰键、保留、键码三段布局，`crates/vdev-hid-win/src/report.rs:139`）；
-2. **找设备**：`HidD_GetHidGuid` 拿 HID 接口类 → `SetupDiEnumDeviceInterfaces` 枚举全部 HID 接口 → 逐个打开并 `HidD_GetAttributes` 核对 VID/PID，命中 `0x5644/0x4849` 即键盘（`crates/vdev-hid-win/src/kernel.rs:368–465`）；
-3. **写入**：`CreateFileW` 打开接口后直接 `WriteFile` 8 字节（`crates/vdev-hid-win/src/kernel.rs:468–493`）：
+2. **找设备**：`HidD_GetHidGuid` 拿 HID 接口类 → `SetupDiEnumDeviceInterfaces` 枚举全部 HID 接口 → 逐个打开并 `HidD_GetAttributes` 核对 VID/PID，命中 `0x5644/0x4849` 即键盘（`find_hid_paths`，`crates/vdev-hid-win/src/kernel.rs:516–617`）；
+3. **写入**：`CreateFileW` 打开接口后直接 `WriteFile` 8 字节（当前代码里 `WriteFile` 已退为 `HidD_SetFeature` 失败后的兜底，见 `write_report_to`，`crates/vdev-hid-win/src/kernel.rs:641–687`）：
 
 ```rust
 // crates/vdev-hid-win/src/kernel.rs（节选）

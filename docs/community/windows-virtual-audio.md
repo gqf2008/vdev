@@ -64,11 +64,11 @@ PnP 子系统为设备调 `AddDevice`，我们在里面用 `PcAddAdapterDevice` 
 
 ## 四、核心机制解析
 
-### 4.1 SPSC 环形缓冲：三个原子索引走天下
+### 4.1 SPSC 环形缓冲：两个单调索引，计数只派生不存储
 
-扬声器和麦克风两个流共享一块 1 MB 的非分页池（`ExAllocatePool2`，flags `0x40` = `POOL_FLAG_NON_PAGED`——`GetPosition` 会在 `DISPATCH_LEVEL` 被轮询，任何分页内存都是禁忌）。缓冲本身是无锁 SPSC：裸指针数据区 + `read`/`write`/`count` 三个 `AtomicUsize`，全部 `SeqCst`；数据拷贝先行于 `count` 更新，读者只信 `count`（`crates/vdev-audio-win/driver/src/ringbuffer.rs:13–19`）。审查确认过并发设计本身：单写单读 + 原子 RMW 在 x86/ARM64 都是安全的，`GetPosition` 内无锁、无分页内存、无阻塞调用，DISPATCH_LEVEL 合规。
+扬声器和麦克风两个流共享一块非分页池（`ExAllocatePool2`，flags `0x40` = `POOL_FLAG_NON_PAGED`——`GetPosition` 会在 `DISPATCH_LEVEL` 被轮询，任何分页内存都是禁忌）。缓冲本身是无锁 SPSC：裸指针数据区 + `read`/`write` 两个 `AtomicUsize` **单调索引**（存取时对 capacity 取模），`count` 不再是独立原子量、而是由 `write - read` 派生（`crates/vdev-audio-win/driver/src/ringbuffer.rs:25–32`）。`GetPosition` 内无锁、无分页内存、无阻塞调用，DISPATCH_LEVEL 合规。
 
-工程上有一个不优雅但诚实的妥协：渲染流满载时，`write_drop_oldest` 会"代写者"推进 read 索引来腾位（`crates/vdev-audio-win/driver/src/ringbuffer.rs:112–120`），所以严格说 read 索引有两个潜在写者——代码注释明说了这是"尽力而为的环回链路，不承诺强一致"。
+之所以改成这个形态，是 2026-09-15 的复审推翻了本文此前「单写单读 + 原子 RMW 即可」的结论：渲染流满载时 `write_drop_oldest` 要从**写者线程**推进 read 索引腾位，于是 read 有了两个写者；两端各自 load-compute-store 互相覆盖，read 会**回退**，并与独立存储的 `count` 永久脱同步（`fetch_sub` 还会让 count 下溢回绕）——不是丢帧，是环回流的结构性损坏。修复后的纪律是：**read 索引两端都可以推进，但一律 `fetch_max` 单调递增、绝不回退**（读者正常读、写者满载丢最旧，`crates/vdev-audio-win/driver/src/ringbuffer.rs:124,147`）；`count` 由索引派生，从根上消灭「索引与计数脱同步」这一类错误，`read <= write` 恒成立。数据面仍是尽力而为的环回链路（满载丢最旧的窗口内读者可能拷到写者正在覆盖的字节，个别撕裂帧），但索引/计数永不错位。两个并发回归测试把这个不变式钉死：无压力并发读写 20 万样本逐字节保序、持续满载丢最旧压力下不变式始终成立（`crates/vdev-audio-win/driver/src/ringbuffer.rs:332–429`）。
 
 ### 4.2 时间锚定的 GetPosition：sysvad 同款
 
@@ -101,7 +101,7 @@ pub const fn split_ring_span(start: usize, n: usize, size: usize) -> (usize, usi
 
 > 这一条是**装机之后**才纠过来的：第一版按 sysvad 的"节点中转"形状写渲染拓扑（经 `KSNODETYPE_AUDIO_ENGINE` 节点），端点能枚举但打不开（见案例七～十一）。把渲染拓扑改成直通、`NodeCount` 归零之后，端点才真正可用。
 
-最后用 `PcRegisterPhysicalConnection` 把 wave↔topology 两对桥接 pin 接成物理连接（渲染路径 wave→topology，捕获路径 topology→wave），任一步失败沿注册逆序 teardown：先 `IUnregisterPhysicalConnection` 解除物理连接，再 `IUnregisterSubdevice` 注销子设备，否则已注册的 port 反向引用即将被释放的适配器内存，是一个窗口期 UAF（`crates/vdev-audio-win/driver/src/adapter.rs:447–498`）。
+最后用 `PcRegisterPhysicalConnection` 把 wave↔topology 两对桥接 pin 接成物理连接（渲染路径 wave→topology，捕获路径 topology→wave），任一步失败沿注册逆序 teardown：先 `IUnregisterPhysicalConnection` 解除物理连接，再 `IUnregisterSubdevice` 注销子设备，否则已注册的 port 反向引用即将被释放的适配器内存，是一个窗口期 UAF（`crates/vdev-audio-win/driver/src/adapter.rs:529–595；失败路径 teardown 在 458–510`）。
 
 ## 五、踩坑实录：六个蓝屏级案例
 
@@ -119,7 +119,7 @@ let ring = RingBuffer::new(ring_mem.cast(), RING_SIZE); // 值，存于栈局部
 
 `adapter_init` 一返回，这个指针就是悬垂的。三重后果：`stream_get_position` 在 DISPATCH_LEVEL 经它读写已被复用的内核栈；释放路径对悬垂地址 `ExFreePoolWithTag` 造成池损坏 bugcheck；真正的 1 MB 池分配永久泄漏。
 
-修法（`crates/vdev-audio-win/driver/src/adapter.rs:171–186`）：`RingBuffer` 结构体和数据区合并成**一次**池分配——分配 `size_of::<RingBuffer>() + 1MB`，`ptr::write` 把结构体放置到池基址，数据区紧随其后，释放时只 free 唯一的池指针。教训：内核里任何"会被别的执行流摸到"的对象，生命周期必须挂到池上，栈上构造 + 存地址是标准送命姿势。
+修法（`crates/vdev-audio-win/driver/src/adapter.rs:168–197`）：`RingBuffer` 结构体和数据区合并成**一次**池分配——分配 `size_of::<RingBuffer>() + 1MB`，`ptr::write` 把结构体放置到池基址，数据区紧随其后，释放时只 free 唯一的池指针。教训：内核里任何"会被别的执行流摸到"的对象，生命周期必须挂到池上，栈上构造 + 存地址是标准送命姿势。
 
 ### 案例二：回绕首段长度公式写反——现有单测全从 0 起写，所以漏网
 
@@ -132,7 +132,7 @@ let first = (self.capacity - w % self.capacity).min(n); // 对：到末尾的剩
 
 前者在 offset < capacity/2 时不越界但写错位置（静默数据损坏），跨尾界时直接 slice 越界 panic——内核态就是 `KeBugCheckEx`。最扎心的是测试：修复前仅有的 3 个单测**全部从 offset 0 或恰好 capacity/2 起写**，这个 bug 在宿主上零触发，是审查者用同逻辑写 PoC（capacity=8、offset=6、写 4 字节）实证的。
 
-修复后补了三类用例（`crates/vdev-audio-win/driver/src/ringbuffer.rs:188–233`）：写跨尾界（尾 5 写 6 → 5+1 切分）、读跨尾界、整圈回绕；再加一个 4096 步的 XorShift 随机性质测试，环形实现逐字节比对线性参考实现（`crates/vdev-audio-win/driver/src/ringbuffer.rs:276–310`）。教训：**回绕逻辑的测试必须从非零偏移、跨尾界的形态开始写**，全零起点的用例天然抓不到这类错。
+修复后补了三类用例（`crates/vdev-audio-win/driver/src/ringbuffer.rs:205–263`）：写跨尾界（尾 5 写 6 → 5+1 切分）、读跨尾界、整圈回绕；再加一个 4096 步的 XorShift 随机性质测试，环形实现逐字节比对线性参考实现（`crates/vdev-audio-win/driver/src/ringbuffer.rs:293–327`）。教训：**回绕逻辑的测试必须从非零偏移、跨尾界的形态开始写**，全零起点的用例天然抓不到这类错。
 
 ### 案例三：COM vtable 少一级间接——调用即野跳转
 
@@ -146,7 +146,7 @@ let vtbl: &IPortWaveRTStreamVtbl =
     unsafe { &*(*(ps.port_stream as *const *const IPortWaveRTStreamVtbl)) };
 ```
 
-错的那版把 PortCls 流对象的内部数据当函数指针表，`allocate_pages_for_mdl`（vtable 偏移 24）读到一个数据值就"调用"了它——跳任意地址。讽刺的是同一仓库 `crates/vdev-audio-win/driver/src/adapter.rs:367` 里对 `IPort` 的写法是正确的双重间接，两处对照才让问题显形。COM 是"指针的指针"这件事，在 Rust 里没有类型系统替你兜底，只能靠纪律。
+错的那版把 PortCls 流对象的内部数据当函数指针表，`allocate_pages_for_mdl`（vtable 偏移 24）读到一个数据值就"调用"了它——跳任意地址。讽刺的是同一仓库 `crates/vdev-audio-win/driver/src/adapter.rs:380–390` 里对 `IPort` 的写法是正确的双重间接，两处对照才让问题显形。COM 是"指针的指针"这件事，在 Rust 里没有类型系统替你兜底，只能靠纪律。
 
 ### 案例四：GetPosition 的双重契约违反
 

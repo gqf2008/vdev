@@ -67,13 +67,13 @@ PnP 子系统为设备调 `AddDevice`，我们在里面用 `PcAddAdapterDevice` 
 
 **绑定全部手写，与 WDK 头文件逐字段对照。** 手写的 WDM / PortCls / KS 绑定子集里：`types.rs`（基础类型 + KS/PC 描述符）、`portcls.rs`（导出函数与 IID/CLSID）、`mem.rs`（`ExAllocatePool2` / `ExFreePoolWithTag` 薄封装）、`log.rs`（默认静默的 `kdbg!` 宏，仅接受字面量消息，规避 varargs ABI）。方法论是：vtable 槽序对照 `portcls.h` 行号、GUID 值逐条从 `ksmedia.h` / `ks.h` 抄录并注明行号、结构布局推演 x64 尺寸后用 `size_of!` / `offset_of!` 断言钉死。**宿主跑不了内核代码，但布局断言跑得动**——这是 Rust 内核驱动在非 Windows 开发机上仅有的几种验证手段之一。
 
-## 四、核心机制：三个原子索引 + 时间锚定
+## 四、核心机制：两个单调索引 + 时间锚定
 
 ### 4.1 SPSC 环形缓冲
 
-扬声器和麦克风两个流共享一块 1 MB 的非分页池（`POOL_FLAG_NON_PAGED`——`GetPosition` 会在 `DISPATCH_LEVEL` 被轮询，任何分页内存都是禁忌）。缓冲本身是无锁 SPSC：裸指针数据区 + `read` / `write` / `count` 三个 `AtomicUsize`，全部 `SeqCst`；数据拷贝先行于 `count` 更新，读者只信 `count`。单写单读 + 原子 RMW 在 x86/ARM64 都安全，`GetPosition` 内无锁、无分页内存、无阻塞调用，DISPATCH_LEVEL 合规。
+扬声器和麦克风两个流共享一块非分页池（`POOL_FLAG_NON_PAGED`——`GetPosition` 会在 `DISPATCH_LEVEL` 被轮询，任何分页内存都是禁忌）。缓冲本身是无锁 SPSC：裸指针数据区 + `read` / `write` 两个 `AtomicUsize` **单调索引**（存取时对 capacity 取模），`count` 不再独立存储、由 `write - read` 派生。`GetPosition` 内无锁、无分页内存、无阻塞调用，DISPATCH_LEVEL 合规。
 
-有个不优雅但诚实的妥协：渲染流满载时 `write_drop_oldest` 会"代写者"推进 read 索引来腾位，所以严格说 read 索引有两个潜在写者——代码注释明说了这是"尽力而为的环回链路，不承诺强一致"。
+> 2026-09-15 复审修订：本文此前写「read / write / count 三个原子索引、单写单读 + 原子 RMW 即安全」是**错误结论**。渲染流满载时 `write_drop_oldest` 要从写者线程推进 read 索引，read 因此有两个写者，两端 load-compute-store 互相覆盖会让 read 回退、与独立的 count 永久脱同步——不是丢帧，是环回流的结构性损坏。修复后的纪律是：read 两端都可推进但一律 `fetch_max` 单调递增、绝不回退；count 由索引派生，`read <= write` 恒成立。数据面仍是尽力而为的环回（满载丢最旧的窗口内可能有个别撕裂帧），但索引/计数永不错位，两个并发回归测试把这个不变式钉死。
 
 ### 4.2 时间锚定的 GetPosition
 

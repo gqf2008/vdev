@@ -65,7 +65,7 @@ RX, RW = 760, 350         # 右列：PortCls 负责什么
 steps = [
     ("会议 / 播放软件", "把音频写到「vdev 扬声器」", BLUE_BG, BLUE),
     ("KS Filter · WaveRender-0", "render pin（SINK）", BLUE_BG, BLUE),
-    ("内核环形缓冲 · 1 MB 非分页池", "SPSC：read / write / count 三个原子索引", AMBER_BG, AMBER),
+    ("内核环形缓冲 · 非分页池", "SPSC：read / write 单调索引，计数派生", AMBER_BG, AMBER),
     ("KS Filter · WaveCapture-0", "capture pin（SOURCE）", GREEN_BG, GREEN),
     ("会议软件选「vdev 麦克风」", "从同一块缓冲读出降噪/环回后的音频", GREEN_BG, GREEN),
 ]

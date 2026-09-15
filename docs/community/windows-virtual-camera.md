@@ -104,7 +104,7 @@ HKCR\CLSID\{860BB310-5D01-11D0-BD3B-00A0C911CE86}\Instance\{E4C01F0D-...}
 - `Local\vdev-camera-win-frame-event`：自动重置事件，新帧信号；
 - `Local\vdev-camera-win-publish-lock`：命名互斥体，多生产者并发的发布锁。
 
-头部是一个 `#[repr(C)]` 结构，`seq` 与 `ready` 是跨进程原子（`crates/vdev-camera-win/src/com/shm.rs:48–58`）：
+头部是一个 `#[repr(C)]` 结构，`seq` 与 `ready` 是跨进程原子（`crates/vdev-camera-win/src/com/shm.rs:56–68`）：
 
 ```rust
 // crates/vdev-camera-win/src/com/shm.rs
@@ -121,9 +121,9 @@ struct Header {
 }
 ```
 
-**生产者** `publish()`（`crates/vdev-camera-win/src/com/shm.rs:177–252`）的顺序是：有界等待发布锁（500ms，正常持锁窗口是微秒级 memcpy）→ 读当前 `seq` 加一 → 把帧整块拷进**另一个槽**（`seq & 1` 双缓冲，写者写的永远是读者没在读的槽）→ 以 `Release` 顺序发布新 `seq`、置 `ready` → `SetEvent` 唤醒消费者 → `ReleaseMutex`。
+**生产者** `publish()`（`crates/vdev-camera-win/src/com/shm.rs:190–267`）的顺序是：有界等待发布锁（500ms，正常持锁窗口是微秒级 memcpy）→ 读当前 `seq` 加一 → 把帧整块拷进**另一个槽**（`seq & 1` 双缓冲，写者写的永远是读者没在读的槽）→ 以 `Release` 顺序发布新 `seq`、置 `ready` → `SetEvent` 唤醒消费者 → `ReleaseMutex`。
 
-**消费者** `latest()`（`crates/vdev-camera-win/src/com/shm.rs:268–297`）是一次标准的 **seqlock 读**：
+**消费者** `latest()`（`crates/vdev-camera-win/src/com/shm.rs:283–312`）是一次标准的 **seqlock 读**：
 
 ```rust
 // crates/vdev-camera-win/src/com/shm.rs（latest 读循环，精简）
@@ -143,7 +143,7 @@ for _ in 0..MAX_SEQLOCK_ATTEMPTS {          // 上限 8 轮，防活锁
 
 防撕裂有两个关键点：一是**`seq_after` 必须在负载拷贝完成之后采样**——序号括弧要罩住"头部 + 负载"全部读取。若只在拷贝前采样，写方在拷贝期间连发两帧回到同一槽（奇偶相同，如 7→9）的撕裂像素会漏检并通过校验；二是拷贝长度在通过 `buf_len == w*h*4` 自洽校验之前不可信，必须按单槽容量截断，防崩溃残留的垃圾 `buf_len` 造成越界。这两条裁决被抽成了零 Windows 依赖的纯函数 `judge_seqlock_read`（`crates/vdev-camera-win/src/com/channel_logic.rs:86–107`），连同重读收敛、双发布回归等 9 个测试可以直接在任意平台 `rustc --test` 跑——**把无锁算法的"决策逻辑"与"系统调用"分离，是这类代码能被充分单测的关键**。
 
-**过滤器侧**的推流线程（`crates/vdev-camera-win/src/dshow/streaming.rs:62–166`）把通道数据变成 DirectShow 样本：`wait_frame` 等新帧（超时=一帧时长）→ `latest` 取帧，生产者分辨率与协商格式不一致时最近邻缩放，完全无帧则回退棋盘格测试图案（摄像头永远不能"没有画面"）→ BGRA 转 YUY2 → `allocator.GetBuffer` 取下游样本 → `GetPointer` 拿缓冲区、`copy_nonoverlapping` 填帧（这就是 FillBuffer）→ `SetTime` 打**流时间**戳、`SetSyncPoint(true)` → 下游 `IMemInputPin::Receive`。其中分配器协商镜像了 `CBaseOutputPin::DecideAllocator` 的协议：先试下游提供的分配器，`VFW_E_NO_ALLOCATOR`（ffmpeg 的 sink 就这样）或属性被拒时自建 `CLSID_MemoryAllocator` 并 `NotifyAllocator`（`crates/vdev-camera-win/src/dshow/pin.rs:527–549`）。
+**过滤器侧**的推流线程（`crates/vdev-camera-win/src/dshow/streaming.rs:57–161`）把通道数据变成 DirectShow 样本：`wait_frame` 等新帧（超时=一帧时长）→ `latest` 取帧，生产者分辨率与协商格式不一致时最近邻缩放，完全无帧则回退棋盘格测试图案（摄像头永远不能"没有画面"）→ BGRA 转 YUY2 → `allocator.GetBuffer` 取下游样本 → `GetPointer` 拿缓冲区、`copy_nonoverlapping` 填帧（这就是 FillBuffer）→ `SetTime` 打**流时间**戳、`SetSyncPoint(true)` → 下游 `IMemInputPin::Receive`。其中分配器协商镜像了 `CBaseOutputPin::DecideAllocator` 的协议：先试下游提供的分配器，`VFW_E_NO_ALLOCATOR`（ffmpeg 的 sink 就这样）或属性被拒时自建 `CLSID_MemoryAllocator` 并 `NotifyAllocator`（`crates/vdev-camera-win/src/dshow/pin.rs:521–549`）。
 
 顺带一提兼容性选型：输出子类型选 **YUY2 而非 RGB32**，因为 DirectShow 摄像头生态以 YUV 为主，VLC 3.0 无法从 RGB32 媒体类型提取 fourcc，直接报 unsupported format；`biHeight` 用**正数**（OBS/libdshowcapture 同款），负值会被 VLC 塞进 unsigned 字段溢出成黑屏（`crates/vdev-camera-win/src/dshow/media_type.rs:24,63-70`）。
 
@@ -170,7 +170,7 @@ pub fn judge_lock_wait(code: u32) -> LockWaitVerdict {
 }
 ```
 
-接管后的两条配套：一、既已获锁，正常路径末尾的 `ReleaseMutex` 照常执行（`crates/vdev-camera-win/src/com/shm.rs:250`）；二、锁保护的数据可能被崩溃写撕坏，读侧用上面的 seqlock 序号裁决兜底丢弃坏帧。同批还把 `INFINITE` 等待改成了 500ms 有界等待——正常持锁是微秒级，超时即持锁方异常，放弃本帧由下一帧自然重试，别让推流线程陪一个挂死的进程一起挂死。
+接管后的两条配套：一、既已获锁，正常路径末尾的 `ReleaseMutex` 照常执行（`crates/vdev-camera-win/src/com/shm.rs:265`）；二、锁保护的数据可能被崩溃写撕坏，读侧用上面的 seqlock 序号裁决兜底丢弃坏帧。同批还把 `INFINITE` 等待改成了 500ms 有界等待——正常持锁是微秒级，超时即持锁方异常，放弃本帧由下一帧自然重试，别让推流线程陪一个挂死的进程一起挂死。
 
 ### 坑 2：COM 对象的自引用环——引用计数永不归零的泄漏
 
