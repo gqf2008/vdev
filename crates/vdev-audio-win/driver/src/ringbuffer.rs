@@ -277,6 +277,37 @@ mod tests {
         assert_eq!(&out2, &[0, 0]);
     }
 
+    /// P0 回归（环回 ×19 / 幅度翻倍）：只要调用方给出的窗口长度是整帧
+    /// （`block_align`）倍数，环形缓冲的读写索引与派生计数就始终落在帧栅格上。
+    ///
+    /// 驱动侧 `stream_get_position` 先做 `frame_aligned_advance()`（position.rs）
+    /// 对齐字节推进，本测试固定"缓冲索引恒为整帧倍数"这条不变式——一旦索引
+    /// 脱离帧栅格，DMA 缓冲的字节相位就会和音频引擎的 16bit 立体声帧错开，
+    /// 引擎按错误字节边界解码（修复前实测：整段环回被解码错位）。
+    #[test]
+    fn frame_aligned_windows_keep_indices_on_frame_grid() {
+        const BLOCK: usize = 4; // 48kHz / 16bit / 2ch
+        const CAP: usize = 64; // 容量本身也是整帧倍数
+        let mut storage = [0u8; CAP];
+        let rb = unsafe { RingBuffer::new(storage.as_mut_ptr(), CAP) };
+        for k in 0..500usize {
+            // 交替 16 帧 / 5 帧窗口：后者会走满载丢最旧（drop_oldest）路径
+            let wlen = BLOCK * if k % 3 == 0 { 16 } else { 5 };
+            let payload = vec![(k % 251) as u8; wlen];
+            rb.write_drop_oldest(&payload);
+            let rlen = BLOCK * if k % 2 == 0 { 3 } else { 1 };
+            let mut out = vec![0u8; rlen];
+            rb.read_zero_fill(&mut out);
+
+            let r = rb.read.load(Ordering::SeqCst);
+            let w = rb.write.load(Ordering::SeqCst);
+            assert_eq!(r % BLOCK, 0, "read 索引脱离帧栅格（k={k}）");
+            assert_eq!(w % BLOCK, 0, "write 索引脱离帧栅格（k={k}）");
+            assert_eq!(rb.readable() % BLOCK, 0, "readable 脱离帧栅格（k={k}）");
+            assert_eq!(rb.writable() % BLOCK, 0, "writable 脱离帧栅格（k={k}）");
+        }
+    }
+
     struct XorShift(u64);
 
     impl XorShift {

@@ -6,7 +6,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::com::{interlocked_decrement, interlocked_increment};
-use crate::position::{bytes_for_interval, mod_position, split_ring_span};
+use crate::position::{bytes_for_interval, frame_aligned_advance, mod_position, split_ring_span};
 use crate::ringbuffer::RingBuffer;
 use crate::sys::portcls::*;
 use crate::sys::types::*;
@@ -369,7 +369,19 @@ unsafe extern "system" fn stream_get_position(
         ));
         // 单次最多推进一个 DMA 周期（引擎久未查询时不越过缓冲窗口）
         let target = target.min(s.last_processed + dma_size as u64);
-        let n = target.saturating_sub(s.last_processed) as usize;
+        // P0 修复：推进量必须向下对齐到整帧（block_align 字节）。
+        //
+        // `bytes_for_interval()` 按 QPC 时间换算出的字节数是任意整数（如
+        // 7.3 ms @192000 B/s = 1401），直接拿它推进 `last_processed` 会让
+        // `last_processed % dma_size`（DMA 缓冲偏移）与环形缓冲读写索引脱离
+        // 引擎的帧栅格；引擎随后按 16bit 立体声帧解码时，样本边界与写入边界
+        // 相差 1 字节（高低字节错位）——实测整段环回幅度翻倍、频谱被高频伪造
+        // 分量占据（详见 position.rs::frame_aligned_advance 与 2a2f4bd 后续）。
+        // 欠账由 QPC 锚点在下一轮补齐，不累积漂移。
+        let n = frame_aligned_advance(
+            target.saturating_sub(s.last_processed),
+            u32::from(s.block_align),
+        ) as usize;
         if n > 0 {
             // SAFETY: dma 有效且 dma_size 字节；split_ring_span 保证 off+first ≤ dma_size
             let (off, first) = split_ring_span(s.last_processed as usize, n, dma_size);
