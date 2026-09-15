@@ -14,6 +14,12 @@ use crate::*;
 // EOF byte used to separate messages
 pub(crate) const EOF: u8 = 0x4;
 
+/// 客户端侧未完成消息（尚未见到 EOF）的缓冲上限，与驱动侧
+/// `validate::MAX_MSG_BYTES`（512 KiB）一致：驱动发来的合法单条消息不可能
+/// 超过该值，超限说明对端行为异常或流已错位，直接断链报错，防止 recv_buf
+/// 无界增长耗尽内存（审查 M-h）。
+const MAX_RECV_BYTES: usize = 512 * 1024;
+
 /// Client for interacting with the Virtual Display Driver.
 ///
 /// Connects via a named pipe to the driver.
@@ -181,7 +187,10 @@ impl Clone for Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if Arc::strong_count(&self.shared) == 2 {
-            self.shared.abort_receiver.notify_waiters();
+            // notify_one 会存一个许可：即使接收任务此刻还没 poll notified()，
+            // 下一次 poll 也立即完成；notify_waiters 只唤醒已注册的等待者，
+            // 丢失后接收任务永不退出（审查 M-h）
+            self.shared.abort_receiver.notify_one();
         }
     }
 }
@@ -248,10 +257,25 @@ async fn receive_command(
         }
 
         match client.try_read(&mut buf) {
-            Ok(0) => return Err(io::Error::last_os_error()),
+            // 读到 0 字节 = 对端已关闭管道；last_os_error 在一次成功调用后
+            // 返回的是无关的陈旧错误码，这里语义就是 EOF（审查 M-h）
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "driver closed the pipe",
+                ))
+            }
             Ok(n) => recv_buf.extend(&buf[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
+        }
+
+        // 未完成消息超过上限：对端异常或流错位，断链而不是无限攒缓冲（M-h）
+        if recv_buf.len() > MAX_RECV_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unterminated message exceeded {MAX_RECV_BYTES} bytes"),
+            ));
         }
 
         let eof_iter =
@@ -410,8 +434,11 @@ mod test {
 
         println!("{:?}", events);
 
+        // M-h：对端关闭管道现在按读侧语义报 UnexpectedEof（此前代码用
+        // last_os_error，恰好返回 ERROR_PIPE_NOT_CONNECTED 之类的陈旧码才
+        // 凑出 BrokenPipe，并不可靠）
         assert!(
-            matches!(events[..], [Err(error::ReceiveError(ref e))] if e.kind() == io::ErrorKind::BrokenPipe)
+            matches!(events[..], [Err(error::ReceiveError(ref e))] if e.kind() == io::ErrorKind::UnexpectedEof)
         );
     }
 

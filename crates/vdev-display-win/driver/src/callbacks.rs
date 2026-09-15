@@ -63,10 +63,16 @@ pub extern "C-unwind" fn device_d0_entry(
 }
 
 fn device_d0_entry_impl(device: WDFDEVICE, _previous_state: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    // M-a 修复：init_adapter 失败必须上抛——原实现只记日志仍返回 SUCCESS，
+    // OS 认为设备已启动而 adapter 实为 None，后续显示器创建全部失败且对外
+    // 不可见（僵尸设备）。返回失败后 KMDF 走设备启动失败路径；M6 守卫保证
+    // adapter 未建成，下一次 D0Entry（重新上电/重启设备）会重试初始化。
+    let mut init_failed = false;
     let status: NTSTATUS = unsafe {
         DeviceContext::get_mut(device.cast(), |context| {
             if let Err(e) = context.init_adapter() {
                 error!("Failed to init adapter: {e:?}");
+                init_failed = true;
             }
         })
         .into()
@@ -74,6 +80,9 @@ fn device_d0_entry_impl(device: WDFDEVICE, _previous_state: WDF_POWER_DEVICE_STA
 
     if !status.is_success() {
         return status;
+    }
+    if init_failed {
+        return NTSTATUS::STATUS_ADAPTER_HARDWARE_ERROR;
     }
 
     NTSTATUS::STATUS_SUCCESS

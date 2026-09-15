@@ -427,6 +427,14 @@ fn sanitize_monitors(mut monitors: Vec<Monitor>) -> Vec<Monitor> {
     monitors
 }
 
+/// 驱动内部当前生效的监视器状态（MONITOR_MODES 快照）。
+/// notify 的所有广播出口统一用它，保证广播 == 驱动实际状态（审查 M-b）。
+fn current_state() -> Vec<Monitor> {
+    // M3：互斥量中毒后继续使用既有数据（into_inner），避免 unwrap panic 跨 FFI 边界
+    let lock = MONITOR_MODES.lock().unwrap_or_else(PoisonError::into_inner);
+    lock.iter().map(|m| m.data.clone()).collect()
+}
+
 /// Notifies driver of new system monitor state
 ///
 /// Adds, updates, or removes monitors as needed
@@ -436,22 +444,26 @@ fn sanitize_monitors(mut monitors: Vec<Monitor>) -> Vec<Monitor> {
 /// Only detaches/reattaches if required
 /// e.g. only a monitor name update would not detach/arrive a monitor
 fn notify(monitors: Vec<Monitor>) -> Vec<Monitor> {
-    // M2(b)：先做输入校验（数量/分辨率/刷新率上限与范围）；返回校验后的列表，
-    // 供 process_message 广播（minor(c)），使广播与驱动实际生效状态同源
+    // M2(b)：先做输入校验（数量/分辨率/刷新率上限与范围）
     let monitors = sanitize_monitors(monitors);
+
+    // 广播不变式（审查 M-b 修复）：本函数的返回值会被 process_message 直接广播为
+    // EventCommand::Changed，因此**所有出口都必须返回驱动实际生效的状态**。
+    // 拒绝/忽略输入时返回当前（未改变的）状态——原实现把被拒的输入列表广播出去，
+    // 客户端看到的"新状态"与驱动内部状态分叉。
 
     // Duplicated id's will not cause any issue, however duplicated resolutions/refresh rates are possible
     // They should all be unique anyways. So warn + noop if the sender sent incorrect data
     if has_duplicates(&monitors) {
         warn!("notify(): Duplicate data was detected; update aborted");
-        return monitors;
+        return current_state();
     }
 
     // M3：adapter 未就绪（IddCxAdapterInitFinished 尚未回调）时收敛为记日志并忽略，
     // 不再 unwrap panic。listener 在 adapter 就绪后才启动，正常路径不会走到这里。
     let Some(adapter) = ADAPTER.get() else {
         error!("notify(): adapter is not initialized yet; ignoring notify");
-        return monitors;
+        return current_state();
     };
     let adapter = adapter.0.as_ptr();
 
@@ -479,9 +491,8 @@ fn notify(monitors: Vec<Monitor>) -> Vec<Monitor> {
         found
     });
 
-    // minor(c)：广播列表取 sanitize 后的快照（消费前克隆，与驱动实际生效状态同源）
-    let broadcast = monitors.clone();
-
+    // M-b：minor(c) 的快照广播改为应用后的当前状态——不变式只有一个来源
+    // （驱动内部状态），create_monitor 失败等边缘也不会让广播偏离实际状态
     let should_arrive = monitors
         .into_iter()
         .map(|monitor| {
@@ -549,7 +560,7 @@ fn notify(monitors: Vec<Monitor>) -> Vec<Monitor> {
         error!("notify(): failed to access device context: {e:?}");
     }
 
-    broadcast
+    current_state()
 }
 
 fn remove_all() {
