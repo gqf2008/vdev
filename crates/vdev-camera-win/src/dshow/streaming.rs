@@ -1,9 +1,10 @@
 //! 推流线程：取共享帧通道最新帧 → 填 `IMediaSample` → 交给下游 `IMemInputPin::Receive`。
 //!
-//! 线程在 `IMediaFilter::Run` 时启动、`Stop` 时停止；期间若无新帧（生产者未推流），
+//! 线程在 `IMediaFilter::Pause` 时启动（源过滤器需先送预滚帧渲染器才能完成
+//! Pause）、`Stop` 时停止；期间若无新帧（生产者未推流），
 //! 回退到 vdev-camera 的测试图案（棋盘格），与 macOS 版「无帧回退彩条」语义一致。
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -19,7 +20,6 @@ use crate::com::ComInit;
 /// 推流线程句柄。
 pub struct StreamThread {
     stop: Arc<AtomicBool>,
-    tstart: Arc<AtomicI64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -30,20 +30,16 @@ impl StreamThread {
             let _ = join.join();
         }
     }
-
-    /// 更新 Run 时间起点（图在 Pause 预滚后调用 Run 时设置）。
-    pub fn set_tstart(&self, tstart: i64) {
-        self.tstart.store(tstart, Ordering::Relaxed);
-    }
 }
 
 /// 启动推流线程。
 ///
 /// 注意：推流线程在 **Pause** 时启动（源过滤器需先送预滚帧，渲染器才能完成
-/// Pause，图才会调用 Run），而不是在 Run 时启动。
-pub fn start_stream(filter: Arc<FilterInner>, tstart: i64) -> StreamThread {
+/// Pause，图才会调用 Run），而不是在 Run 时启动。样本时间戳用本地流时间
+/// （从 0 递增），Run 的参考时钟起点 tstart 在此无用，故不接收该参数
+/// （审查 L7：原实现存了 tstart 原子量却从未读取——死存储）。
+pub fn start_stream(filter: Arc<FilterInner>) -> StreamThread {
     let stop = Arc::new(AtomicBool::new(false));
-    let tstart_atomic = Arc::new(AtomicI64::new(tstart));
     let stop2 = stop.clone();
     let pin = filter.pin.clone();
     let channel = filter.channel.clone();
@@ -54,7 +50,6 @@ pub fn start_stream(filter: Arc<FilterInner>, tstart: i64) -> StreamThread {
         .expect("spawn stream thread");
     StreamThread {
         stop,
-        tstart: tstart_atomic,
         join: Some(join),
     }
 }
@@ -167,9 +162,10 @@ fn stream_loop(pin: Arc<PinInner>, channel: Arc<SharedFrameChannel>, stop: Arc<A
 
 /// 填一帧到 IMediaSample 并设置样本时间戳；失败返回 false。
 ///
-/// 时间戳用参考时钟当前时间（`IReferenceClock::GetTime`，OBS virtualcam 同款）：
-/// VLC 等下游的 grabber 用样本时间戳做 PTS，无时间戳会导致画面黑屏。
-/// 参考时钟不可用时回退墙钟（100ns 单位），保证 PTS 单调有效。
+/// 时间戳用**流时间**（相对 Run 开始、从 0 按帧间隔递增，`stream_time` 由
+/// 调用方跨帧持有），CBaseOutputPin 同款：渲染器把样本时间戳与其时钟流时间
+/// 比较，只有流时间基准才能正确渲染；参考时钟绝对时间会错位导致卡死
+/// （实测仅 1 帧）。VLC 等下游 grabber 用样本时间戳做 PTS，流时间同样有效。
 fn deliver_sample(
     sample: &IMediaSample,
     buf: &[u8],
@@ -201,9 +197,11 @@ fn deliver_sample(
     // 基准才能正确渲染；用参考时钟绝对时间会错位导致卡死（实测仅 1 帧）。
     // VLC 等 grabber 用样本时间戳做 PTS，流时间同样有效，可修复黑屏。
     let interval = 10_000_000 / format.fps.max(1) as i64;
-    *stream_time += interval;
+    // 先取起点再推进：首帧时间戳必须是 [0, interval)，原实现先 += 导致
+    // 首帧从 [interval, 2·interval) 开始，整体错位一帧（审查 L7）
     let rt_start = *stream_time;
-    let rt_end = rt_start + interval;
+    *stream_time += interval;
+    let rt_end = *stream_time;
     // SAFETY: 栈上 i64，调用期间存活。
     let _ = unsafe { sample.SetTime(Some(&rt_start as *const i64), Some(&rt_end as *const i64)) };
     // SAFETY: COM 方法调用，设置样本标志位。

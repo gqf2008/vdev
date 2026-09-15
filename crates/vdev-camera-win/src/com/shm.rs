@@ -41,6 +41,15 @@ const BPP: u32 = 4; // BGRA
 const MAX_WIDTH: u32 = 1920;
 const MAX_HEIGHT: u32 = 1080;
 const MAX_BUF: usize = (MAX_WIDTH * MAX_HEIGHT * BPP) as usize;
+
+/// 校验帧尺寸并计算期望字节数（纯函数，可宿主单测）。
+/// 上限校验先于 u32 乘法，杜绝大入参回绕绕过校验（审查 M-f）。
+fn checked_frame_len(width: u32, height: u32) -> Option<usize> {
+    if width > MAX_WIDTH || height > MAX_HEIGHT {
+        return None;
+    }
+    Some((width * height * BPP) as usize)
+}
 /// 头部大小（64 字节对齐，含 pad）。
 const HEADER_LEN: usize = 64;
 
@@ -112,17 +121,21 @@ impl SharedFrameChannel {
                 io::Error::from_raw_os_error(e.code().0)
             })?;
 
-        // 首个创建者写入魔数。
+        // 首个创建者初始化头部。魔数是「已初始化」标志，必须**最后**写：
+        // 其余打开者凭 magic == MAGIC 跳过初始化，若先写魔数，并发打开者
+        // 会在字段尚未清零时误判初始化完成、读到未初始化值（审查 M-f 附带）。
         // SAFETY: view 已映射且长度 >= HEADER_LEN，对齐由 Header 定义保证。
         let header = unsafe { &mut *view.Value.cast::<Header>() };
         if header.magic != MAGIC {
-            header.magic = MAGIC;
             header.width = 0;
             header.height = 0;
             header.stride = 0;
             header.buf_len = 0;
             header.seq = AtomicU32::new(0);
             header.ready = AtomicU32::new(0);
+            // Release 栅栏保证以上字段写入先于魔数对其他进程可见
+            std::sync::atomic::fence(Ordering::Release);
+            header.magic = MAGIC;
         }
 
         let mutex_name = to_wide(PUBLISH_MUTEX_NAME);
@@ -181,7 +194,15 @@ impl SharedFrameChannel {
                 "channel is not in writer mode",
             ));
         }
-        let expected = (width * height * BPP) as usize;
+        // 尺寸上限校验必须先于乘法：width*height*BPP 在 u32 域计算，未限幅的
+        // 入参（如 65535x65535）会先回绕再与 bgra.len() 比较，校验形同虚设、
+        // 还可能让 expected 小于真实帧长而越界写共享缓冲（审查 M-f）
+        let Some(expected) = checked_frame_len(width, height) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("frame too large: {width}x{height} (max {MAX_WIDTH}x{MAX_HEIGHT})"),
+            ));
+        };
         if bgra.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -193,12 +214,6 @@ impl SharedFrameChannel {
                     BPP,
                     expected
                 ),
-            ));
-        }
-        if width > MAX_WIDTH || height > MAX_HEIGHT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("frame too large: {width}x{height} (max {MAX_WIDTH}x{MAX_HEIGHT})"),
             ));
         }
 
@@ -343,5 +358,23 @@ mod tests {
         assert_eq!(WAIT_OBJECT_0_CODE, WAIT_OBJECT_0.0);
         assert_eq!(WAIT_ABANDONED_CODE, WAIT_ABANDONED.0);
         assert_eq!(WAIT_TIMEOUT_CODE, WAIT_TIMEOUT.0);
+    }
+
+    /// M-f 回归：尺寸上限校验必须先于 u32 乘法——超限输入返回 None，
+    /// 不得先回绕出一个"合法"字节数
+    #[test]
+    fn checked_frame_len_rejects_oversize_before_multiply() {
+        use super::{BPP, MAX_HEIGHT, MAX_WIDTH, checked_frame_len};
+        // 合法上限帧
+        assert_eq!(
+            checked_frame_len(MAX_WIDTH, MAX_HEIGHT),
+            Some((MAX_WIDTH * MAX_HEIGHT * BPP) as usize)
+        );
+        // 任一维度超限即拒绝
+        assert_eq!(checked_frame_len(MAX_WIDTH + 1, MAX_HEIGHT), None);
+        assert_eq!(checked_frame_len(MAX_WIDTH, MAX_HEIGHT + 1), None);
+        // u32 乘法必回绕的极端输入：debug 下也不得 panic
+        assert_eq!(checked_frame_len(u32::MAX, u32::MAX), None);
+        assert_eq!(checked_frame_len(65535, 65535), None);
     }
 }

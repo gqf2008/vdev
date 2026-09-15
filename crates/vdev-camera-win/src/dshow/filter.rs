@@ -229,20 +229,19 @@ impl IMediaFilter_Impl for VirtualCameraFilter_Impl {
     fn Pause(&self) -> windows_core::Result<()> {
         log::debug!("filter Pause");
         // 推源过滤器：Pause 时启动推流线程，送出预滚帧让下游渲染器完成 Pause。
-        self.start_streaming(0)?;
+        self.start_streaming()?;
         *self.inner.state.lock().unwrap() = FilterStateInternal::Paused;
         Ok(())
     }
 
     fn Run(&self, tstart: i64) -> windows_core::Result<()> {
         log::debug!("filter Run(tstart={tstart})");
-        let mut guard = self.inner.stream.lock().unwrap();
-        match guard.as_mut() {
-            Some(t) => t.set_tstart(tstart),
-            None => {
-                drop(guard);
-                self.start_streaming(tstart)?;
-            }
+        // 样本时间戳用本地流时间（从 0 递增），tstart（参考时钟起点）无需
+        // 下发给推流线程（审查 L7：原实现经原子量传递却从未被读取）。
+        let guard = self.inner.stream.lock().unwrap();
+        if guard.is_none() {
+            drop(guard);
+            self.start_streaming()?;
         }
         *self.inner.state.lock().unwrap() = FilterStateInternal::Running;
         Ok(())
@@ -286,7 +285,7 @@ impl IAMFilterMiscFlags_Impl for VirtualCameraFilter_Impl {
 }
 
 impl VirtualCameraFilter {
-    fn start_streaming(&self, tstart: i64) -> windows_core::Result<()> {
+    fn start_streaming(&self) -> windows_core::Result<()> {
         let mut guard = self.inner.stream.lock().unwrap();
         if guard.is_some() {
             return Ok(());
@@ -301,7 +300,7 @@ impl VirtualCameraFilter {
             // SAFETY: COM 方法调用。
             unsafe { conn.allocator.Commit() }?;
         }
-        *guard = Some(streaming::start_stream(self.inner.clone(), tstart));
+        *guard = Some(streaming::start_stream(self.inner.clone()));
         log::debug!("stream thread started");
         Ok(())
     }

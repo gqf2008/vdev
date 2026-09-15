@@ -129,7 +129,8 @@ pub struct OutputPin {
     pub inner: Arc<PinInner>,
 }
 
-/// 校验媒体类型并转换为 [`VideoFormat`]（仅接受我们支持的 RGB32 格式）。
+/// 校验媒体类型并转换为 [`VideoFormat`]（仅接受我们支持的 YUY2 格式，
+/// 见 `media_type::FORMATS`——实际输出一直是 YUY2，此处注释此前误写 RGB32，审查 L8）。
 fn accepted_format(pmt: *const AM_MEDIA_TYPE) -> Option<VideoFormat> {
     if pmt.is_null() {
         return None;
