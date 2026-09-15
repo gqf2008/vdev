@@ -73,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-mic-live-e2e.p
 powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -VdevInstance 0001 -RefInstance 0000
 ```
 
-没有物理麦克风时用「立体声混音 / Stereo Mix」当信号源（`-Input`、`-ToneEndpoint` 可改）：往真实声卡播 1 kHz 正弦，由混音端采回，穿过整条链路。本机实测基线：
+没有物理麦克风时用「立体声混音 / Stereo Mix」当信号源（`-InputDevice`、`-ToneEndpoint` 可改）：往真实声卡播 1 kHz 正弦，由混音端采回，穿过整条链路。本机实测基线：
 
 | 项目 | 实测 |
 |---|---|
@@ -81,7 +81,61 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -
 | 环回链路的电平 | 峰值 **−6.02 dBFS**（0.5 幅度正弦理论值） |
 | mic-agent：数字探针 p50 | **10.16 ms** |
 | mic-agent：完整降噪 20 s 实时 | 帧时 p50 **26.8 µs**、CPU **0.156 %**（单核） |
-| 直通 vs 降噪 A/B | **−5.8 → −34.1 dBFS** |
+| 直通 vs 降噪 A/B | ~~−5.8 → −34.1 dBFS~~（见下方修正：该数是自反馈环，不是物理链路） |
+
+### ⚠ 2026-09-15 复测修正（两条真 bug）
+
+1. **脚本参数名踩了 PowerShell 自动变量。** `audio-mic-live-e2e.ps1` / `audio-ring-delay.ps1` 的
+   `-Input` 与自动变量 `$Input` 同名，在函数作用域里它求值为「空枚举」，于是传给 agent 的是
+   `--input ""`；空串被任何设备名 `contains` 命中 ⇒ 选到枚举出的第一个采集端点，本机正是
+   `Microphone (vdev 虚拟声卡)` **本身**。也就是说上表最后一行量的是 **agent 的自反馈环**，
+   不是「物理声源 → agent → 虚拟麦克风」。已改名为 `-InputDevice`，并加了硬断言
+   （采集端点 == vdev 设备即判不通过）。同时修了带空格取值的引号问题
+   （`Start-Process -ArgumentList` 不会替我们加引号，`--input Stereo Mix` 会被切出多余的 `Mix`）。
+2. **agent 的 Windows live 通路样本标度是错的（已修）。** crate 内部约定样本是 **int16 标度**
+   （±32768，`wavio` / `metrics` / RNNoise 的口径），而 WASAPI 共享模式交付/消费的是
+   `[-1,1]` float；`drain_capture` / `fill_render_ring` 在边界两侧都没换算，于是喂给模型的信号
+   比训练分布低约 90 dB（VAD 形同失效）。实测症状：`--record-in` / `--record-out` 两个 WAV
+   **全是数字静音**，注入电平同错。另有一处编码校验缺口：`check_mix_format` 只查了
+   `wBitsPerSample == 32`（容器位数），而 32bit 容器也可能是 32bit **PCM 整型**。
+   均已在 main `179480e` 修掉（入口 ×32768、上环前 ÷32768；按 `wFormatTag` / `SubFormat`
+   拒绝非 IEEE float 的端点）。
+   ⚠ **更正**：这两条症状**不是**"端点走 16bit PCM"——`GetMixFormat` 实测就是 IEEE float
+   32bit / 2ch / 48k（注册表里的 16bit 是设备格式，引擎自己会转）。
+   帧时/CPU 与标度无关，一直有效。
+
+设备侧单独复测（2026-09-15，这三条可信）：
+
+| 项目 | 实测 |
+|---|---|
+| 驱动状态 | `testsigning Yes`、服务 `vdev_audio` RUNNING、设备 `ROOT\MEDIA\0001` Started（0.3.10.0） |
+| vdev 端点 | `Speakers (vdev 虚拟声卡)` + `Microphone (vdev 虚拟声卡)` 均 Active |
+| 驱动环回电平（`inject --endpoint vdev` + `capture --endpoint vdev`，0.5 幅度 1 kHz） | peak **−6.0201 dBFS**（理论 −6.0206），rms −13.06 |
+| agent live 20 s（真实 WASAPI 设备） | 帧 2000、**drop 0**、帧时 p99 **45 µs**、CPU **0.078 %**（单核） |
+
+### 2026-09-16 复跑：agent 修好了，瓶颈转到驱动的环回
+
+**agent 侧（M-g / L9）已验证**：`cargo test -p vdev-mic-agent` **46 passed / 0 failed**
+（原 27 + 新增 19），`cargo check -p vdev-mic-agent --target x86_64-apple-darwin` 通过。
+标度不再是问题 —— 用 vdev 环回当已知源（0.5 幅度 1 kHz，理论 peak −6.02 dBFS）跑 agent 直通，
+`--record-in` 与 `--record-out` 两路一致：peak **−4.97** / rms **−10.83 dBFS**
+（不再是数字静音，也没有削顶）；环回干净的轮次里，设备读数与源逐 dB 对齐
+（源 peak −30.81 → vdev 麦克风 peak −30.82）。数字探针 p50 **10.22 ms**（复现 10.16 ms 基线）。
+
+**但 `vdev-audio-win` 的环回本身不稳定，且只用 CLI 就能复现**（`vdev-mic-agent` 完全不参与）：
+
+| `inject --endpoint vdev` + `capture --endpoint vdev`，连跑 5 轮 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| 实测 peak | −6.02 ✅ | −6.02 ✅ | **−0.06** ❌ | **−0.06** ❌ | **−0.06** ❌ |
+
+- 坏读数**与注入幅度无关**：amplitude 0.10 / 0.25 / 0.50 都得到同一个坏电平（−1.8 / −0.27 / −0.06 dBFS），
+  说明不是"增益偏大"，是信号被破坏；
+- 频谱上是被**硬削顶的 1 kHz**（基频 −20 dB、3 kHz 分量 −17 dB 更高，过零率 ≈7 kHz）；
+- **一旦翻坏就持续坏**；驱动服务与设备都还是 RUNNING/Started。
+
+所以这条链路上现在的瓶颈是**驱动环回**，不是 agent。在它修好之前，
+`audio-mic-live-e2e.ps1` 输出的「vdev 麦克风」列不可信（本脚本已加 `Assert-Loopback`：
+自检偏差 >3 dB 即判不通过）。
 
 ## 文档体检
 
