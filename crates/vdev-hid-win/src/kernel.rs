@@ -1,6 +1,7 @@
 //! vdev-hid-win 内核路线（路线 B）：虚拟 HID 内核驱动的安装/状态与报告注入。
 //! 安装/卸载/状态走 SetupAPI（HIDClass，Root\vdev-hid[-mouse]）；注入经 HID 接口
-//! WriteFile 8 字节键盘 / 4 字节鼠标报告（厂商输出管道），由驱动投递给 hidclass。
+//! `HidD_SetFeature` 写 8 字节键盘 / 4 字节鼠标 Feature 报告（厂商 Feature 管道），
+//! 由驱动投递给 hidclass（WriteFile 输出报告仅作兜底，系统通常会拒绝）。
 //!
 //! 纯逻辑（键码映射/报告组装/HWID 匹配）在 `crate::report`（windows-free，可宿主单测），
 //! 本模块经重导出保持既有调用面不变。本模块整体仅 Windows 可编译（SetupAPI/WMI）。
@@ -505,7 +506,7 @@ pub fn status() -> Result<DeviceStatus> {
     })
 }
 
-// ---------------- 报告注入（经 HID 接口 WriteFile） ----------------
+// ---------------- 报告注入（经 HID 接口 HidD_SetFeature，WriteFile 兜底） ----------------
 
 /// 按 VID/PID 收集 vdev 虚拟键盘/鼠标的**全部** HID 接口路径。
 ///
@@ -671,9 +672,12 @@ fn write_report_to(path: &str, report: &[u8]) -> Result<()> {
         let mut written = 0u32;
         ok = unsafe { WriteFile(handle, Some(report), Some(&mut written), None) }.is_ok();
     }
+    // L6：last-error 必须在 CloseHandle 之前取——CloseHandle 可能改写线程的
+    // last-error，失败原因会被覆盖成无关错误码
+    let last_err = windows::core::Error::from_win32();
     unsafe { CloseHandle(handle) }.ok();
     if !ok {
-        bail!("写入 HID 报告失败：{}", windows::core::Error::from_win32());
+        bail!("写入 HID 报告失败：{last_err}");
     }
     Ok(())
 }

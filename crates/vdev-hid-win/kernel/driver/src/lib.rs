@@ -8,9 +8,11 @@
 //! - `EvtDevicePrepareHardware` 里用 `VhfCreate` + `VhfStart` 各创建一个虚拟 HID 设备：
 //!   报告描述符与 VID/PID 交给系统 VHF（vhf.sys），由 hidclass 枚举成真实 HID 设备并
 //!   发布 HID 设备接口；`EvtDeviceReleaseHardware` 里 `VhfDelete` 回收。
-//! - 注入沿用"厂商输出报告"管道：用户态对 HID 接口 `WriteFile` 写 8 字节（键盘）/
-//!   4 字节（鼠标）报告 → hidclass → VHF 的 WriteReport 回调 → 驱动把同一份字节作为
-//!   **输入报告**用 `VhfReadReportSubmit` 交回，成为系统输入事件（与真实键鼠无异）。
+//! - 注入沿用"厂商 Feature 报告"管道：用户态对 HID 接口 `HidD_SetFeature` 写 8 字节
+//!   （键盘）/ 4 字节（鼠标）Feature 报告 → hidclass → VHF 的
+//!   `EvtVhfAsyncOperationSetFeature` 回调 → 驱动把同一份字节作为**输入报告**用
+//!   `VhfReadReportSubmit` 交回，成为系统输入事件（与真实键鼠无异）。
+//!   （系统对键盘/鼠标 TLC 的输出报告写入一律拒绝，故不走 WriteFile/WriteReport。）
 //!
 //! ## 为什么不用 mshidkmdf 路线（上游原设计；本机 Win10 19045 实测结论）
 //!
@@ -397,7 +399,7 @@ unsafe extern "C" fn evt_self_managed_io_cleanup(device: WDFDEVICE) {
     }
 }
 
-// ---------------- 注入：写厂商输出报告 → 交回输入报告 ----------------
+// ---------------- 注入：写厂商 Feature 报告 → 交回输入报告 ----------------
 
 /// VHF Feature 报告回调（SetFeature）：hidclass 收到 HID 客户端设置的 Feature 报告
 /// （用户态 `HidD_SetFeature`）。
@@ -423,7 +425,7 @@ unsafe extern "C" fn evt_vhf_report_in(
     }
 }
 
-/// 取 WriteReport 包里的报告字节，按角色原样作为**输入报告**交回 VHF。
+/// 取 SetFeature 传输包里的报告字节，按角色原样作为**输入报告**交回 VHF。
 ///
 /// # Safety
 /// `packet` 由 VHF 在回调期间提供；本函数检查空指针与长度。
