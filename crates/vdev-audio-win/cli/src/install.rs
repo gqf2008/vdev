@@ -1,4 +1,9 @@
 //! 虚拟声卡驱动安装 / 卸载 / 状态（SetupAPI，Media 类，Root\vdev-audio）。
+//!
+//! 卸载路径与 `vdev-hid-win/src/kernel.rs` 同款（CfgMgr 重试、wait_gone 轮询、
+//! pnputil 兜底、零残留断言）：真机实测 `CM_Query_And_Remove_SubTreeW` 会
+//! 返回 `CR_SUCCESS` 而节点仍在设备树（"假成功"），只看返回值就把幽灵节点
+//! 留给下一次 install（见 LESSON_CM移除设备返回成功不等于节点消失）。
 
 use std::path::Path;
 
@@ -57,11 +62,35 @@ fn read_multi_sz(
         .collect::<Vec<u16>>()
 }
 
-fn wide_contains(haystack: &[u16], needle: &str) -> bool {
+fn ascii_lower_u16(c: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&c) {
+        c + 0x20
+    } else {
+        c
+    }
+}
+
+/// REG_MULTI_SZ 硬件 ID 精确匹配：逐段（NUL 分隔）整段不区分大小写相等。
+/// 与 hid 侧 `report::hwid_matches` 同款（审查 L1 修复）：原实现 `wide_contains`
+/// 做子串匹配，`Root\vdev-audio` 会误中 `Root\vdev-audio-extra` 之类前缀兄弟。
+fn hwid_matches(haystack: &[u16], needle: &str) -> bool {
     let needle: Vec<u16> = needle.encode_utf16().collect();
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle.as_slice())
+    let mut start = 0usize;
+    for (i, &ch) in haystack.iter().enumerate() {
+        if ch == 0 {
+            let part = &haystack[start..i];
+            if part.len() == needle.len()
+                && part
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(a, b)| ascii_lower_u16(*a) == ascii_lower_u16(*b))
+            {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    false
 }
 
 /// 读取设备信息元素的设备实例 ID（如 `ROOT\MEDIA\0000`）。
@@ -88,6 +117,19 @@ fn get_instance_id(devs: HDEVINFO, info: &SP_DEVINFO_DATA) -> Result<String> {
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// 打开 Media 类设备集合（flags=0：含非 present 残留节点）
+fn open_class_devices() -> Result<HDEVINFO> {
+    unsafe {
+        SetupDiGetClassDevsW(
+            Some(&GUID_DEVCLASS_MEDIA),
+            None,
+            None,
+            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
+        )
+    }
+    .context("SetupDiGetClassDevsW failed")
 }
 
 /// 在调用方自己的设备信息集合上按实例 ID 重新打开设备，
@@ -122,15 +164,7 @@ fn open_device(devs: HDEVINFO, instance_id: &str) -> Result<SP_DEVINFO_DATA> {
 /// 集合销毁后配到别的集合上用违反 SetupAPI 契约（元素属于传入集合）；
 /// 调用方应建立自己的集合并用 [`open_device`] 重新打开。
 fn find_device() -> Result<Option<String>> {
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_MEDIA),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
-    }
-    .context("SetupDiGetClassDevsW failed")?;
+    let devs = open_class_devices()?;
     let found = (|| -> Result<Option<String>> {
         let mut found = None;
         let mut index = 0u32;
@@ -144,7 +178,7 @@ fn find_device() -> Result<Option<String>> {
             }
             index += 1;
             let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-            if wide_contains(&hwids, HARDWARE_ID) {
+            if hwid_matches(&hwids, HARDWARE_ID) {
                 found = Some(get_instance_id(devs, &info)?);
                 break;
             }
@@ -155,18 +189,10 @@ fn find_device() -> Result<Option<String>> {
     found
 }
 
-/// 移除所有 vdev-audio 设备节点
-fn remove_all_nodes() -> Result<usize> {
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_MEDIA),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
-    }
-    .context("SetupDiGetClassDevsW failed")?;
-    let mut to_remove: Vec<SP_DEVINFO_DATA> = Vec::new();
+/// 枚举 Media 类下所有 vdev-audio 节点。`remove_all_nodes` 与卸载后的
+/// "无残留"断言共用，避免两处枚举逻辑漂移（与 hid 侧同款结构）。
+fn collect_vdev_nodes(devs: HDEVINFO) -> Vec<SP_DEVINFO_DATA> {
+    let mut out: Vec<SP_DEVINFO_DATA> = Vec::new();
     let mut index = 0u32;
     loop {
         let mut info = SP_DEVINFO_DATA {
@@ -178,15 +204,152 @@ fn remove_all_nodes() -> Result<usize> {
         }
         index += 1;
         let hwids = read_multi_sz(devs, &info, SPDRP_HARDWAREID);
-        if wide_contains(&hwids, HARDWARE_ID) {
-            to_remove.push(info);
+        if hwid_matches(&hwids, HARDWARE_ID) {
+            out.push(info);
         }
     }
-    for info in &mut to_remove {
-        remove_subtree(info)?;
+    out
+}
+
+/// 当前 vdev-audio 节点的实例 ID 列表（如 `ROOT\MEDIA\0007`）。
+///
+/// 这是"节点是否真的消失"的唯一可信判据：真机实测 `CM_Query_And_Remove_SubTreeW`
+/// 会返回 `CR_SUCCESS` 而节点**仍然留在设备树里**（随后 `install` 又建一个，
+/// 反复装卸就把节点堆起来），所以删除后必须按实例 ID 轮询确认。
+pub fn vdev_instance_ids() -> Result<Vec<String>> {
+    let devs = open_class_devices()?;
+    let nodes = collect_vdev_nodes(devs);
+    let mut out = Vec::with_capacity(nodes.len());
+    for info in &nodes {
+        let mut id_buf = [0u16; 512];
+        // SAFETY: info.DevInst 来自枚举；id_buf 可写且有长度
+        let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+        if cr != CR_SUCCESS {
+            continue;
+        }
+        let end = id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len());
+        out.push(String::from_utf16_lossy(&id_buf[..end]));
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    Ok(to_remove.len())
+    Ok(out)
+}
+
+/// 轮询等待某个实例 ID 从设备树消失（最多 `tries` × 500ms）
+fn wait_gone(instance_id: &str, tries: usize) -> Result<bool> {
+    for _ in 0..tries {
+        if !vdev_instance_ids()?
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(instance_id))
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(false)
+}
+
+/// 移除所有 vdev-audio 设备节点（逐节点重试 + pnputil 兜底，单点失败不中断整轮）。
+///
+/// 用配置管理器（CfgMgr）移除整棵子树：DIF_REMOVE 那条路在本机不可用——
+/// `SetupDiSetDeviceInstallParamsW` 强转 `SP_REMOVEDEVICE_PARAMS` 报 0x800706F8
+/// （与 HID、显示器两侧实测同款结论，RULE_Windows驱动CLI卸载禁用DIF_REMOVE改用CfgMgr）。
+///
+/// 审查 M-c 修复：原实现只看 `CM_Query_And_Remove_SubTreeW` 返回值，而真机上 CM
+/// 会假成功（返回 CR_SUCCESS 节点仍在），且单个节点失败就 bail 整轮；现与 hid 侧
+/// 同款：逐节点 CfgMgr 最多 3 轮 → 以 wait_gone（实例 ID 轮询）为准 → pnputil
+/// 兜底 → 失败汇总，宁可非零退出也不静默留幽灵节点。
+fn remove_all_nodes() -> Result<usize> {
+    let devs = open_class_devices()?;
+    let to_remove = collect_vdev_nodes(devs);
+    let mut removed = 0usize;
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for info in &to_remove {
+        let mut id_buf = [0u16; 512];
+        // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+        let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+        if cr != CR_SUCCESS {
+            failures.push((
+                String::from("<unknown>"),
+                format!("CM_Get_Device_IDW 0x{:08X}", cr.0),
+            ));
+            continue;
+        }
+        let instance_id = String::from_utf16_lossy(
+            &id_buf[..id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len())],
+        );
+        let mut devinst = 0u32;
+        // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
+        let cr = unsafe {
+            CM_Locate_DevNodeW(
+                &mut devinst,
+                PCWSTR(id_buf.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        if cr != CR_SUCCESS {
+            failures.push((instance_id, format!("CM_Locate_DevNodeW 0x{:08X}", cr.0)));
+            continue;
+        }
+
+        // 1) CfgMgr 直删，最多 3 轮：ERROR_NOT_READY 多为瞬时状态，等一拍再来。
+        // SAFETY: devinst 有效；不关心 veto 详情
+        let mut last = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        for _ in 0..2 {
+            if last == CR_SUCCESS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // SAFETY: 同上
+            last = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
+        }
+        // **以"节点真的消失"为准**，不看 CM 的返回值（真机假成功实测）。
+        if wait_gone(&instance_id, 4)? {
+            removed += 1;
+            continue;
+        }
+
+        // 2) 兜底：pnputil /remove-device（hid 侧实测能真正删掉这类节点）。
+        let alt = std::process::Command::new("pnputil")
+            .args(["/remove-device", &instance_id])
+            .output();
+        match alt {
+            Ok(out) if out.status.success() => {
+                if wait_gone(&instance_id, 4)? {
+                    println!(
+                        "  （CfgMgr 回 0x{:08X} 但节点未消失，已用 pnputil 兜底移除）",
+                        last.0
+                    );
+                    removed += 1;
+                } else {
+                    failures.push((instance_id, "pnputil 报成功但节点仍在".to_string()));
+                }
+            }
+            Ok(out) => failures.push((
+                instance_id,
+                format!(
+                    "CfgMgr 0x{:08X}；pnputil exit={:?} {}",
+                    last.0,
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            )),
+            Err(e) => failures.push((
+                instance_id,
+                format!("CfgMgr 0x{:08X}；pnputil 无法执行: {e}", last.0),
+            )),
+        }
+    }
+    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+    if !failures.is_empty() {
+        for (id, why) in &failures {
+            eprintln!("  ! 未能移除 {id}：{why}");
+        }
+        bail!(
+            "有 {} 个 vdev-audio 设备节点未能移除（管理员权限？设备被占用？）",
+            failures.len()
+        );
+    }
+    Ok(removed)
 }
 
 /// 安装驱动：清理旧节点 + 创建设备节点 + DiInstallDriverW 装入驱动存储
@@ -235,7 +398,10 @@ pub fn install(inf_dir: &Path) -> Result<()> {
             .copied()
             .chain(std::iter::once(0))
             .collect();
-        let create_res = unsafe {
+        // 审查 L2 修复：删除 0xE0000207 → SetupDiOpenDeviceInfoW(类名) 的"死路径"
+        // 回退——SetupDiOpenDeviceInfoW 要的是设备实例 ID，类名永远打不开设备
+        // （display 侧同款回退已标"死路径"并移除）；创建失败直接如实报错。
+        unsafe {
             SetupDiCreateDeviceInfoW(
                 devs,
                 windows::core::PCWSTR(class_name_cstr.as_ptr()),
@@ -245,23 +411,8 @@ pub fn install(inf_dir: &Path) -> Result<()> {
                 DICD_GENERATE_ID,
                 Some(&mut dev_info),
             )
-        };
-        match create_res {
-            Ok(()) => {}
-            Err(e) if e.code().0 as u32 == 0xE0000207 => {
-                unsafe {
-                    SetupDiOpenDeviceInfoW(
-                        devs,
-                        windows::core::PCWSTR(class_name_cstr.as_ptr()),
-                        None,
-                        0,
-                        Some(&mut dev_info),
-                    )
-                }
-                .with_context(|| "SetupDiOpenDeviceInfoW failed")?;
-            }
-            Err(e) => return Err(e).context("SetupDiCreateDeviceInfoW failed"),
         }
+        .context("SetupDiCreateDeviceInfoW failed")?;
         let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
         hwid.push(0);
         hwid.push(0);
@@ -305,69 +456,33 @@ pub fn install(inf_dir: &Path) -> Result<()> {
     result
 }
 
-/// 卸载：移除 Root\vdev-audio 设备节点。返回是否找到并移除。
+/// 卸载：移除全部 Root\vdev-audio 残留节点，并断言零残留（有残留非零退出）。
+/// 返回是否找到并移除。
 pub fn uninstall() -> Result<bool> {
-    let Some(instance_id) = find_device()? else {
+    let removed = remove_all_nodes()?;
+    if removed == 0 {
         println!("未找到 vdev 虚拟声卡设备");
         return Ok(false);
-    };
-
-    // 与 find_device 同域（flags=0，含非 present 残留），保证找到的实例一定能在此
-    // 集合里重新打开；Windows 运行时行为（SetupAPI + DIF_REMOVE），无法在 macOS 交叉环境单测
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_MEDIA),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
     }
-    .context("SetupDiGetClassDevsW failed")?;
-
-    let result = (|| -> Result<()> {
-        let dev_info = open_device(devs, &instance_id)?;
-        remove_subtree(&dev_info)?;
-        Ok(())
-    })();
-
-    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    result?;
-    println!("已移除 vdev 虚拟声卡设备");
+    println!("已移除 {removed} 个 vdev 虚拟声卡设备节点");
+    // 事后断言：真的没有残留（节点移除是异步的，给它最多 ~3s）。真机上出现过
+    // "报成功但节点还在"——宁可让 CLI 非零退出，也不要静默留幽灵节点。
+    let mut left = vdev_instance_ids()?;
+    for _ in 0..6 {
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        left = vdev_instance_ids()?;
+    }
+    if !left.is_empty() {
+        bail!(
+            "卸载后仍有 {} 个 vdev-audio 节点残留：{}（可能被占用，请重试或重启后重试）",
+            left.len(),
+            left.join(", ")
+        );
+    }
     Ok(true)
-}
-
-/// 用配置管理器（CfgMgr）移除设备子树。
-///
-/// 不用 `DIF_REMOVE`：`SetupDiSetDeviceInstallParamsW` 强转 `SP_REMOVEDEVICE_PARAMS`
-/// 在本机必然报 `0x800706F8`（ERROR_INVALID_USER_BUFFER）——与 HID、显示器两侧
-/// 实测同款结论（显示器侧已在 `fix(win-display)` 换成 CfgMgr）。这里沿用
-/// neflib/nefcon 同款做法：`CM_Get_Device_IDW` → `CM_Locate_DevNodeW` →
-/// `CM_Query_And_Remove_SubTreeW`。
-fn remove_subtree(info: &SP_DEVINFO_DATA) -> Result<()> {
-    let mut id_buf = [0u16; 512];
-    // SAFETY: info.DevInst 来自 SetupDi* 枚举；id_buf 可写且有长度
-    let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
-    if cr != CR_SUCCESS {
-        bail!("CM_Get_Device_IDW failed: 0x{:08X}", cr.0);
-    }
-    let mut devinst = 0u32;
-    // SAFETY: id_buf 以 NUL 结尾（CM_Get_Device_IDW 保证）
-    let cr = unsafe {
-        CM_Locate_DevNodeW(
-            &mut devinst,
-            PCWSTR(id_buf.as_ptr()),
-            CM_LOCATE_DEVNODE_NORMAL,
-        )
-    };
-    if cr != CR_SUCCESS {
-        bail!("CM_Locate_DevNodeW failed: 0x{:08X}", cr.0);
-    }
-    // SAFETY: devinst 有效；不关心 veto 详情
-    let cr = unsafe { CM_Query_And_Remove_SubTreeW(devinst, None, None, 0) };
-    if cr != CR_SUCCESS {
-        bail!("CM_Query_And_Remove_SubTreeW failed: 0x{:08X}", cr.0);
-    }
-    Ok(())
 }
 
 /// 设备状态
@@ -390,15 +505,7 @@ pub fn status() -> Result<DeviceStatus> {
 
     // 与 find_device 同域（flags=0），在自己集合上按实例 ID 重新打开后再读属性；
     // Windows 运行时行为（SetupAPI 注册表属性读取），无法在 macOS 交叉环境单测
-    let devs = unsafe {
-        SetupDiGetClassDevsW(
-            Some(&GUID_DEVCLASS_MEDIA),
-            None,
-            None,
-            SETUP_DI_GET_CLASS_DEVS_FLAGS(0),
-        )
-    }
-    .context("SetupDiGetClassDevsW failed")?;
+    let devs = open_class_devices()?;
 
     let result = (|| -> Result<DeviceStatus> {
         let dev_info = open_device(devs, &instance_id)?;
@@ -435,4 +542,38 @@ pub fn status() -> Result<DeviceStatus> {
 
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn multi(parts: &[&str]) -> Vec<u16> {
+        let mut v: Vec<u16> = Vec::new();
+        for p in parts {
+            v.extend(p.encode_utf16());
+            v.push(0);
+        }
+        v.push(0);
+        v
+    }
+
+    /// L1 回归：硬件 ID 精确分段匹配（子串实现会误中前缀兄弟）
+    #[test]
+    fn hwid_matches_exact_segment_case_insensitive() {
+        let ids = multi(&[r"Root\vdev-audio", r"ROOT\OTHER"]);
+        assert!(hwid_matches(&ids, r"Root\vdev-audio"));
+        // 大小写不敏感（Windows 硬件 ID 比较语义）
+        assert!(hwid_matches(&ids, r"root\VDEV-AUDIO"));
+    }
+
+    #[test]
+    fn hwid_rejects_prefix_sibling() {
+        // 子串实现会把 `Root\vdev-audio-extra` 误判为命中
+        let ids = multi(&[r"Root\vdev-audio-extra"]);
+        assert!(!hwid_matches(&ids, r"Root\vdev-audio"));
+        // 也不能中更短的公共前缀
+        let ids2 = multi(&[r"Root\vdev"]);
+        assert!(!hwid_matches(&ids2, r"Root\vdev-audio"));
+    }
 }

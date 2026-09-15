@@ -185,7 +185,10 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后退出。
+/// 非管理员时以 UAC 重新启动自身执行同一命令，等待完成后以其退出码退出。
+///
+/// 修复记录（审查 M-d，对照 PR #21 display 侧与 hid 侧同款修复）：原实现
+/// 等待提权子进程后无条件 `exit(0)`，UAC 被取消或子进程失败都静默报成功。
 #[cfg(windows)]
 fn ensure_elevated() -> Result<()> {
     // SAFETY: IsUserAnAdmin 只读当前令牌
@@ -221,9 +224,32 @@ fn ensure_elevated() -> Result<()> {
     unsafe { windows::Win32::UI::Shell::ShellExecuteExW(&mut sei) }
         .context("请求管理员权限失败（请以管理员身份重试）")?;
     if !sei.hProcess.is_invalid() {
+        // SAFETY: SEE_MASK_NOCLOSEPROCESS 使 ShellExecuteExW 返回子进程句柄
         unsafe { windows::Win32::System::Threading::WaitForSingleObject(sei.hProcess, u32::MAX) };
+        let mut code: u32 = 0;
+        // SAFETY: 句柄有效且已等待其退出
+        let got = unsafe {
+            windows::Win32::System::Threading::GetExitCodeProcess(sei.hProcess, &mut code)
+        };
+        // SAFETY: 关闭自有句柄，避免泄漏
+        unsafe { windows::Win32::Foundation::CloseHandle(sei.hProcess) }.ok();
+        std::process::exit(elevated_exit_code(true, got.is_ok(), code));
     }
-    std::process::exit(0);
+    // ShellExecuteExW 成功却未见子进程句柄（SEE_MASK_NOCLOSEPROCESS 下属意外）：
+    // 无法等待/回传提权子进程结果，按失败退出（禁止静默当成功）。
+    eprintln!("警告：ShellExecuteExW 已成功但未返回提权子进程句柄，无法回传其退出码");
+    std::process::exit(elevated_exit_code(false, false, 0));
+}
+
+/// 提权子进程结果 → 本进程退出码（纯函数，宿主可单测；与 hid 侧同款）：
+/// 句柄有效且 GetExitCodeProcess 成功 → 原样回传子进程退出码；
+/// 未拿到句柄或查询失败 → 1（结果无法回传即按失败，禁止静默当成功）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn elevated_exit_code(handle_valid: bool, query_ok: bool, child_code: u32) -> i32 {
+    if !handle_valid || !query_ok {
+        return 1;
+    }
+    child_code as i32
 }
 
 /// Windows 命令行参数转义：含空白/引号/为空的参数用双引号包裹，
@@ -294,5 +320,18 @@ mod tests {
         assert_eq!(quote_arg(r"a\b"), r"a\b");
         // 引号与收尾反斜杠组合：2n+1 与 2n 规则同时生效
         assert_eq!(quote_arg(r#"say "hi"\"#), "\"say \\\"hi\\\"\\\\\"");
+    }
+
+    /// M-d 回归：提权子进程结果无法回传时退出码必须非 0。修复前等待后
+    /// 无条件 exit(0)，UAC 取消/子进程失败都静默报成功。
+    #[test]
+    fn elevated_exit_code_is_nonzero_when_child_result_unavailable() {
+        // 子进程成功 → 原样回传 0；非零（如 3010 REBOOT_REQUIRED）原样回传
+        assert_eq!(elevated_exit_code(true, true, 0), 0);
+        assert_eq!(elevated_exit_code(true, true, 3010), 3010);
+        // 查询子进程退出码失败 → 按失败
+        assert_eq!(elevated_exit_code(true, false, 0), 1);
+        // 句柄意外无效 → 按失败（修复前此处等价返回 0）
+        assert_eq!(elevated_exit_code(false, false, 0), 1);
     }
 }

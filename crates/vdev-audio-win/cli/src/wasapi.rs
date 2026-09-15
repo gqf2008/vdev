@@ -48,28 +48,43 @@ struct Endpoint {
 
 impl Endpoint {
     /// 打开共享模式客户端 + 混音格式
-    fn open(&self) -> Result<(IAudioClient, *mut WAVEFORMATEX, SampleFmt, u16, u32)> {
+    fn open(&self) -> Result<(IAudioClient, MixFormatPtr, SampleFmt, u16, u32)> {
         // SAFETY: 调用方持有有效 IMMDevice；返回的接口指针由 windows crate 管理
         unsafe {
             let client: IAudioClient = self
                 .device
                 .Activate(CLSCTX_ALL, None)
                 .with_context(|| format!("Activate(IAudioClient) 失败：{}", self.name))?;
-            let fmt = client.GetMixFormat().context("GetMixFormat 失败")?;
-            let kind = detect_format(fmt)?;
+            let fmt = MixFormatPtr(client.GetMixFormat().context("GetMixFormat 失败")?);
+            let kind = detect_format(fmt.0)?;
             // 只取前 18 字节里需要的两个字段（WAVEFORMATEX 本身是 packed，按值拷贝安全）
-            let wf = *fmt;
+            let wf = *fmt.0;
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
                     0,
                     10_000_000, // 1s 缓冲（hns）
                     0,
-                    fmt,
+                    fmt.0,
                     None,
                 )
                 .context("IAudioClient::Initialize(shared) 失败（端点是否可用？）")?;
             Ok((client, fmt, kind, wf.nChannels, wf.nSamplesPerSec))
+        }
+    }
+}
+
+/// `GetMixFormat` 的 CoTaskMem 分配守卫（审查 L4 修复）：原实现只在 inject/capture
+/// 的成功路径 `CoTaskMemFree`，中途任何 `?` 早退都泄漏这份分配；RAII 保证所有出口释放。
+struct MixFormatPtr(*mut WAVEFORMATEX);
+
+impl Drop for MixFormatPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: 指针来自 GetMixFormat（CoTaskMemAlloc），本守卫是唯一释放点
+            unsafe {
+                windows::Win32::System::Com::CoTaskMemFree(Some(self.0.cast_const().cast()));
+            }
         }
     }
 }
@@ -237,7 +252,7 @@ pub fn inject(
     duration: f64,
 ) -> Result<InjectReport> {
     let ep = find_endpoint(eRender, name_filter)?;
-    let (client, fmt, kind, channels, rate) = ep.open()?;
+    let (client, _fmt, kind, channels, rate) = ep.open()?;
     let buf_frames = unsafe { client.GetBufferSize() }.context("GetBufferSize 失败")?;
     let render: IAudioRenderClient = unsafe { client.GetService() }.context("GetService 失败")?;
 
@@ -291,7 +306,7 @@ pub fn inject(
             written += u64::from(n);
         }
         client.Stop().context("Stop 失败")?;
-        windows::Win32::System::Com::CoTaskMemFree(Some(fmt.cast()));
+        // fmt（MixFormatPtr）随作用域结束自动 CoTaskMemFree，含所有早退路径
         Ok(InjectReport {
             endpoint: ep.name,
             endpoint_id: ep.id,
@@ -311,7 +326,7 @@ pub fn capture(
     wav_path: Option<&std::path::Path>,
 ) -> Result<CaptureReport> {
     let ep = find_endpoint(eCapture, name_filter)?;
-    let (client, fmt, kind, channels, rate) = ep.open()?;
+    let (client, _fmt, kind, channels, rate) = ep.open()?;
     let cap: IAudioCaptureClient = unsafe { client.GetService() }.context("GetService 失败")?;
     let ch = usize::from(channels);
     let mut kept: Vec<f32> = Vec::new();
@@ -347,7 +362,7 @@ pub fn capture(
             cap.ReleaseBuffer(got).context("ReleaseBuffer 失败")?;
         }
         client.Stop().context("Stop 失败")?;
-        windows::Win32::System::Com::CoTaskMemFree(Some(fmt.cast()));
+        // fmt（MixFormatPtr）随作用域结束自动 CoTaskMemFree，含所有早退路径
     }
     let (rms, peak) = crate::wav::rms_peak(&kept);
     let mut saved = None;

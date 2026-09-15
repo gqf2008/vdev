@@ -3,6 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::com::{interlocked_decrement, interlocked_increment};
 use crate::miniport::MiniportWaveRT;
@@ -82,8 +83,8 @@ pub struct AdapterCommon {
     pub phys_capture_connected: bool,
 }
 
-// 单例：一次只允许一个适配器
-static mut INSTANCES: u32 = 0;
+// 单例：一次只允许一个适配器（全程原子访问；修复前与普通写 `INSTANCES = 0` 混用）
+static INSTANCES: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn adapter_qi(
     this: PVOID,
@@ -134,7 +135,7 @@ unsafe extern "system" fn adapter_release(this: PVOID) -> u32 {
             crate::com::release_unknown((*this).topo_speaker.cast());
         }
         ExFreePoolWithTag_np(this.cast(), TAG);
-        INSTANCES = 0;
+        INSTANCES.store(0, Ordering::SeqCst);
     }
     rc
 }
@@ -218,12 +219,23 @@ unsafe extern "system" fn adapter_set_etw_helper(_this: PVOID, _helper: PVOID) {
 
 unsafe extern "system" fn adapter_cleanup(this: PVOID) {
     let this = this as *mut AdapterCommon;
-    // SAFETY: 释放驱动持有的 miniport 引用（port 由 PortCls 持有，不在此释放）
+    // SAFETY: 释放驱动持有的 miniport 引用（port 由 PortCls 持有，不在此释放）。
+    // wave 与 topology 对称释放（审查 M-e 修复）：原实现 cleanup 只置 NULL 不
+    // Release topology 两个驱动侧引用，若 PortCls 先 Cleanup 后最终 Release，
+    // 这两个引用永久泄漏（wave 路径两条路都放，行为不对称）。
     if !(*this).mic.is_null() {
         crate::miniport::miniport_release((*this).mic.cast());
     }
     if !(*this).speaker.is_null() {
         crate::miniport::miniport_release((*this).speaker.cast());
+    }
+    if !(*this).topo_mic.is_null() {
+        // SAFETY: topology 小端口头部即 vtable 指针，release_unknown 调其 Release
+        crate::com::release_unknown((*this).topo_mic.cast());
+    }
+    if !(*this).topo_speaker.is_null() {
+        // SAFETY: 同上
+        crate::com::release_unknown((*this).topo_speaker.cast());
     }
     (*this).mic = core::ptr::null_mut();
     (*this).speaker = core::ptr::null_mut();
@@ -242,14 +254,14 @@ unsafe extern "system" fn adapter_cleanup(this: PVOID) {
 /// # Safety
 /// device 为有效设备对象。
 pub unsafe fn create(device: PDEVICE_OBJECT) -> *mut AdapterCommon {
-    if interlocked_increment(core::ptr::addr_of_mut!(INSTANCES)) != 1 {
-        interlocked_decrement(core::ptr::addr_of_mut!(INSTANCES));
+    if INSTANCES.fetch_add(1, Ordering::SeqCst) != 0 {
+        INSTANCES.fetch_sub(1, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
     // SAFETY: 非分页池分配
     let ptr = ExAllocatePool2_np(0x40, size_of::<AdapterCommon>() as u64, TAG);
     if ptr.is_null() {
-        INSTANCES = 0;
+        INSTANCES.store(0, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
     // SAFETY: 刚分配的内存
@@ -279,7 +291,7 @@ pub unsafe fn create(device: PDEVICE_OBJECT) -> *mut AdapterCommon {
     let st = adapter_init(this.cast(), core::ptr::null_mut(), device);
     if st < 0 {
         ExFreePoolWithTag_np(ptr, TAG);
-        INSTANCES = 0;
+        INSTANCES.store(0, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
     this
