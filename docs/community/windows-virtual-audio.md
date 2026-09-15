@@ -77,7 +77,7 @@ PnP 子系统为设备调 `AddDevice`，我们在里面用 `PcAddAdapterDevice` 
 时间→字节、环跨度切分、位置取模这三块纯数学被抽进 `position.rs`，该模块不做任何内核调用、无条件编译——于是这组最容易出现 off-by-one 的公式反而在 macOS 宿主上有完整单测兜底：
 
 ```rust
-// crates/vdev-audio-win/driver/src/position.rs:20-28
+// crates/vdev-audio-win/driver/src/position.rs:54-62
 pub const fn split_ring_span(start: usize, n: usize, size: usize) -> (usize, usize) {
     if size == 0 {
         return (0, 0);
@@ -89,6 +89,10 @@ pub const fn split_ring_span(start: usize, n: usize, size: usize) -> (usize, usi
 ```
 
 欠载/过载策略也在这里：捕获侧读不足就补零（`read_zero_fill`，否则 DMA 尾部残留旧数据，麦克风会循环回放陈旧音频）；渲染侧满载就丢最旧数据（`write_drop_oldest`，丢新数据会让渲染时钟停滞）。
+
+**2026-09-16 补：时间→字节之后还要向下对齐到整帧。** `bytes_for_interval()` 按 QPC 换算出的字节数是**任意整数**（1 ms @ 192000 B/s = 192，可是 7.3 ms = 1401），而 DMA 缓冲与环形缓冲的读写栅格是 `block_align`（16bit 立体声 = 4 字节）。直接拿这个数推进 `last_processed`，`last_processed % dma_size`（DMA 缓冲偏移）与环形缓冲读写索引就带上了一字节相位：引擎按帧解码时高/低字节互换。症状极隐蔽——注入 1 kHz 正弦，环回连跑几轮后从 −6.02 dBFS 翻到满幅垃圾、主频变 19 kHz，而约一半轮次是好的（0.5 ms 的换算量恰好是 4 的倍数）。修法是推进前用 `frame_aligned_advance()` 向下取整到整帧（余数由 QPC 锚点下一轮补齐，不累积漂移）。
+
+> 教训：凡是“按时间算字节、再当索引用”的地方，都要问一句“这是帧的整数倍吗”——字节地址空间上的缓冲区不等分成帧。
 
 ### 4.3 IMiniportTopology：把端点真正"装"进系统
 

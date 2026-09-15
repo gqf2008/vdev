@@ -137,6 +137,21 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -
 `audio-mic-live-e2e.ps1` 输出的「vdev 麦克风」列不可信（本脚本已加 `Assert-Loopback`：
 自检偏差 >3 dB 即判不通过）。
 
+### 2026-09-16 修复：环回字节相位（`GetPosition` 推进未对齐整帧）
+
+上面那条“驱动环回坏了”已定位根因并修复（`crates/vdev-audio-win/driver/src/position.rs` + `miniport.rs`）：`bytes_for_interval()` 按 QPC 换算出的字节数**天然不是 `block_align`（4 字节/帧）的整数倍**（7.3 ms @ 192000 B/s = 1401，余 1；0.5 ms = 96 恰好是 4 的倍数）。旧实现直接拿它推进 `last_processed`，于是 DMA 缓冲偏移 `last_processed % dma_size` 与环形缓冲读写索引都带上这一字节相位，脱离引擎的帧栅格，引擎按 16bit 立体声帧解码时高/低字节互换——坏样本与正确样本逐字节同源、仅差固定 1 字节相位（在偏移 1/3 处解码即可重建，残差 ~0.7%）。“~50% 概率恰好对齐”正是上面“时好时坏”的来源。
+
+修法：推进前用 `frame_aligned_advance()` 向下对齐到整帧，欠账由 QPC 锚点下一轮补齐，不累积漂移。
+
+同一台机器复测（旧 `vdev_audio.sys` sha256 `a49ab8b7…` → 新 `b6a397da…`，其余不变）：
+
+| `inject --endpoint vdev` + `capture --endpoint vdev`（1 kHz / 幅度 0.5） | 修复前（4 轮） | 修复后（6 轮） |
+|---|---|---|
+| peak / rms | 2 轮 −6.02 / −9.03；2 轮 **−0.06 / −4.33** | **全部 −6.02 / −9.03** |
+| 主频 | 1000 Hz 或 **19000 Hz** | **1000 Hz** |
+
+`Assert-Loopback` 现在应常绿；它仍是回归门：驱动侧再引入字节相位漂移会立刻翻红。
+
 ## 文档体检
 
 ```powershell
