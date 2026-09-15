@@ -75,6 +75,12 @@ Realtek 输出播 1 kHz / 0.5 幅度正弦，链路为 *Realtek 出音 → Stere
 | `live --adaptive`（完整降噪） | 20.000 s 音频在 20.0014 s 内跑完（实时）；帧时 **p50 26.8 µs / p95 39.4 / p99 46.2 / max 120.6 µs**；CPU 0.0312 s = **0.156 % 单核**；ring dropped 0 |
 | 端到端 A/B（同一信号） | `--mix 0` 直通：vdev 麦克风 **RMS −5.8 dBFS / peak 0.0 dBFS**；`--adaptive` 降噪后：**RMS −34.1 dBFS / peak −29.7 dBFS**（纯音被 RNNoise 判为噪声，抑制约 28 dB） |
 
+> **注意（2026-09-15 代码审查 M-g 修复后）**：上表 A/B 电平与 VAD 行为是在
+> 「[-1,1] float 直接喂 RNNoise」的错误标度下测得的（信号比模型预期低约 90 dB）。
+> 修复后输入按 ×32768 放大到 int16 标度再进模型、出口缩回 [-1,1]（见
+> `platform/windows.rs` `Core::on_frame`），降噪强度与 adaptive 混音行为会变，
+> **A/B 行数字需重新实测**；digital probe 延迟行不经过模型，不受影响。
+
 > 延迟口径别混：探测器的 ~10 ms 量的是 **WASAPI 对渲染端点的 loopback 捕获**；
 > 而「vdev 扬声器 → 驱动环形缓冲 → vdev 麦克风」是另一条路径：driver 0.3.9.0 的 1 MB 环形缓冲
 > 对应约 **5.46 s** 积压（实测 ≈5.14 s，按设备格式 16bit/48k/2ch = 192000 B/s 算）；
@@ -250,7 +256,10 @@ kernel loopback) was measured on a real Windows machine on 2026-09-14
 zero rejected frames, 20 s of adaptive denoise ran in 20.0014 s of wall clock at
 0.156 % of one core with no dropped ring buffers, and the A/B comparison dropped
 the captured level from −5.8 to −34.1 dBFS. The numbers in the table above come
-from that run. **Still open: the acoustic probe** — it needs a real microphone and
+from that run — note the A/B levels were measured before the 2026-09-15 M-g
+scale fix (RNNoise was being fed [-1,1] floats instead of int16 scale), so the
+denoise-strength numbers need re-measuring; the digital-probe latency numbers
+bypass the model and are unaffected. **Still open: the acoustic probe** — it needs a real microphone and
 a room, which the measurement host did not have (Stereo Mix stood in for the
 capture side). Correctness of the Windows-side code paths also rests on the five
 `cfg(windows)` unit tests (marker period/start, pending pairing, search-window

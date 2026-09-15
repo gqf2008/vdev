@@ -1026,6 +1026,30 @@ impl MixFormat {
         unsafe { (*self.ptr).wBitsPerSample }
     }
 
+    /// Sample encoding tag (`wFormatTag`): 1 = PCM 整型，3 = IEEE float，
+    /// 0xFFFE = extensible（真实编码在 SubFormat）。
+    #[must_use]
+    pub fn format_tag(&self) -> u16 {
+        // SAFETY: see `channels`.
+        unsafe { (*self.ptr).wFormatTag }
+    }
+
+    /// Extensible 格式的 SubFormat.Data1（KSDATAFORMAT_SUBTYPE_* 的首 u32，
+    /// IEEE float 为 3）。仅 `format_tag() == 0xFFFE` 时有意义，其余返回 None。
+    #[must_use]
+    pub fn extensible_subtype_data1(&self) -> Option<u32> {
+        if self.format_tag() != 0xFFFE {
+            return None;
+        }
+        // WAVEFORMATEXTENSIBLE 布局：WAVEFORMATEX（18 字节）+ wValidBitsPerSample
+        // （2 字节）+ dwChannelMask（4 字节）+ SubFormat GUID（16 字节，偏移 24，
+        // Data1 为其首 u32）。按字节指针 read_unaligned 读取，不依赖绑定侧
+        // 结构体对齐假设。GetMixFormat 在 extensible 时返回完整的
+        // WAVEFORMATEXTENSIBLE 缓冲（cbSize >= 22），偏移 24..28 在界内。
+        // SAFETY: 见上；ptr 在 self 生命周期内有效。
+        Some(unsafe { self.ptr.cast::<u8>().add(24).cast::<u32>().read_unaligned() })
+    }
+
     /// The raw format pointer, for `Initialize` / format matches.
     #[must_use]
     pub fn as_ptr(&self) -> *const WAVEFORMATEX {
@@ -1052,6 +1076,9 @@ impl Drop for MixFormat {
 // Live loop: the pipeline core (macOS-identical)
 // ===========================================================================
 
+/// int16 满幅值：[-1,1] float 与 int16 标度（RNNoise/wavio/metrics 口径）之间的换算系数。
+const INT16_SCALE: f32 = 32768.0;
+
 /// Per-frame pipeline state. A field-for-field mirror of the macOS `Core` so
 /// both backends are one `on_frame` away from identical output.
 struct Core {
@@ -1064,9 +1091,15 @@ struct Core {
     out_ring: Arc<SpscRing>,
 
     /// One 480-sample frame, the buffer that goes to the virtual mic.
+    /// 内容物为 **int16 标度**（±32768，RNNoise / wavio / metrics 的统一口径），
+    /// 出口经 `out_float` 缩回 [-1,1] 再上环（审查 M-g）。
     frame: Vec<f32>,
     /// Dry frame, delayed in place before blending.
     dry_frame: Vec<f32>,
+    /// WASAPI [-1,1] 输入放大到 int16 标度的每帧暂存。
+    in_scaled: Vec<f32>,
+    /// int16 标度的 `frame` 缩回 [-1,1] 的每帧暂存（上环前）。
+    out_float: Vec<f32>,
 
     rec_in: Vec<f32>,
     rec_out: Vec<f32>,
@@ -1109,6 +1142,8 @@ impl Core {
             out_ring,
             frame: vec![0.0; engine.frame_size],
             dry_frame: vec![0.0; engine.frame_size],
+            in_scaled: vec![0.0; engine.frame_size],
+            out_float: vec![0.0; engine.frame_size],
             rec_in,
             rec_out,
             timing: Vec::with_capacity(60 * 1000), // 60 s of 10 ms frames
@@ -1123,27 +1158,39 @@ impl Core {
     /// One 480-sample frame: model, blend, ship. Mirrors `agent::process`'s
     /// inner loop (and the macOS `Core::on_frame`) exactly, so the offline
     /// numbers stay valid.
+    ///
+    /// 标度约定（审查 M-g）：WASAPI 共享模式交付/消费 [-1,1] float，而
+    /// RNNoise 与 crate 内全部离线口径（wavio 读写、metrics 的 dBFS、
+    /// `AdaptiveMixer` 的 noise_floor）都是 **int16 标度 ±32768**。入口先把
+    /// 输入放大到 int16 标度（模型、延迟线、混音、A/B 录音全在该标度），
+    /// 出口再缩回 [-1,1] 上环。修复前直接把 [-1,1] 喂给模型——信号比
+    /// 训练分布低约 90 dB，降噪/VAD 形同失效，混音噪声门限单位同样错乱。
     #[inline]
     fn on_frame(&mut self, input: &[f32]) {
-        // 1) raw capture, for the A/B file
+        // 0) [-1,1] -> int16 标度（input 恒为 FRAME 长，见 den.process 的既有假设）
+        for (d, &s) in self.in_scaled.iter_mut().zip(input) {
+            *d = s * INT16_SCALE;
+        }
+
+        // 1) raw capture, for the A/B file（int16 标度，与 wavio::write 的约定一致）
         if self.rec_in.len() + FRAME <= RECORD_SAMPLES {
-            self.rec_in.extend_from_slice(input);
+            self.rec_in.extend_from_slice(&self.in_scaled);
         }
 
         let t0 = Instant::now();
-        let (vad, wet_frame) = self.den.process(input);
+        let (vad, wet_frame) = self.den.process(&self.in_scaled);
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if self.timing.len() < self.timing.capacity() {
             self.timing.push(dt_ms);
         }
 
         // 2) dry path, delayed to the model's lookahead (see frames::DelayLine)
-        self.dry_frame.copy_from_slice(input);
+        self.dry_frame.copy_from_slice(&self.in_scaled);
         self.dry.process(&mut self.dry_frame);
 
-        // 3) blend
+        // 3) blend（mixer 拿到 int16 标度输入，noise_floor_dbfs 才是真实 dBFS）
         let w = if self.adaptive {
-            self.mixer.update(input, vad)
+            self.mixer.update(&self.in_scaled, vad)
         } else {
             self.mix as f64
         };
@@ -1166,7 +1213,11 @@ impl Core {
 
         // 4) ship it. Dropping on a full ring is the right failure mode: the
         // render side is starving, and stale audio would be worse than a gap.
-        self.out_ring.push_or_drop(&self.frame);
+        // 上环前缩回 [-1,1]——渲染侧（fill_render_ring）按 WASAPI float 写出。
+        for (d, &s) in self.out_float.iter_mut().zip(&self.frame) {
+            *d = s / INT16_SCALE;
+        }
+        self.out_ring.push_or_drop(&self.out_float);
 
         self.frames += 1;
         self.vad_sum += vad as f64;
@@ -1498,6 +1549,19 @@ fn check_mix_format(fmt: &MixFormat, ep: &EndpointInfo, side: &str) -> Result<()
             fmt.bits_per_sample()
         );
     }
+    // 审查 L9：32 bit 容器不等于 float——还可能是 32 bit PCM 整型。整型样本
+    // 被当 float 读/写会得到满幅噪声，必须按 wFormatTag 拒绝。
+    // 接受：WAVE_FORMAT_IEEE_FLOAT(3)，或 extensible 且 SubFormat.Data1 == 3。
+    let tag = fmt.format_tag();
+    let is_float = tag == 3 || (tag == 0xFFFE && fmt.extensible_subtype_data1() == Some(3));
+    if !is_float {
+        bail!(
+            "{side} endpoint {:?} reports mix format tag {tag:#06x} (subtype {:?}); the \
+             pipeline reads/writes samples as IEEE float32, so refusing to guess the encoding.",
+            ep.name,
+            fmt.extensible_subtype_data1()
+        );
+    }
     Ok(())
 }
 
@@ -1656,6 +1720,18 @@ fn print_report(r: &WinReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-g 回归：int16 标度换算系数必须与 crate 口径（wavio/metrics/mixer）
+    /// 一致——1.0 ↔ 32768，且 on_frame 的入/出换算互为逆运算。
+    #[test]
+    fn int16_scale_roundtrips() {
+        assert_eq!(INT16_SCALE, 32768.0);
+        for &v in &[0.0f32, 0.5, -0.5, 1.0, -1.0] {
+            let scaled = v * INT16_SCALE;
+            assert!((scaled / INT16_SCALE - v).abs() < 1e-7);
+        }
+        assert_eq!(1.0f32 * INT16_SCALE, 32768.0);
+    }
 
     #[test]
     fn marker_emitter_starts_immediately_then_every_period() {
