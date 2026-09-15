@@ -4,13 +4,17 @@
 #
 # 前置：声卡驱动已安装；信号源用「立体声混音 / Stereo Mix」代替物理麦克风。
 # 用法：powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ring-delay.ps1 -Tag before
+#
+# ⚠ 2026-09-15：`-Input` 改名 `-InputDevice`。`$Input` 与 PowerShell 自动变量同名，
+#   函数作用域里求值为空枚举 ⇒ 传给 agent 的 `--input ""` 会被任意设备名命中，
+#   选到第一个采集端点（本机即 vdev 麦克风自身），量的是自反馈环而非物理链路。
 param(
     [string]$Tag = 'after',
     [string]$RepoRoot,
     [string]$OutDir,
     [string]$Endpoint = 'vdev',
     [string]$ToneEndpoint = 'Realtek',
-    [string]$Input = 'Stereo Mix',
+    [string]$InputDevice = 'Stereo Mix',
     [string]$MicAgent,
     [string]$AudioCli
 )
@@ -33,18 +37,22 @@ $cli = $AudioCli
 $agent = $MicAgent
 $wav = Join-Path $OutDir "ring-delay-$Tag.wav"
 
+# Start-Process 把 -ArgumentList 数组按空格拼接、不替我们加引号：
+# 含空格的取值必须自带引号，否则会被切成分开的参数。
+function Quote([string]$s) { '"' + $s + '"' }
+
 # 排空环（2s 采集）
 & $cli capture --endpoint $Endpoint --duration 2 | Out-Null
 
 # 连续写者（14s dry 直通；先不采集 → 环灌满）
 $live = Start-Process -FilePath $agent `
-    -ArgumentList 'live','--mix','0','--seconds','14','--vdev',$Endpoint,'--input',"`"$Input`"" `
+    -ArgumentList 'live','--mix','0','--seconds','14','--vdev',$Endpoint,'--input',(Quote $InputDevice) `
     -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $OutDir "ring-delay-$Tag-live.log")
 Start-Sleep -Seconds 3
 
 # 采集 10s → WAV
 $cap = Start-Process -FilePath $cli `
-    -ArgumentList 'capture','--endpoint',$Endpoint,'--duration','10','--wav',"`"$wav`"" `
+    -ArgumentList 'capture','--endpoint',$Endpoint,'--duration','10','--wav',(Quote $wav) `
     -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $OutDir "ring-delay-$Tag-cap.log")
 Start-Sleep -Seconds 2
 

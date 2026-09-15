@@ -73,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-mic-live-e2e.p
 powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -VdevInstance 0001 -RefInstance 0000
 ```
 
-没有物理麦克风时用「立体声混音 / Stereo Mix」当信号源（`-Input`、`-ToneEndpoint` 可改）：往真实声卡播 1 kHz 正弦，由混音端采回，穿过整条链路。本机实测基线：
+没有物理麦克风时用「立体声混音 / Stereo Mix」当信号源（`-InputDevice`、`-ToneEndpoint` 可改）：往真实声卡播 1 kHz 正弦，由混音端采回，穿过整条链路。本机实测基线：
 
 | 项目 | 实测 |
 |---|---|
@@ -81,7 +81,35 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -
 | 环回链路的电平 | 峰值 **−6.02 dBFS**（0.5 幅度正弦理论值） |
 | mic-agent：数字探针 p50 | **10.16 ms** |
 | mic-agent：完整降噪 20 s 实时 | 帧时 p50 **26.8 µs**、CPU **0.156 %**（单核） |
-| 直通 vs 降噪 A/B | **−5.8 → −34.1 dBFS** |
+| 直通 vs 降噪 A/B | ~~−5.8 → −34.1 dBFS~~（见下方修正：该数是自反馈环，不是物理链路） |
+
+### ⚠ 2026-09-15 复测修正（两条真 bug）
+
+1. **脚本参数名踩了 PowerShell 自动变量。** `audio-mic-live-e2e.ps1` / `audio-ring-delay.ps1` 的
+   `-Input` 与自动变量 `$Input` 同名，在函数作用域里它求值为「空枚举」，于是传给 agent 的是
+   `--input ""`；空串被任何设备名 `contains` 命中 ⇒ 选到枚举出的第一个采集端点，本机正是
+   `Microphone (vdev 虚拟声卡)` **本身**。也就是说上表最后一行量的是 **agent 的自反馈环**，
+   不是「物理声源 → agent → 虚拟麦克风」。已改名为 `-InputDevice`，并加了硬断言
+   （采集端点 == vdev 设备即判不通过）。同时修了带空格取值的引号问题
+   （`Start-Process -ArgumentList` 不会替我们加引号，`--input Stereo Mix` 会被切出多余的 `Mix`）。
+2. **agent 的 Windows live 通路样本布局是错的（待修）。** `platform/windows.rs` 的
+   `drain_capture` / `fill_render_ring` 直接把设备缓冲当 `*const f32` / `*mut f32` 读写，
+   而 `vdev-audio-win` 的端点走 **16bit PCM**（`crates/vdev-audio-win/cli/src/wasapi.rs`
+   就是按 i16、2 字节步长处理的，所以 CLI 那条路精确到理论值）。
+   `check_mix_format` 只校验了 `wBitsPerSample == 32`（容器位数），没校验子格式是不是 IEEE float，
+   所以这个假设一路过关。实测症状：把 −24.9 dBFS 的源灌成 **0.0 dBFS 削顶**，
+   `--record-in` / `--record-out` 两个 WAV **全是数字静音**。
+   修好之前，上表里 mic-agent 相关的**电平类**数字（A/B 那行）不可引用；
+   帧时/CPU 与采样布局无关，仍然有效。
+
+设备侧单独复测（2026-09-15，这三条可信）：
+
+| 项目 | 实测 |
+|---|---|
+| 驱动状态 | `testsigning Yes`、服务 `vdev_audio` RUNNING、设备 `ROOT\MEDIA\0001` Started（0.3.10.0） |
+| vdev 端点 | `Speakers (vdev 虚拟声卡)` + `Microphone (vdev 虚拟声卡)` 均 Active |
+| 驱动环回电平（`inject --endpoint vdev` + `capture --endpoint vdev`，0.5 幅度 1 kHz） | peak **−6.0201 dBFS**（理论 −6.0206），rms −13.06 |
+| agent live 20 s（真实 WASAPI 设备） | 帧 2000、**drop 0**、帧时 p99 **45 µs**、CPU **0.078 %**（单核） |
 
 ## 文档体检
 
