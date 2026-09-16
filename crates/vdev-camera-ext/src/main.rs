@@ -21,7 +21,7 @@ use objc2_foundation::NSObjectProtocol;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSSet, NSString, NSUUID};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 static LOG_BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -228,8 +228,39 @@ extern "C" {
 static STREAM: Mutex<Option<usize>> = Mutex::new(None);
 static STREAM_FORMAT: Mutex<Option<usize>> = Mutex::new(None);
 static FORMAT_DESC: Mutex<Option<CMFormatDescription>> = Mutex::new(None);
-static RUNNING: AtomicBool = AtomicBool::new(false);
+/// 流是否被客户端启动过（`startStream` 置位、`stopStream` 清位）。
+/// **不能单独拿它当产帧开关**：客户端被强杀时 CMIO 不会补发 `stopStream`，
+/// 该位会永久留在 `true`（issue #52 的现场）。
+static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 当前已连接客户端数，由 provider 的 `connectClient:` / `disconnectClient:` 维护。
+/// 与 `STREAM_ACTIVE` 一起决定是否产帧：客户端计数归零是「客户端已经不在了」
+/// 唯一可靠的信号，也是强杀后无需重启扩展就能自动恢复的关键。
+static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 上一次 `sendSampleBuffer` 里程碑（时刻, 累计帧数），用于打印窗口实测帧率。
+static LAST_MARK: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+
+/// 客户端接入：返回接入后的连接数。
+fn client_connected(clients: &AtomicUsize) -> usize {
+    clients.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// 客户端断开：返回断开后的连接数，未配对的 disconnect 饱和在 0（不回绕）。
+fn client_disconnected(clients: &AtomicUsize) -> usize {
+    clients
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .map_or(0, |prev| prev.saturating_sub(1))
+}
+
+/// 产帧开关：**流已被启动** 且 **仍有客户端连着**，两者同时成立才产帧。
+///
+/// 旧实现只看 `stream_active`：客户端强杀不补发 `stopStream` → 永久空转烧 CPU，
+/// 且新客户端接入后只能从旧失效队列的缝里拿到残帧（真机实测 2.3fps）。
+fn should_produce(stream_active: bool, clients: usize) -> bool {
+    stream_active && clients > 0
+}
 
 fn class(name: &str) -> &'static objc2::runtime::AnyClass {
     let cname = std::ffi::CString::new(name).unwrap();
@@ -261,12 +292,21 @@ define_class!(
             _client: &NSObject,
             _out_error: *mut *mut NSObject,
         ) -> bool {
-            elog("provider: connectClient");
+            let n = client_connected(&CLIENTS);
+            elog(format!("provider: connectClient clients={n}"));
             true
         }
 
         #[unsafe(method(disconnectClient:))]
-        unsafe fn disconnectClient(&self, _client: &NSObject) {}
+        unsafe fn disconnectClient(&self, _client: &NSObject) {
+            let n = client_disconnected(&CLIENTS);
+            if n == 0 {
+                // 客户端可能已被强杀（不会补发 stopStream）：此处是唯一的兜底停帧点
+                elog("provider: disconnectClient clients=0 → 暂停产帧");
+            } else {
+                elog(format!("provider: disconnectClient clients={n}"));
+            }
+        }
 
         #[unsafe(method_id(availableProperties))]
         unsafe fn availableProperties(&self) -> Retained<NSSet<NSObject>> {
@@ -416,14 +456,14 @@ define_class!(
         #[unsafe(method(startStreamAndReturnError:))]
         unsafe fn startStreamAndReturnError(&self, _out_error: *mut *mut NSObject) -> bool {
             elog("stream: startStream");
-            RUNNING.store(true, Ordering::SeqCst);
+            STREAM_ACTIVE.store(true, Ordering::SeqCst);
             true
         }
 
         #[unsafe(method(stopStreamAndReturnError:))]
         unsafe fn stopStreamAndReturnError(&self, _out_error: *mut *mut NSObject) -> bool {
             elog("stream: stopStream");
-            RUNNING.store(false, Ordering::SeqCst);
+            STREAM_ACTIVE.store(false, Ordering::SeqCst);
             true
         }
     }
@@ -536,7 +576,14 @@ fn send_bgra(
             SENT.fetch_add(1, Ordering::SeqCst);
             let n = SENT.load(Ordering::SeqCst);
             if n.is_multiple_of(300) || n == 1 {
-                elog(format!("sendSampleBuffer #{n}"));
+                let now = std::time::Instant::now();
+                let mut last = LAST_MARK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let fps = last.map_or(0.0, |(at, m)| window_fps(at, m, now, n));
+                *last = Some((now, n));
+                drop(last);
+                elog(format!("sendSampleBuffer #{n} 窗口实测 fps={fps:.1}"));
             }
             CFRelease(sb.0.cast_const());
         } else {
@@ -546,18 +593,73 @@ fn send_bgra(
     }
 }
 
+/// 两个里程碑之间的窗口实测帧率（`n` 为累计帧数；非法输入返回 0）。
+#[allow(clippy::cast_precision_loss)]
+fn window_fps(prev_at: std::time::Instant, prev_n: u64, now: std::time::Instant, n: u64) -> f64 {
+    let dt = now.saturating_duration_since(prev_at).as_secs_f64();
+    if dt <= 0.0 || n <= prev_n {
+        return 0.0;
+    }
+    (n - prev_n) as f64 / dt
+}
+
+/// 目标帧周期（60fps）。
+const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+/// 过载时每轮的最小让出时长（不忙等）。
+const MIN_YIELD: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// 固定节拍器：按**绝对 deadline** 推进，睡眠只补足到下一个 tick。
+///
+/// 旧实现是「先产帧、再固定睡满 16.666ms」，睡眠**加在**帧生成耗时之上：
+/// 实测周期 ≈ 帧耗时(≈14ms) + 16.666ms ≈ 30.7ms ≈ 32.5fps（issue #51）。
+/// 这里改为推进 deadline，帧生成耗时被 tick 吸收而不是累加。
+struct Pacer {
+    period: std::time::Duration,
+    next: std::time::Instant,
+}
+
+impl Pacer {
+    fn new(now: std::time::Instant, period: std::time::Duration) -> Self {
+        Self {
+            period,
+            next: now + period,
+        }
+    }
+
+    /// 推进一个 tick，返回本轮应休眠的时长。
+    ///
+    /// 稳态（帧耗时 < period）：帧起始间隔严格 = period。
+    /// 过载（帧耗时 ≥ period）：deadline 重锚到 `now + period`，本轮只让出
+    /// `MIN_YIELD`——不追赶、不补帧风暴；速率退化为「帧耗时 + 让出」，
+    /// 而不是掉到「帧耗时 + period」的半个帧率。
+    fn tick(&mut self, now: std::time::Instant) -> std::time::Duration {
+        let wait = self.next.saturating_duration_since(now);
+        self.next += self.period;
+        if self.next <= now {
+            self.next = now + self.period;
+        }
+        if wait.is_zero() {
+            MIN_YIELD
+        } else {
+            wait
+        }
+    }
+}
+
 fn frame_loop() {
     let fmt = FORMAT_DESC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .unwrap();
-    // 初值从不被读（循环内先赋值再用），不设初值以免 unused_assignments
-    let mut last_sent: std::time::Instant;
     // 彩条缓冲复用，避免每帧 8.3MB 分配
     let mut bars_buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
+    let mut pacer = Pacer::new(std::time::Instant::now(), FRAME_PERIOD);
     loop {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if RUNNING.load(Ordering::SeqCst) {
+            if should_produce(
+                STREAM_ACTIVE.load(Ordering::SeqCst),
+                CLIENTS.load(Ordering::SeqCst),
+            ) {
                 let stream = STREAM
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -601,17 +703,8 @@ fn frame_loop() {
                 }
             }
         }));
-        last_sent = std::time::Instant::now();
-        // 60fps 节拍
-        let elapsed = last_sent.elapsed();
-        let target = std::time::Duration::from_micros(16_666);
-        // 分支条件已保证 elapsed < target，减法不会下溢
-        #[allow(clippy::unchecked_time_subtraction)]
-        if elapsed < target {
-            std::thread::sleep(target - elapsed);
-        } else {
-            std::thread::sleep(std::time::Duration::from_micros(500));
-        }
+        // 60fps 固定节拍：只补足到下一个 tick，不把帧耗时再叠加一个 period
+        std::thread::sleep(pacer.tick(std::time::Instant::now()));
     }
 }
 
@@ -778,7 +871,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_bgra_rows, log_skip};
+    use super::{
+        client_connected, client_disconnected, copy_bgra_rows, log_skip, should_produce,
+        window_fps, Pacer, FRAME_PERIOD, MIN_YIELD,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn bgra_rows_padded_src_stride_copies_only_valid_bytes() {
@@ -853,5 +951,114 @@ mod tests {
     fn log_skip_no_drain_yet_reads_from_start() {
         assert_eq!(log_skip(0, 10, 10), 0);
         assert_eq!(log_skip(3, 10, 10), 3);
+    }
+
+    // ---- 60fps 节拍（issue #51）----
+
+    #[test]
+    fn pacer_steady_state_holds_period_despite_frame_work_time() {
+        // 帧生成耗时 14ms：真机扩展流式期间 CPU 实测 ~12–14ms/帧
+        let work = Duration::from_millis(14);
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, FRAME_PERIOD);
+        let mut now = t0;
+        let mut starts = Vec::new();
+        for _ in 0..120 {
+            starts.push(now);
+            now += work; // 产一帧
+            now += pacer.tick(now); // 睡到下一个 tick
+        }
+        let span = starts[starts.len() - 1].saturating_duration_since(starts[0]);
+        #[allow(clippy::cast_possible_truncation)]
+        let avg = span / (starts.len() as u32 - 1);
+        assert!(
+            avg.abs_diff(FRAME_PERIOD) <= Duration::from_micros(1),
+            "平均帧间隔 {avg:?} 应严格等于 {FRAME_PERIOD:?}（60fps）；\n\
+             若得到 ~30.7ms 说明 sleep 是「帧耗时之上再加一个 period」（旧实现）"
+        );
+        // 顺带钉住量级：60fps 与 32fps 必须能被区分
+        assert!(avg < Duration::from_millis(20), "平均帧间隔 {avg:?} 仍偏大");
+    }
+
+    #[test]
+    fn pacer_overload_degrades_gracefully_without_catch_up_burst() {
+        // 帧生成 25ms > 16.67ms：不追赶、不补帧，退化为「帧耗时 + 最小让出」
+        let work = Duration::from_millis(25);
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, FRAME_PERIOD);
+        let mut now = t0;
+        let mut starts = Vec::new();
+        for _ in 0..8 {
+            starts.push(now);
+            now += work;
+            now += pacer.tick(now);
+        }
+        for pair in starts.windows(2) {
+            let d = pair[1].saturating_duration_since(pair[0]);
+            assert!(d >= work, "帧间隔 {d:?} 不应短于帧生成耗时");
+            assert!(
+                d <= work + Duration::from_millis(1),
+                "帧间隔 {d:?} 被额外 sleep / 补帧风暴放大（应约 {work:?} + {MIN_YIELD:?}）"
+            );
+        }
+    }
+
+    // ---- 产帧生命周期（issue #52）----
+
+    #[test]
+    fn produce_only_when_stream_started_and_client_still_connected() {
+        assert!(should_produce(true, 1));
+        assert!(should_produce(true, 2));
+        // 只连接、未起流：不空转产帧
+        assert!(!should_produce(false, 1));
+        assert!(!should_produce(false, 0));
+        // 客户端被强杀：计数归零必须停帧（旧实现只看 stream_active → 永久空转）
+        assert!(!should_produce(true, 0));
+    }
+
+    #[test]
+    fn client_counter_covers_kill_and_reconnect_without_start_stream() {
+        let clients = AtomicUsize::new(0);
+        // 接入 + 起流
+        assert_eq!(client_connected(&clients), 1);
+        assert!(should_produce(true, clients.load(Ordering::SeqCst)));
+        // 强杀：只会有 disconnectClient，不会有 stopStream
+        assert_eq!(client_disconnected(&clients), 0);
+        assert!(
+            !should_produce(true, clients.load(Ordering::SeqCst)),
+            "强杀后必须停帧，否则扩展 32fps 永久空转"
+        );
+        // 新客户端接入：CMIO 不再补发 startStream（stream_active 仍为 true），也必须恢复产帧
+        assert_eq!(client_connected(&clients), 1);
+        assert!(should_produce(true, clients.load(Ordering::SeqCst)));
+        // 正常收尾
+        assert_eq!(client_disconnected(&clients), 0);
+        // 防御：未配对的 disconnect 不回绕成巨大计数
+        assert_eq!(client_disconnected(&clients), 0);
+        assert_eq!(client_disconnected(&clients), 0);
+        assert_eq!(clients.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn window_fps_reports_window_rate_and_rejects_bad_input() {
+        let t0 = Instant::now();
+        // 300 帧 / 5s = 60fps
+        let fps = window_fps(t0, 0, t0 + Duration::from_secs(5), 300);
+        assert!((fps - 60.0).abs() < 0.01, "fps={fps}");
+        // 非法输入：零窗口 / 非递增计数 → 0（不产生 inf/NaN 污染日志）
+        let is_zero = |fps: f64| fps.abs() < f64::EPSILON;
+        assert!(is_zero(window_fps(t0, 0, t0, 300)));
+        assert!(is_zero(window_fps(
+            t0,
+            300,
+            t0 + Duration::from_secs(1),
+            300
+        )));
+        assert!(is_zero(window_fps(
+            t0,
+            300,
+            t0 + Duration::from_secs(1),
+            100
+        )));
     }
 }

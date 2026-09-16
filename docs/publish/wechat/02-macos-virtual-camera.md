@@ -75,7 +75,7 @@ offset size 字段
 
 `main`按 8 步线性初始化：建 `CMVideoFormatDescription`（1920x1080 BGRA@60）→ 建 `CMIOExtensionStreamFormat` → 建三个 source 对象 → 建 `CMIOExtensionStream` → 建 `CMIOExtensionDevice` → 建 `CMIOExtensionProvider`（`clientQueue` 必须给真实 dispatch queue，NULL 会注册不上 XPC）→ **先 `addStream` 再 `addDevice`** → 起帧线程、`startServiceWithProvider`、进 `CFRunLoopRun`。
 
-帧线程 `frame_loop`以 60fps 节拍循环：`RUNNING` 为真（客户端调了 `startStream`）时，先看 `INJECTED` 槽里有没有 2 秒内的注入帧——有就走滤镜（可选）直发；没有就调用核心库的 `vdev_camera_render_bgra32` 渲染一帧 SMPTE 彩条发出去。也就是说**摄像头永不黑屏**：没有推流源时它是一个彩条测试源，这正是验证链路时最有用的行为。
+帧线程 `frame_loop`用 `Pacer` 按**固定 deadline 节拍**（60fps，只补足到下一个 tick）循环：`STREAM_ACTIVE && CLIENTS > 0`（流被客户端启动过、且还有客户端连着）时才产帧——先看 `INJECTED` 槽里有没有 2 秒内的注入帧——有就走滤镜（可选）直发；没有就调用核心库的 `vdev_camera_render_bgra32` 渲染一帧 SMPTE 彩条发出去。也就是说**摄像头永不黑屏**：没有推流源时它是一个彩条测试源，这正是验证链路时最有用的行为。
 
 彩条回落窗口为什么是 2 秒？因为推流端可能"喘"：读网络挂载的视频、屏幕静止不产生新帧，都会让注入停顿。停顿小于窗口时靠推流端保活（重发最后一帧）顶住，超过窗口才回落彩条——这套"保持注入新鲜"的机制让画面在源停顿时也不闪彩条。
 
@@ -239,6 +239,18 @@ elog(format!("addDevice -> {ok_add_dev}"));
 **定位**：对 `VNPixelBufferObservation.pixelBuffer` 这个 getter 取出的 mask 调了 `CFRelease`（注释还写着"内部完成取用与释放"）。用 `CFGetRetainCount` 在 getter 后打点：实测取出时计数为 1——说明对象由 observation 独占持有，getter 返回的是 **+0**（不转移所有权）。调用方多 release 一次，计数归零提前释放；全局复用同一个 `VNRequest` 再次 `performRequests` 替换 results 时，旧 observation dealloc 触发二次释放。单测不崩只是因为 autorelease pool 尚未排空、旧 observation 仍被全局 request 持有——**内存错误能否复现，取决于释放时机与池排空顺序，"测试过了"不等于"所有权对了"**。
 
 **修法**：删掉那行 `CFRelease`。规则收敛成一句：**getter 取出的 CF/ObjC 对象默认不拥有（+0），读出数据即走，绝不 release；要跨调用持有先 retain；alloc/copy/create 出来的才是 +1，用完必须释放**（如 4.3 节的 sample buffer）。存疑时用 `CFGetRetainCount` 实证。对应 commit `d0e5502`（"修 ObjC 过释放"）与全仓审查的 blocker 清零（`e7caea0`）。
+
+### 坑 6：帧节拍写成"帧耗时 + 固定 sleep"，以及把产帧开关绑在不可靠的信号上
+
+**现象**：设备对外号称 1920x1080@60，实测只有 ~32fps；另一头，某个播放器被强杀之后摄像头就"黑"了，必须重装扩展才恢复。两个现象看着无关，实际是同一段 `frame_loop` 的两个缺陷。
+
+**定位（一）节拍累加**：原来的写法是"产完一帧再固定睡 16.666ms"——`last_sent` 每轮开头重新赋值，`elapsed()` 恒为 ~0，于是每轮**恒定睡满一个 period**。睡眠是**加在帧生成耗时之上**的：帧耗时 ≈14ms + 16.666ms ≈ 30.7ms ≈ **32.5fps**，正好是实测值。判据很干净：把节拍抽成纯结构体，单测里喂"帧耗时 14ms"，帧起始间隔必须恒为 16.666ms；旧实现下这条单测给出 `30.666667ms`（阳性对照）。
+
+**定位（二）产帧开关绑错信号**：产帧原来只看 `startStream`/`stopStream` 置的 `RUNNING`。客户端被 `SIGKILL`/`SIGTERM` 时 CMIO **不会补发 `stopStream`**，`RUNNING` 永久为真 → 扩展 32fps 空转到天荒地老（实测 41.5% CPU），而 cmiod 认为该流仍是 started，**新客户端接入时连 `startStream` 都不再触发**（日志里只有 `connectClient`），拿到的只有旧失效队列挤出来的残帧（授权探针实测 **2.3fps**）。
+
+**修法**：节拍改为**固定 deadline** 推进（`Pacer`：`wait = next - now; next += period;`，只补足、不叠加；帧耗时 ≥ period 时重锚 + 最小让出，不做补帧风暴）；产帧开关改为 `should_produce(STREAM_ACTIVE, CLIENTS)`——由 provider 的 `connectClient:` / `disconnectClient:` 维护客户端计数，**计数归零即停帧**，新客户端接入即恢复（不依赖 CMIO 是否补发 `startStream`）。两条都有单测：旧语义下 4 条红（含 `平均帧间隔 30.666667ms` 这条），改回修复版全绿。
+
+**教训**：① 实时循环里 **sleep 永远是"补足到某个绝对时刻"，不是"相对延时"**——只要写成相对延时，负载就会直接吃掉帧率；② 生命周期开关要绑**你能观测到的事实**（还有没有客户端连着），不要绑**对端不保证会发的回调**。
 
 ## 6. 构建与运行
 
