@@ -32,6 +32,7 @@ DriverKit 只支持 C++，Rust 只能做 C ABI 内核、工程成本高。macOS 
 - **GitHub 只是镜像 + 发布通道**（remote `github`）：本机 `~/.walgit/sync-to-github.sh` 常驻循环
   （screen `walgit-sync-github`，60s）把 walgit 的 heads/tags 镜像过去；**不要手动双推**。
 - **发布**：在 main 打 tag → push `origin`（walgit）→ 镜像自动同步 → `gh release create <tag> --generate-notes`。
+- GitHub 侧的 Issues / Wiki / Projects / Discussions **已关闭**：issue 与评审都走 walgit collab（GitHub 只留镜像与 Releases）。
 - 开发流程与 collab 记账要求见 `AGENTS.md`。
 
 ## 快速开始
