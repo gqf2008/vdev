@@ -151,8 +151,9 @@ mod ffi {
         pub m_data: *mut c_void,
     }
 
-    /// Variable-length in C; only `mBuffers[0]` is ever accessed here, and the
-    /// device does not hand out multi-buffer lists for interleaved formats.
+    /// C 里是变长数组：interleaved 只用 `mBuffers[0]`（多声道在同一 buffer
+    /// 内交错）；non-interleaved 时 `mNumberBuffers >= mChannelsPerFrame`，
+    /// 连续读取前 N 个 AudioBuffer（见 `capture_ioproc` 的 planar 分支）。
     #[repr(C)]
     pub struct AudioBufferList {
         pub m_number_buffers: u32,
@@ -754,6 +755,25 @@ struct CaptureCtx {
     resample: Vec<f32>,
     /// 预分配容量不足而丢弃的块数（正常应为 0；运行结束打印警告）。
     dropped_blocks: u64,
+    /// 设备交付的 buffer layout 与 ASBD 不符而拒收的块数（正常应为 0）。
+    layout_errors: u64,
+}
+
+/// 非交错（每声道一个 buffer）-> mono：`sample(c, i)` 给出第 c 声道第 i 帧。
+fn downmix_planar<F: Fn(usize, usize) -> f32>(
+    channels: usize,
+    frames: usize,
+    sample: F,
+    dst: &mut [f32],
+) -> usize {
+    for (i, slot) in dst.iter_mut().take(frames).enumerate() {
+        let mut sum = 0.0f32;
+        for c in 0..channels {
+            sum += sample(c, i);
+        }
+        *slot = sum / channels as f32;
+    }
+    frames
 }
 
 /// 交错多声道 -> mono（逐帧平均）；返回写入 `dst` 的帧数。
@@ -846,37 +866,48 @@ unsafe extern "C" fn capture_ioproc(
         } else {
             // 非交错：ABL 每个 buffer 一个声道（m_number_buffers >= channels）。
             if (abl.m_number_buffers as usize) < channels {
+                ctx.layout_errors += 1;
                 return 0;
             }
             // SAFETY: C flexible array；第一个 buffer 后连续 channels 个 AudioBuffer。
             let base = (&abl.m_buffers[0]) as *const AudioBuffer;
             let first = unsafe { &*base };
             if first.m_data.is_null() || first.m_data_byte_size < 4 {
+                ctx.layout_errors += 1;
                 return 0;
             }
             let frames = (first.m_data_byte_size / 4) as usize;
             if frames == 0 {
+                ctx.layout_errors += 1;
                 return 0;
+            }
+            // 逐声道预校验，避免在 downmix 的 sample 回调里做错误分支。
+            for c in 0..channels {
+                // SAFETY: base.add(c) 在 m_number_buffers >= channels 范围内。
+                let b = unsafe { &*base.add(c) };
+                if b.m_data.is_null()
+                    || b.m_number_channels != 1
+                    || (b.m_data_byte_size as usize) < frames * 4
+                {
+                    ctx.layout_errors += 1;
+                    return 0;
+                }
             }
             if ctx.mono.capacity() < frames {
                 ctx.dropped_blocks += 1;
                 return 0;
             }
             ctx.mono.resize(frames, 0.0);
-            for i in 0..frames {
-                let mut sum = 0.0f32;
-                for c in 0..channels {
-                    // SAFETY: base.add(c) 在 m_number_buffers >= channels 范围内。
-                    let b = unsafe { &*base.add(c) };
-                    if b.m_data.is_null() || (b.m_data_byte_size as usize) < (i + 1) * 4 {
-                        return 0;
-                    }
-                    // SAFETY: i < frames <= b.m_data_byte_size/4。
-                    sum += unsafe { *(b.m_data as *const f32).add(i) };
-                }
-                ctx.mono[i] = sum / channels as f32;
-            }
-            &ctx.mono[..frames]
+            let n = downmix_planar(
+                channels,
+                frames,
+                |c, i| unsafe {
+                    let b = &*base.add(c);
+                    *(b.m_data as *const f32).add(i)
+                },
+                &mut ctx.mono,
+            );
+            &ctx.mono[..n]
         };
 
         // SAFETY: `ASM` 只被采集 IOProc 这一个音频线程触碰；`core` 是
@@ -1409,6 +1440,19 @@ fn validate_capture_format(fmt: &AudioStreamBasicDescription) -> Result<(f64, u3
         bail!("采集采样率 {rate} 不支持（需要 48k 或 16k）");
     }
     let interleaved = fmt.m_format_flags & FLAG_IS_NON_INTERLEAVED == 0;
+    let expected_bpf = if interleaved {
+        4 * fmt.m_channels_per_frame
+    } else {
+        4
+    };
+    if fmt.m_bytes_per_frame != expected_bpf {
+        bail!(
+            "采集格式帧宽不一致：channels={} interleaved={} bytesPerFrame={}（期望 {expected_bpf}）",
+            fmt.m_channels_per_frame,
+            interleaved,
+            fmt.m_bytes_per_frame
+        );
+    }
     Ok((rate, fmt.m_channels_per_frame, interleaved))
 }
 
@@ -1430,6 +1474,7 @@ fn build_capture_ioproc(
         mono: Vec::with_capacity(max_frames),
         resample: Vec::with_capacity(max_frames * 3),
         dropped_blocks: 0,
+        layout_errors: 0,
     });
     let mut ioproc_id: AudioDeviceIOProcID = std::ptr::null_mut();
     // SAFETY: capture_ioproc 是 AudioDeviceIOProc；ctx 为 Box 持有的
@@ -1820,6 +1865,12 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
                 ctx.dropped_blocks
             );
         }
+        if ctx.layout_errors > 0 {
+            eprintln!(
+                "vdev-mic-agent: capture rejected {} block(s): device buffer layout did not match ASBD (channels/number_channels/bytes)",
+                ctx.layout_errors
+            );
+        }
     }
     // SAFETY: `vdev`/`ioproc_id` are the live pair created above; Stop first
     // quiesces callbacks, then Destroy removes the IOProc. Errors ignored.
@@ -2091,9 +2142,17 @@ mod capture_tests {
             m_sample_rate: rate,
             m_format_id: FORMAT_LINEAR_PCM,
             m_format_flags: flags,
-            m_bytes_per_packet: 4 * ch,
+            m_bytes_per_packet: if flags & FLAG_IS_NON_INTERLEAVED != 0 {
+                4
+            } else {
+                4 * ch
+            },
             m_frames_per_packet: 1,
-            m_bytes_per_frame: 4 * ch,
+            m_bytes_per_frame: if flags & FLAG_IS_NON_INTERLEAVED != 0 {
+                4
+            } else {
+                4 * ch
+            },
             m_channels_per_frame: ch,
             m_bits_per_channel: bits,
             m_reserved: 0,
@@ -2170,6 +2229,16 @@ mod capture_tests {
         let src = [1.0f32, 3.0, 2.0, 4.0];
         let mut dst = [0.0f32; 2];
         assert_eq!(downmix_interleaved(&src, 2, &mut dst), 2);
+        assert_eq!(dst, [2.0, 3.0]);
+    }
+
+    #[test]
+    fn downmix_planar_averages_channels() {
+        let l = [1.0f32, 2.0];
+        let r = [3.0f32, 4.0];
+        let mut dst = [0.0f32; 2];
+        let n = downmix_planar(2, 2, |c, i| if c == 0 { l[i] } else { r[i] }, &mut dst);
+        assert_eq!(n, 2);
         assert_eq!(dst, [2.0, 3.0]);
     }
 
