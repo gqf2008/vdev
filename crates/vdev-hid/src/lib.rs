@@ -51,8 +51,27 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 }
 
 /// 输入一段文本（Unicode 走 unicode string 通道，可输入中文等）。
+///
+/// 逐字符 paced 发射：`cgevents::type_string` 把每个字符的 down/up 背靠背
+/// 连发（都用 keycode 0），macOS 26 实测会被 `WindowServer` 合并/丢弃——同一
+/// 探针窗下 `"q1q1"` 只到达 0–2 个字符，而单键 `tap_key`（down/up 间有
+/// `GAP`）稳定得多。这里与 `tap_key` 对齐：down 后 `GAP`、up 后 `GAP`
+/// 再发下一个字符。
 pub fn type_text(text: &str) -> Result<()> {
-    cgevents::type_string(text, LOCATION).map_err(|e| err(&e))
+    for ch in text.chars() {
+        let chunk = ch.to_string();
+        KeyEvent::down(0)
+            .with_unicode(&chunk)
+            .post(LOCATION)
+            .map_err(|e| err(&e))?;
+        thread::sleep(GAP);
+        KeyEvent::up(0)
+            .with_unicode(&chunk)
+            .post(LOCATION)
+            .map_err(|e| err(&e))?;
+        thread::sleep(GAP);
+    }
+    Ok(())
 }
 
 /// 移动鼠标到绝对坐标（点坐标，原点左上）。
