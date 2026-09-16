@@ -16,15 +16,20 @@
 # 退出码：0 = 全部通过；1 = 有用例失败；2 = 环境不具备（没验证，不算通过）
 set -u
 
+# `--self-test` 可前置：它只跑"准备注入器 app"的行为自测，不需要 vdev / 探针 / 前台焦点
+SELF_TEST=0
+if [ "${1:-}" = "--self-test" ]; then SELF_TEST=1; shift; fi
 VDEV=${1:-target/release/vdev}
-if [ ! -x "${VDEV}" ]; then
+if [ "${SELF_TEST}" = "0" ] && [ ! -x "${VDEV}" ]; then
   echo "FAIL: vdev 二进制不可执行：${VDEV}（先 cargo build -p vdev-host --release）"
   exit 2
 fi
 VDEV=$(cd "$(dirname "${VDEV}")" && pwd)/$(basename "${VDEV}")
-for tool in swiftc python3 open; do
-  command -v "${tool}" >/dev/null 2>&1 || { echo "FAIL: 缺 ${tool}"; exit 2; }
-done
+if [ "${SELF_TEST}" = "0" ]; then
+  for tool in swiftc python3 open; do
+    command -v "${tool}" >/dev/null 2>&1 || { echo "FAIL: 缺 ${tool}"; exit 2; }
+  done
+fi
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 RUN_DIR=$(mktemp -d -t vdev-hid-access.XXXXXX)
@@ -35,6 +40,7 @@ RUN_DIR=$(mktemp -d -t vdev-hid-access.XXXXXX)
 #                          作为 A / A2 的未授权对照（用固定 id 会被历史授权污染）
 INJECTOR_DIR="${HOME}/.vdev-hid-injector"
 INJECTOR_APP="${INJECTOR_DIR}/VdevHidInjector.app"
+LOCK_DIR="${INJECTOR_DIR}/.lock"
 UNAUTH_ID="com.vdev.hid.injector.unauth.$$.$(date +%s)"
 INJECTOR_APP_UNAUTH="${RUN_DIR}/VdevHidUnauth.app"
 SECURE_HELPER_BIN="${RUN_DIR}/secure-input-hold"
@@ -43,6 +49,8 @@ cleanup() {
   pkill -x VdevHidProbe 2>/dev/null || true
   pkill -x SecureInputHold 2>/dev/null || true
   rm -rf "${RUN_DIR}"
+  # 注入器目录的互斥锁也让位于同一个 EXIT trap（脚本里只能有一处 EXIT trap）
+  rmdir "${INJECTOR_DIR:-/nonexistent}/.lock" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -68,27 +76,56 @@ cat > "${PROBE_APP}/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-# 2) 稳定注入器 app（固定 id + **稳定签名**，供人工授权一次后长期有效）
+# 2) 准备"稳定注入器 app"（固定 id + 稳定签名 + 只在必要时重写）
 #
-# 为什么要签名：未签名的 app，TCC 的授权要求是 `cdhash H"..."`（实测 csreq 40 字节），
-# 而本脚本每轮都会把新的 vdev 二进制拷进 bundle —— cdhash 一变，人工授权立刻失配
+# 为什么要签名：未签名的 app，TCC 的授权要求是 `cdhash H"..."`（实测 csreq 40B），
+# 而脚本每轮都会把新的 vdev 二进制拷进 bundle —— cdhash 一变，人工授权立刻失配
 # （issue #58）。用 Apple Development/Developer ID 签名后，要求变成
 # `identifier "com.vdev.hid.injector" and anchor apple generic and certificate leaf[…]`，
-# 与二进制内容无关，授权才能跨运行跨重建稳定。
+# 与二进制内容无关（实测把可执行文件换掉重签，DR 一字不变）。
 #
-# 旁证：本机签名版 VDCamera.app 的 TCC csreq 就是这种身份型要求（160 字节）。
-INJECTOR_BIN="${INJECTOR_APP}/Contents/MacOS/VdevHidInjector"
-# 戳记必须记"源二进制的 sha256"，**不能**拿 bundle 内二进制去 cmp：
-# codesign 会把签名嵌进 Mach-O 本身，签过名的可执行文件永远不等于源文件。
-INJECTOR_STAMP="${INJECTOR_DIR}/.injector-source.sha256"
-mkdir -p "${INJECTOR_APP}/Contents/MacOS" "${INJECTOR_DIR}"
-VDEV_SHA=$(shasum -a 256 "${VDEV}" | awk '{print $1}')
-if [ ! -f "${INJECTOR_BIN}" ] || [ ! -f "${INJECTOR_STAMP}" ] \
-   || [ "$(cat "${INJECTOR_STAMP}" 2>/dev/null)" != "${VDEV_SHA}" ]; then
-  cp "${VDEV}" "${INJECTOR_BIN}"
-  INJECTOR_NEEDS_SIGN=1
-fi
-cat > "${INJECTOR_APP}/Contents/Info.plist" <<'IPLIST'
+# 准备策略（审查 B1 修正版）：**只有"源 sha 同名 + 期望身份一致 + codesign 校验通过"
+# 三者都满足才复用**；否则重写+重签。签名或校验失败时**不写戳**，避免把坏状态永久固化。
+resolve_sign_identity() {
+  # 优先 Apple Development（与本仓 crates/vdev-camera/Makefile 一致），其次 Developer ID
+  if [ -n "${VDEV_HID_SIGN_IDENTITY:-}" ]; then
+    printf '%s' "${VDEV_HID_SIGN_IDENTITY}"; return
+  fi
+  local pref="Apple Development: qingfeng gao (7L8FV63FAP)"
+  if security find-identity -v -p codesigning 2>/dev/null | grep -qF "${pref}"; then
+    printf '%s' "${pref}"; return
+  fi
+  local devid
+  devid=$(security find-identity -v -p codesigning 2>/dev/null | sed -nE 's/.*"(Developer ID Application: [^"]+)".*/\1/p' | head -1)
+  if [ -n "${devid}" ]; then printf '%s' "${devid}"; return; fi
+  printf '%s' "-"   # 没有任何可用身份 → ad-hoc（并会在下面 WARN）
+}
+
+# 返回 0=刚准备好（重写/重签过），1=复用了现有 bundle
+prepare_injector_app() {
+  local src=$1 app=$2 stamp=$3 identity=$4
+  local bin="${app}/Contents/MacOS/VdevHidInjector"
+  local want_state
+  if [ "${identity}" = "-" ]; then want_state="adhoc"; else want_state="signed:${identity}"; fi
+  local src_sha
+  src_sha=$(shasum -a 256 "${src}" | awk '{print $1}')
+  # 复用条件：三个都满足。只看 sha 会让"签名坏了/身份降级"永久固化（审查 B1）。
+  if [ -f "${bin}" ] && [ -f "${stamp}" ]; then
+    local got_sha got_state
+    got_sha=$(cut -f1 "${stamp}" 2>/dev/null)
+    got_state=$(cut -f2 "${stamp}" 2>/dev/null)
+    if [ "${got_sha}" = "${src_sha}" ] && [ "${got_state}" = "${want_state}" ] \
+       && codesign --verify --strict "${app}" >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  mkdir -p "${app}/Contents/MacOS" "$(dirname "${stamp}")"
+  cp "${src}" "${bin}"
+  # Info.plist 也只在内容变了才写：签名之后再改 plist 会让签名失效（审查 B1）
+  local plist="${app}/Contents/Info.plist"
+  local tmp_plist
+  tmp_plist=$(mktemp -t vdev-injector-plist)
+  cat > "${tmp_plist}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -99,27 +136,117 @@ cat > "${INJECTOR_APP}/Contents/Info.plist" <<'IPLIST'
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
-IPLIST
+PLIST
+  if [ ! -f "${plist}" ] || ! cmp -s "${tmp_plist}" "${plist}"; then
+    cp "${tmp_plist}" "${plist}"
+  fi
+  rm -f "${tmp_plist}"
+  if ! codesign --force --sign "${identity}" -i com.vdev.hid.injector \
+       --options runtime --timestamp=none "${app}" >/dev/null 2>&1; then
+    echo "WARN: 签名失败（identity='${identity}'）：本 bundle 不会被标记就绪，下次运行会重试。" >&2
+    return 0
+  fi
+  if ! codesign --verify --strict "${app}" >/dev/null 2>&1; then
+    echo "WARN: 签名后 codesign --verify --strict 失败：不写戳，下次运行会重试。" >&2
+    return 0
+  fi
+  # 只有"签名 + 校验"都过了才写戳
+  printf '%s\t%s' "${src_sha}" "${want_state}" > "${stamp}"
+  return 0
+}
 
-# 2a) 签名（身份可复现时）
-# 优先 Apple Development（与本仓 crates/vdev-camera/Makefile 的 SIGN_APP_IDENTITY 一致），
-# 其次 Developer ID；都没有则退回 ad-hoc 并**明确警告**——那种情况下 D 段的授权
-# 每轮都会失效，必须让使用者知道。
-INJECTOR_SIGN_IDENTITY="${VDEV_HID_SIGN_IDENTITY:-Apple Development: qingfeng gao (7L8FV63FAP)}"
-if [ -n "${INJECTOR_NEEDS_SIGN:-}" ]; then
-  if codesign --force --sign "${INJECTOR_SIGN_IDENTITY}" -i com.vdev.hid.injector \
-       --options runtime --timestamp=none "${INJECTOR_APP}" >/dev/null 2>&1; then
-    echo "  注入器已用稳定身份签名：${INJECTOR_SIGN_IDENTITY}"
-    printf '%s' "${VDEV_SHA}" > "${INJECTOR_STAMP}"
+# ---- 自测模式：不需要证书、不需要前台焦点，供 CI/冒烟做**行为级**守卫 ----
+# 用法：macos-hid-access-verify.sh --self-test
+#
+# 为什么要它：只 grep 标识符的守卫抓不住"把修复摘掉"的写法（例如把签名换成
+# `--sign -`、删掉 INJECTOR_NEEDS_SIGN 的赋值、把写戳删掉）——审查 B2 实测那些
+# 变异都能骗过纯字符串守卫。这里直接跑 prepare_injector_app 的行为。
+if [ "${SELF_TEST}" = "1" ]; then
+  TMP_SELF=$(mktemp -d -t vdev-injector-selftest.XXXXXX)
+  SELF_OK=1
+  SELF_SRC="${TMP_SELF}/src.bin"
+  SELF_APP="${TMP_SELF}/App.app"
+  SELF_STAMP="${TMP_SELF}/stamp"
+  SELF_BIN="${SELF_APP}/Contents/MacOS/VdevHidInjector"
+  # 夹具用**未被改动的** Mach-O：给 Apple 自带二进制追加字节会破坏它的签名，
+  # codesign 会以 "main executable failed strict validation" 拒签——那是夹具问题，
+  # 不是被测逻辑问题。所以"源变了"用**换一个源文件**表达，而不是改同一个文件。
+  if [ -x "${VDEV}" ]; then SELF_SRC0="${VDEV}"; else SELF_SRC0="/bin/echo"; fi
+  cp "${SELF_SRC0}" "${SELF_SRC}"
+  # "源变了"必须换**内容不同**的文件：拿同一个 vdev 复制一份 sha 不变，会被正确复用
+  SELF_SRC2="${TMP_SELF}/src2.bin"
+  cp /bin/ls "${SELF_SRC2}"
+  sha_of() { shasum -a 256 "$1" | awk '{print $1}'; }
+  stat_of() { stat -f "%m %i" "$1"; }
+
+  echo "== 1) 首跑：应重写并写状态戳 =="
+  prepare_injector_app "${SELF_SRC}" "${SELF_APP}" "${SELF_STAMP}" "-" >/dev/null || true
+  [ -f "${SELF_STAMP}" ] || { echo "FAIL: 首跑没有写戳"; SELF_OK=0; }
+  grep -q "adhoc" "${SELF_STAMP}" 2>/dev/null || { echo "FAIL: 戳里没有身份状态"; SELF_OK=0; }
+  SELF_M1=$(stat_of "${SELF_BIN}")
+  SELF_SHA1=$(sha_of "${SELF_SRC2}")
+
+  echo "== 2) 源与身份都没变：应复用（不重写、不重签）=="
+  if prepare_injector_app "${SELF_SRC}" "${SELF_APP}" "${SELF_STAMP}" "-" >/dev/null 2>&1; then
+    echo "FAIL: 源没变却重写了 bundle（会打掉 cdhash 型授权）"; SELF_OK=0
+  fi
+  [ "$(stat_of "${SELF_BIN}")" = "${SELF_M1}" ] || { echo "FAIL: 二进制 mtime/inode 变了"; SELF_OK=0; }
+
+  echo "== 3) 源换了：应重签并更新戳 =="
+  prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "-" >/dev/null || true
+  [ "$(stat_of "${SELF_BIN}")" != "${SELF_M1}" ] || { echo "FAIL: 源变了却没有重写"; SELF_OK=0; }
+  [ "$(cut -f1 "${SELF_STAMP}")" = "$(sha_of "${SELF_SRC2}")" ] || { echo "FAIL: 戳没有跟源更新"; SELF_OK=0; }
+
+  echo "== 4) bundle 被改坏（签名失效）：戳匹配也不该复用（审查 B1）=="
+  printf '<!--tamper-->' >> "${SELF_APP}/Contents/Info.plist"
+  if codesign --verify --strict "${SELF_APP}" >/dev/null 2>&1; then
+    echo "SKIP: 篡改未使 codesign 校验失败（环境差异），本段未验证"
   else
-    echo "WARN: 用 '${INJECTOR_SIGN_IDENTITY}' 签名失败 → 退回 ad-hoc。"
-    # 没签成也记戳：至少避免每轮都无谓重写（重写会让 TCC 的 cdhash 型授权失效）
+    SELF_M4=$(stat_of "${SELF_BIN}")
+    prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "-" >/dev/null || true
+    if codesign --verify --strict "${SELF_APP}" >/dev/null 2>&1; then
+      echo "  坏签名已被自动重做 ✓"
+    else
+      echo "FAIL: 校验失败的 bundle 被戳固化了（没有重做）"; SELF_OK=0
+    fi
+    [ "$(stat_of "${SELF_BIN}")" != "${SELF_M4}" ] || { echo "FAIL: 没有真的重写二进制"; SELF_OK=0; }
+  fi
+
+  echo "== 5) 身份变化：应重签（戳里记了身份，不只是 sha）=="
+  if prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "signed:fake-identity" >/dev/null 2>&1; then
+    echo "  身份变化已触发重做 ✓"
+  else
+    echo "FAIL: 身份变化没有触发重签（戳只比了 sha）"; SELF_OK=0
+  fi
+
+  rm -rf "${TMP_SELF}"
+  if [ "${SELF_OK}" = "1" ]; then echo HID_INJECTOR_SELFTEST=PASS; exit 0; fi
+  echo HID_INJECTOR_SELFTEST=FAIL
+  exit 1
+fi
+
+INJECTOR_STAMP="${INJECTOR_DIR}/.injector-source.sha256"
+mkdir -p "${INJECTOR_DIR}"
+# 并发保护：两份脚本同时改同一个 bundle 会把签名踩坏（审查 B1 实测）
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  echo "NOT_RUN: 另一个 ${0##*/} 实例正在准备同一个注入器（${LOCK_DIR}）；本脚本不支持并发运行。"
+  echo "HID_ACCESS_RESULT=NOT_RUN"
+  exit 2
+fi
+
+INJECTOR_SIGN_IDENTITY=$(resolve_sign_identity)
+if prepare_injector_app "${VDEV}" "${INJECTOR_APP}" "${INJECTOR_STAMP}" "${INJECTOR_SIGN_IDENTITY}"; then
+  if [ "${INJECTOR_SIGN_IDENTITY}" = "-" ]; then
+    echo "WARN: 没有可用的签名身份 → 注入器退回 ad-hoc。"
     echo "WARN: ad-hoc 的 TCC 授权要求是 cdhash，二进制一变授权就失效（issue #58）；"
     echo "WARN: D 段（授权前报错 → 授权后可用）将无法跨运行复现。"
-    printf '%s' "${VDEV_SHA}" > "${INJECTOR_STAMP}"
+  else
+    echo "  注入器已用稳定身份签名：${INJECTOR_SIGN_IDENTITY}"
   fi
+else
+  echo "  注入器复用现有 bundle（源与身份都未变、签名校验通过）"
 fi
-# 把「TCC 会拿到的要求」打出来做证据：身份型要求里不该出现 cdhash
+echo "  注入器 codesign --verify --strict: $(codesign --verify --strict "${INJECTOR_APP}" >/dev/null 2>&1 && echo OK || echo FAILED)"
 INJECTOR_DR=$(codesign -dr - "${INJECTOR_APP}" 2>&1 | tail -1)
 echo "  注入器 designated requirement: ${INJECTOR_DR}"
 case "${INJECTOR_DR}" in
@@ -169,7 +296,7 @@ fi
 # 还没真正拿到前台），先跑一个 throwaway 实例把它消化掉。
 warm_out="${RUN_DIR}/warmup.out"
 : > "${warm_out}"
-open -W -n "${PROBE_APP}" --args "${warm_out}" 1 >/dev/null 2>&1 || true
+open -W -n "${PROBE_APP}" --args "${warm_out}" 1 >/dev/null || true
 
 # 锁屏前置判定：锁屏下任何 App 都无法成为前台/键窗口（探针会一直 READY
 # active=false），此时既不能验证也不该判红——按"没验证 ≠ 通过"退出 2。
@@ -207,7 +334,7 @@ run_case() {
   # 探针有 4s 等待窗口，所以要在它跑起来后立刻置前。
   for _ in $(seq 1 30); do
     if pgrep -x VdevHidProbe >/dev/null 2>&1; then
-      osascript -e 'tell application "System Events" to set frontmost of process "VdevHidProbe" to true' >/dev/null 2>&1 || true
+      osascript -e 'tell application "System Events" to set frontmost of process "VdevHidProbe" to true' >/dev/null || true
       break
     fi
     sleep 0.1
@@ -232,6 +359,9 @@ run_case() {
     return
   fi
   : > "${RUN_DIR}/inject.out"; : > "${RUN_DIR}/inject.err"
+  # READY 之后仍可能有极短的在途事件（探针已在 READY 时清零计数，这里再降一点概率）。
+  # 两种注入方式都要等，不能只等 direct —— app 分支正是 #58 的路径（审查 S2）。
+  sleep 0.3
   if [ "${mode}" = "app" ]; then
     local app=$1; shift
     # VDEV_HID_CASE_ENV：可选的 `open --env K=V`（阳性对照用，见 A2）。
@@ -244,10 +374,7 @@ run_case() {
         "${app}" --args "$@" 2>/dev/null
     fi
   else
-    # READY 之后仍可能有极短的在途事件，注入前留一小段静默期（探针已在 READY
-  # 时清零计数，这里只是再降一点概率）
-  sleep 0.3
-  "$@" > "${RUN_DIR}/inject.out" 2>&1
+    "$@" > "${RUN_DIR}/inject.out" 2>&1
   fi
   inject_out_text="$(cat "${RUN_DIR}/inject.out" "${RUN_DIR}/inject.err" 2>/dev/null)"
   echo "  inject_out=$(echo "${inject_out_text}" | tr '\n' ' ' | tail -c 160)"
@@ -351,6 +478,7 @@ if [ "${post_d}" = "true" ]; then
     fail "D: 该身份已授权（post_access=true）却只送达 '${probe_typed}'"
   fi
 else
+  env_fail "D: 稳定注入器身份尚未授权 → #58 的\"授权跨运行持久\"这一段没有验证（整体 PASS 不能代表它已验收）"
   echo "  D: 该身份尚未授权——在 系统设置 → 隐私与安全性 → 辅助功能 里加入"
   echo "     ${INJECTOR_APP} 后重跑本脚本，可复现「授权前报错 → 授权后可用」"
   echo "     （若列表里已有同名旧条目：那是 cdhash 型的失效授权，先 \"-\" 删掉再重新添加，"

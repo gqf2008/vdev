@@ -99,8 +99,8 @@ while Date() < deadline && !(app.isActive && window.isKeyWindow) {
 window.typed = ""
 window.keys = 0
 tapCount = 0
-// tap 计数的基线仍放在 READY 行：验收脚本只应比较注入前后的增量，
-// 避免用户/系统在同一窗口内产生的真实键事件被误算成注入丢失。
+// 清零即基线：READY 行报出来的 tap=0 就是"从这一刻起"的计数，验收脚本比较的是
+// 注入前后的增量，因此用户/系统在同一窗口内产生的真实键事件不会被误算成注入丢失。
 report("READY active=\(app.isActive) key=\(window.isKeyWindow) tap_ok=\(tapOk) tap=\(tapCount)")
 
 DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
