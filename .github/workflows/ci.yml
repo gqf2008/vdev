@@ -49,6 +49,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
+      - name: macOS acceptance scripts smoke
+        run: ./scripts/acceptance/macos-smoke.sh
       - name: fmt
         run: cargo fmt --all -- --check
       - name: check
