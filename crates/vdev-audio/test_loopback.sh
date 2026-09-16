@@ -2,8 +2,11 @@
 # vdev-audio 环回测试：播放 440Hz 到输出流，同时从输入流录制，检查非静音占比。
 # 设备索引随系统设备列表变化，动态探测。
 set -e
-OUT_IDX=$(ffmpeg -hide_banner -f lavfi -i "sine=frequency=440:duration=1" -f audiotoolbox -list_devices true - 2>&1 | grep 'vdev-audio,' | grep -oE '\[[0-9]+\]' | head -1 | tr -d '[]')
-IN_IDX=$(ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | grep 'vdev-audio' | grep -oE '\[[0-9]+\]' | head -1 | tr -d '[]')
+# AudioToolbox 设备行形如 `[2] vdev-audio A, vdev-audio-A-device`；ffmpeg 8.1
+# 不再输出裸 `vdev-audio,`，必须按含 A/B 的设备名匹配。固定选 A，保证输出与输入
+# 取的是同一台设备的环回端点。
+OUT_IDX=$(ffmpeg -hide_banner -f lavfi -i "sine=frequency=440:duration=1" -f audiotoolbox -list_devices true - 2>&1 | grep -E 'vdev-audio A,' | grep -oE '\[[0-9]+\]' | head -1 | tr -d '[]')
+IN_IDX=$(ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | grep 'vdev-audio A' | grep -oE '\[[0-9]+\]' | head -1 | tr -d '[]')
 if [ -z "$OUT_IDX" ] || [ -z "$IN_IDX" ]; then
   echo "FAIL: 未找到 vdev-audio 设备（输出索引='$OUT_IDX' 输入索引='$IN_IDX'）"
   exit 1
