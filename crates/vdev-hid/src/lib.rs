@@ -45,14 +45,19 @@ pub struct InputAccess {
 
 /// 是否处于安全输入（Carbon `IsSecureEventInputEnabled`）。
 ///
-/// 安全输入打开时系统会丢弃合成的键鼠事件（密码框、终端"安全键盘输入"等），
-/// 这是 `CGEvent` 用户态路线绕不过去的系统行为，只能提前告知。
+/// 语义是**全局**的：SDK 头文件写明 "enabled by *any* process"——别的 App 挂着
+/// 密码框 / 另一个终端开了「安全键盘输入」/ 历史进程异常退出留下标志，都会让本
+/// 进程的合成事件整体失效。
+///
+/// 线程安全：SDK 把该 API 标注为非线程安全（要求主线程调用），而这里可能从任意
+/// 线程读；它只返回全局布尔、不做状态迁移，实测可用，但**不作为并发保证**。
 fn secure_event_input_enabled() -> bool {
     #[link(name = "Carbon", kind = "framework")]
     extern "C" {
         fn IsSecureEventInputEnabled() -> u8;
     }
-    // SAFETY: 无参数、无所有权转移的 Carbon 查询；失败只会返回 0/1。
+    // SAFETY: 无参数、无所有权转移、无副作用的 Carbon 查询（Boolean = unsigned char）；
+    // 失败只会返回 0/1，不涉及指针或生命周期。
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
@@ -73,13 +78,17 @@ pub fn input_access() -> InputAccess {
 /// 可跳过本检查（仅在确认 `CGPreflightPostEventAccess` 误报时使用）。
 pub fn ensure_injection_ready() -> Result<()> {
     let access = input_access();
-    if access.secure_input {
+    // 逃生口同时跳过两条检查：安全输入是**全局**标志（别的进程留下残留时本机
+    // 会全量硬失败），没有逃生口会把用户困死。
+    let skip_checks = std::env::var_os("VDEV_HID_SKIP_ACCESS_CHECK").is_some();
+    if access.secure_input && !skip_checks {
         return Err(anyhow!(
             "系统正处于「安全输入」（Secure Input），合成事件会被系统丢弃。\
-             请先关闭密码框 / 终端的\"安全键盘输入\"（Terminal → 编辑 → 安全键盘输入）后重试。"
+             请先关闭密码框 / 终端的\"安全键盘输入\"（Terminal → 编辑 → 安全键盘输入）后重试；\
+             确认是残留标志时可设 VDEV_HID_SKIP_ACCESS_CHECK=1 跳过本检查。"
         ));
     }
-    if !access.post && std::env::var_os("VDEV_HID_SKIP_ACCESS_CHECK").is_none() {
+    if !access.post && !skip_checks {
         return Err(anyhow!(
             "缺少「辅助功能」权限：当前身份 `CGPreflightPostEventAccess=false`，\
              CGEventPost 会被系统静默丢弃（不报错、也不产生按键）。\
@@ -157,8 +166,7 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
 
 /// 点击：先移动到目标再按下/松开。
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
-    // mouse_move 内部已过护栏；这里再查一次是为了让点击在"移动后权限被改"时也拦得住
-    ensure_injection_ready()?;
+    // 护栏由 mouse_move 负责（同一调用内先执行），点击本身不再重复预检。
     mouse_move(x, y)?;
     MouseEvent::button_down(Point::new(x, y), button)
         .post(LOCATION)

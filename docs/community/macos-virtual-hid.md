@@ -30,7 +30,7 @@ macOS 把所有输入事件汇成一条流，Quartz Event Services 在这条流�
 `CGEventPost` 的 target 参数就是这三选一。vdev 把注入点固定在最上游：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:19
+// crates/vdev-hid/src/lib.rs:25
 /// 事件注入位置：HID 会话层，全局生效。
 const LOCATION: TapLocation = TapLocation::Hid;
 ```
@@ -64,7 +64,7 @@ vdev 提供一张"键名 → 键码"表。字母与控制键复用 `cgevents::Ke
 "f12" => 0x6F,
 ```
 
-表外有两道保护：`by_name()` 查不到返回 `None`，CLI 报 `unknown key: … (see vdev hid key --help)`（`crates/vdev-host/src/main.rs:177`）；帮助文本里的键名列表来自同一张表的 `NAMES` 常量，并有单测锁死「NAMES 里每个名字都必须能被 `by_name` 解析」以及全部别名收录（`crates/vdev-hid/src/keycodes.rs:188–211`）——帮助信息与解析逻辑永不漂移。
+表外有两道保护：`by_name()` 查不到返回 `None`，CLI 报 `unknown key: … (see vdev hid key --help)`（`crates/vdev-host/src/main.rs:207`）；帮助文本里的键名列表来自同一张表的 `NAMES` 常量，并有单测锁死「NAMES 里每个名字都必须能被 `by_name` 解析」以及全部别名收录（`crates/vdev-hid/src/keycodes.rs:188–211`）——帮助信息与解析逻辑永不漂移。
 
 注意 CLI **只收键名、不收数字键码**：`vdev hid key space` 可以，`vdev hid key 49` 不行。要发任意原始键码，得用库 API `key(keycode, pressed)`。
 
@@ -73,7 +73,7 @@ vdev 提供一张"键名 → 键码"表。字母与控制键复用 `cgevents::Ke
 最底层的是 `key()`：一个 `KeyEvent::down/up(keycode)` 构造出键盘事件，`post(LOCATION)` 注入了事。往上一层是点按 `tap_key`：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:40-51
+// crates/vdev-hid/src/lib.rs:115-127
 pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
     KeyEvent::down(keycode)
         .with_modifiers(modifiers)
@@ -92,7 +92,7 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 
 1. **down 和 up 都要带 modifiers**。修饰键以 flags 形式附着在事件上（底层 `CGEventSetFlags`），只给 down 不给 up，接收方会认为修饰键还按着不放；
 2. **flags 是"替换"而非"叠加"**——合成事件会整体覆盖 flags 字段，物理按住的修饰键在这一瞬间被"顶掉"。要做物理+合成组合键，得先读当前 flags 再合并（vdev 没做，它的用例不需要）；
-3. **GAP = 12ms**（`crates/vdev-hid/src/lib.rs:22`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
+3. **GAP = 12ms**（`crates/vdev-hid/src/lib.rs:28`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
 
 修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:198–215`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
 
@@ -113,10 +113,10 @@ for ch in s.chars() {
 
 注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。
 
-**vdev 没有直接封装 `type_string`**：上面的 down/up 背靠背连发没有任何间隔，macOS 26 实测会被 `WindowServer` 合并/丢弃——`vdev hid type "q1q1"` 三轮只到达 2/0/2 个字符（`hello from vdev` 在全局 EventTap 上只看到 2/15 个 KeyDown），而同机同负载下 `System Events` 的 `keystroke` 三轮都是 4/4。`type_text`（`crates/vdev-hid/src/lib.rs:60–80`）因此自己按 `tap_key` 的节拍逐字符发射：整串共用一个 private `EventSource`，每个字符 down 后 `GAP`、up 后再 `GAP` 才发下一个：
+**vdev 没有直接封装 `type_string`**：上面的 down/up 背靠背连发没有任何间隔，macOS 26 实测会被 `WindowServer` 合并/丢弃——`vdev hid type "q1q1"` 三轮只到达 2/0/2 个字符（`hello from vdev` 在全局 EventTap 上只看到 2/15 个 KeyDown），而同机同负载下 `System Events` 的 `keystroke` 三轮都是 4/4。`type_text`（`crates/vdev-hid/src/lib.rs:136–157`）因此自己按 `tap_key` 的节拍逐字符发射：整串共用一个 private `EventSource`，每个字符 down 后 `GAP`、up 后再 `GAP` 才发下一个：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:60-80（节选）
+// crates/vdev-hid/src/lib.rs:136-157（节选）
 let source = cgevents::EventSource::private()?;
 for ch in text.chars() {
     let chunk = ch.to_string();
@@ -133,14 +133,14 @@ CLI 一行 `vdev hid type "hello from vdev"` 即可（每字符约 2×`GAP`，�
 
 ## 四、鼠标注入
 
-鼠标三条命令对应三种事件构造，全部发生在 `crates/vdev-hid/src/lib.rs:82–107`：
+鼠标三条命令对应三种事件构造，全部发生在 `crates/vdev-hid/src/lib.rs:159–187`：
 
-**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`crates/vdev-hid/src/lib.rs:82` 注释），Retina 屏上这里是"点"不是物理像素。
+**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`crates/vdev-hid/src/lib.rs:159` 注释），Retina 屏上这里是"点"不是物理像素。
 
 **点击**：先 `mouse_move` 到目标，再 `button_down` + GAP + `button_up`：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:90-100
+// crates/vdev-hid/src/lib.rs:159-187
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
     mouse_move(x, y)?;
     MouseEvent::button_down(Point::new(x, y), button)
@@ -156,7 +156,7 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 
 先 move 再 down 不是多余的：目标 App 的悬停状态（tooltip、hover 高亮）依赖 moved 事件先到位。按钮经 CLI 的 `parse_button` 解析，支持 left/right/middle（middle 别名 center，`crates/vdev-host/src/main.rs:113–118`）。事件构造最终落在 Swift 侧的 `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)`——注意 vdev **没有显式设置 clickState**，即按系统默认的单击语义；要合成双击/三击，需自己给事件的 `kCGMouseEventClickState` 字段递增计数。
 
-**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`crates/vdev-hid/src/lib.rs:102–107`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
+**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`crates/vdev-hid/src/lib.rs:182–187`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
 
 ## 五、监听侧：vdev hid listen
 
@@ -166,7 +166,7 @@ vdev 在注入入口做 `CGPreflightPostEventAccess()` 预检，未授权时明�
 全局事件监听则是另一条同样受 TCC 管制的敏感能力。macOS 10.15 起，系统用 `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:116-122
+// crates/vdev-hid/src/lib.rs:196-122
 pub fn listen(seconds: Option<u64>) -> Result<()> {
     if !EventTap::preflight_listen_access() {
         let _ = EventTap::request_listen_access();
@@ -181,7 +181,7 @@ pub fn listen(seconds: Option<u64>) -> Result<()> {
 过了权限关，创建 tap：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:127-131
+// crates/vdev-hid/src/lib.rs:207-131
 let handle = thread::spawn(move || {
     let tap = match EventTap::new(
         TapLocation::Session,
@@ -199,7 +199,7 @@ let handle = thread::spawn(move || {
 最后是**线程归属**——这是这个函数注释里写了整整七行、也是坑 1 的主角：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:124-125,167-169
+// crates/vdev-hid/src/lib.rs:204-125,167-169
 // 创建与运行同线程（见函数注释）；创建结果经 channel 交还主线程，
 // 成功后主线程持有 Arc 句柄用于到点 stop。
 ...
@@ -208,7 +208,7 @@ let handle = thread::spawn(move || {
     }
 ```
 
-EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`crates/vdev-hid/src/lib.rs:184–190`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
+EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`crates/vdev-hid/src/lib.rs:269–274`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
 
 ## 六、踩坑实录
 

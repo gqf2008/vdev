@@ -91,7 +91,11 @@ enum CameraCmd {
     /// 设置设备侧滤镜（经 127.0.0.1:27892 控制通道，立即生效、无需重启扩展）
     ///
     /// spec 形如 "0.3,1,1,0,0,0,0"（亮度,对比度,饱和度,绿幕阈值,锐化,美颜,美白）；
-    /// 传 "off" 关闭参数滤镜。--bg blur 打开背景模糊（Vision 人像分割）。
+    /// 传 "off" **全部关闭**（参数滤镜与背景模糊）。
+    ///
+    /// 语义是**整段替换**：本命令总会把 `VDEV_FILTER` / `VDEV_BG` 两个键都发过去，
+    /// 没显式打开的那个按关闭处理（所以 `filter 0.3` 会把背景模糊一起关掉，
+    /// 要同时开就写 `filter 0.3 --bg blur`）。
     Filter {
         spec: String,
         #[arg(long, default_value = "none")]
@@ -319,6 +323,10 @@ fn send_camera_control(payload: &str) -> Result<String> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", CAMERA_CONTROL_PORT))
         .map_err(|e| anyhow!("连不上设备侧控制通道 127.0.0.1:{CAMERA_CONTROL_PORT}：{e}（虚拟摄像头扩展没在跑？）"))?;
+    // 不设超时的话，端口被别的进程占着且不应答时 CLI 会一直挂着（审查 S3）
+    let timeout = Some(std::time::Duration::from_secs(3));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     let len = u32::try_from(payload.len()).map_err(|_| anyhow!("配置过长"))?;
     let mut hdr = [0u8; 36];
     hdr[0..4].copy_from_slice(&CAMERA_CHANNEL_MAGIC.to_le_bytes());
@@ -330,7 +338,9 @@ fn send_camera_control(payload: &str) -> Result<String> {
     stream.write_all(&hdr)?;
     stream.write_all(payload.as_bytes())?;
     let mut ack = String::new();
-    stream.read_to_string(&mut ack)?;
+    stream
+        .read_to_string(&mut ack)
+        .map_err(|e| anyhow!("控制通道无响应（{e}）：扩展可能没在跑，或 127.0.0.1:{CAMERA_CONTROL_PORT} 被别的进程占着"))?;
     Ok(ack)
 }
 

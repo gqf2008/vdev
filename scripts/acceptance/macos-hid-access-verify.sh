@@ -115,6 +115,13 @@ swiftc -O "${RUN_DIR}/secure-input-hold.swift" -o "${SECURE_HELPER_BIN}" 2>/dev/
   echo "FAIL: 安全输入保持器编译失败"; exit 2;
 }
 
+# 安全输入前置判定：全局面板开着时 A/A2 会因拿到安全输入报错而假红（审查 S9）
+if "${VDEV}" hid access 2>/dev/null | grep -q '^secure_input=true$'; then
+  echo "NOT_RUN: 当前系统处于安全输入（Secure Input），先把密码框 / 终端「安全键盘输入」关掉再跑。"
+  echo "HID_ACCESS_RESULT=NOT_RUN"
+  exit 2
+fi
+
 # 预热：首次 `open` 一个带 bundle 身份的 App 常有激活竞态（探针 READY 了但窗口
 # 还没真正拿到前台），先跑一个 throwaway 实例把它消化掉。
 warm_out="${RUN_DIR}/warmup.out"
@@ -131,8 +138,11 @@ if ioreg -n Root -d1 -a 2>/dev/null | grep -A1 CGSSessionScreenIsLocked | grep -
 fi
 
 fails=0
+env_bad=0
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+# 环境不具备（不是被测功能坏了）：结束时按 NOT_RUN 退出 2
+env_fail() { echo "ENV: $*"; env_bad=$((env_bad + 1)); }
 
 # 跑一次探针窗 + 注入：$1 = direct|app，$2 标签，其余为注入命令
 #   direct: 直接 exec，**继承调用者身份**（已授权终端里就是已授权）
@@ -143,7 +153,9 @@ probe_summary=""
 inject_out_text=""
 run_case() {
   local mode=$1 label=$2; shift 2
-  local out="${RUN_DIR}/$(echo "${label}" | tr -c 'a-zA-Z0-9' '_').out"
+  local slug
+  slug=$(echo "${label}" | tr -c 'a-zA-Z0-9' '_')
+  local out="${RUN_DIR}/${slug}.out"
   : > "${out}"
   open -W -n "${PROBE_APP}" --args "${out}" 3 >/dev/null 2>&1 &
   local open_pid=$!
@@ -209,7 +221,7 @@ open -n -W --stdout "${access_out}" "${INJECTOR_APP_UNAUTH}" --args hid access >
 post_a=$(sed -nE 's/^post_access=(.*)$/\1/p' "${access_out}" | head -1)
 echo "  未授权身份 post_access=${post_a:-<空>}"
 if [ "${post_a}" != "false" ]; then
-  fail "A: 全新 bundle id 的 post_access 却是 '${post_a}'——未授权对照不成立（环境异常）"
+  env_fail "A: 全新 bundle id 的 post_access 却是 '${post_a}'——未授权对照不成立（环境异常，不是被测功能坏了）"
 fi
 
 run_case app A_unauth "${INJECTOR_APP_UNAUTH}" hid type "${TEXT_A}"
@@ -269,7 +281,7 @@ if [ "${probe_typed}" = "__NO_PROBE__" ] || [ "${probe_typed}" = "__NO_FOCUS__" 
 elif echo "${probe_summary}" | grep -q 'active=true key=true' && [ -z "${probe_typed}" ]; then
   fail "B: 已授权身份一个字都没送达，且窗口全程在前台（不是焦点问题）：${probe_summary}"
 elif [ "${post_b}" != "true" ]; then
-  fail "B: 本身份 post_access=${post_b}（不是已授权身份，B 段对照组不成立；请在已授权终端里跑本脚本）"
+  env_fail "B: 本身份 post_access=${post_b}（不是已授权身份，B 段对照组不成立；请在已授权终端里跑本脚本）"
 elif [ "${probe_typed}" = "${TEXT_B}" ]; then
   pass "B: 已授权身份逐字送达（${probe_typed}）"
 else
@@ -331,9 +343,13 @@ if "${VDEV}" hid access 2>/dev/null | grep -q '^secure_input=true$'; then
   fail "C: 安全输入没有恢复（保持器退出后仍为 true）"
 fi
 
-echo "fails=${fails}"
+echo "fails=${fails} env_bad=${env_bad}"
 if [ "${fails}" -gt 0 ]; then
   echo HID_ACCESS_RESULT=FAIL
   exit 1
+fi
+if [ "${env_bad}" -gt 0 ]; then
+  echo "HID_ACCESS_RESULT=NOT_RUN（环境不具备：请在已授权终端里、且系统未处于安全输入时重跑）"
+  exit 2
 fi
 echo HID_ACCESS_RESULT=PASS

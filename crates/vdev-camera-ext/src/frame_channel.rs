@@ -30,6 +30,8 @@ const HEADER_SIZE: usize = 36;
 const CONTROL_PORT: u16 = 27892;
 /// 控制消息 opcode（放在头的 `height` 字段）：设置设备侧滤镜。
 pub const OP_SET_FILTER: u32 = 1;
+/// 控制连接的单向读/写超时。
+const CONTROL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const MAGIC: u32 = 0x5644_4652; // "VDFR"
 const VERSION: u32 = 1;
 /// 头字段钳制：宽高 ≤ 8K；stride 允许 padded（w*4 ≤ stride ≤ w*4 + 8KiB）；
@@ -57,6 +59,8 @@ enum HeaderError {
     Height,
     Stride,
     PayloadLen,
+    /// 控制消息的 opcode 不认识（帧路径不会产生这个错误）
+    Opcode,
 }
 
 /// 取最新注入帧；超过 `max_age` 视为过期（返回 None → 回落彩条）。
@@ -107,7 +111,7 @@ fn parse_control(raw: &[u8; HEADER_SIZE]) -> Result<(u32, usize), HeaderError> {
     }
     let opcode = u32le(raw, 12);
     if opcode != OP_SET_FILTER {
-        return Err(HeaderError::Height);
+        return Err(HeaderError::Opcode);
     }
     if u32le(raw, 16) != 0 {
         return Err(HeaderError::Stride);
@@ -227,6 +231,10 @@ fn handle_conn(mut stream: TcpStream) {
 
 /// 处理一条控制连接：读一条控制消息 → 应用配置 → 回一行 ack（便于 CLI 立即可见）。
 fn handle_control(mut stream: TcpStream) {
+    // 读超时：只发 1 个字节就能让线程永久阻塞在 read_exact，而每条连接一个线程、
+    // 线程数无上限——本机任意进程都能反复"挂线"把扩展拖住（审查 S3）。
+    let _ = stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONTROL_READ_TIMEOUT));
     let mut raw = [0u8; HEADER_SIZE];
     if std::io::Read::read_exact(&mut stream, &mut raw).is_err() {
         return;
@@ -345,7 +353,7 @@ mod tests {
     fn control_header_rejects_unknown_opcode_and_bad_magic() {
         assert_eq!(
             parse_control(&control_header(7, 0, 8)),
-            Err(HeaderError::Height)
+            Err(HeaderError::Opcode)
         );
         let mut raw = control_header(OP_SET_FILTER, 0, 8);
         raw[0] ^= 0xFF;

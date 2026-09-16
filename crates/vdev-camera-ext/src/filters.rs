@@ -325,6 +325,33 @@ mod tests {
         }
     }
 
+    /// 全局 CFG 是进程级状态：**所有**改它的断言必须放在同一条测试里顺序执行，
+    /// 否则并行测试会互相覆盖（本仓已有"全局状态 + 并行测试"的教训）。
+    #[test]
+    fn apply_config_replaces_whole_config_and_can_disable() {
+        // 1) 打开参数滤镜
+        let summary = apply_config("VDEV_FILTER=0.3,1,1,0,0,0,0\n").expect("合法配置应被接受");
+        assert!(summary.contains("参数滤镜"), "{summary}");
+        assert!(enabled(), "配了 VDEV_FILTER 之后 enabled() 必须为真");
+        // 2) 整段替换：只发空 VDEV_FILTER 等于"全关"（含背景模糊）
+        let off = apply_config("VDEV_FILTER=\nVDEV_BG=\n").expect("空值也是合法配置");
+        assert!(off.contains("全部关闭"), "{off}");
+        assert!(!enabled(), "显式空值应把滤镜关掉");
+        // 3) 一个键都没有 → 拒绝，且**不改动**当前状态
+        apply_config("VDEV_FILTER=0.2,1,1,0,0,0,0\n").expect("先打开");
+        assert!(enabled());
+        assert!(apply_config("这不是配置\n# 注释\n").is_err());
+        assert!(enabled(), "被拒绝的配置不能改动现状");
+        assert!(describe().expect("仍启用").contains("参数滤镜"));
+        // 4) 单独开背景模糊也要被接受
+        let blur = apply_config("VDEV_BG=blur\n").expect("单开背景模糊应被接受");
+        assert!(blur.contains("背景模糊"), "{blur}");
+        assert!(enabled());
+        // 收尾：还原成关闭，避免影响同进程其它用例
+        let _ = apply_config("VDEV_FILTER=\nVDEV_BG=\n");
+        assert!(!enabled());
+    }
+
     #[test]
     fn parse_config_reads_known_keys_ignores_noise() {
         // 典型配置正文：注释、空行、未知键、引号、重复键都要能处理

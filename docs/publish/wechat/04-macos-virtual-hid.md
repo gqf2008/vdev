@@ -32,7 +32,7 @@ macOS 把所有输入事件汇成一条流，Quartz Event Services 在这条流�
 `CGEventPost` 的 target 参数就是这三选一。vdev 把注入点固定在最上游：
 
 `rust
-// crates/vdev-hid/src/lib.rs:19
+// crates/vdev-hid/src/lib.rs:25
 /// 事件注入位置：HID 会话层，全局生效。
 const LOCATION: TapLocation = TapLocation::Hid;
 `
@@ -75,7 +75,7 @@ vdev 提供一张"键名 → 键码"表。字母与控制键复用 `cgevents::Ke
 最底层的是 `key`：一个 `KeyEvent::down/up(keycode)` 构造出键盘事件，`post(LOCATION)` 注入了事。往上一层是点按 `tap_key`：
 
 `rust
-// crates/vdev-hid/src/lib.rs:40-51
+// crates/vdev-hid/src/lib.rs:115-51
 pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<> {
  KeyEvent::down(keycode)
  .with_modifiers(modifiers)
@@ -128,7 +128,7 @@ CLI 一行 `vdev hid type "hello from vdev"` 即可（每字符约 2×`GAP`，�
 **点击**：先 `mouse_move` 到目标，再 `button_down` + GAP + `button_up`：
 
 `rust
-// crates/vdev-hid/src/lib.rs:66-76
+// crates/vdev-hid/src/lib.rs:143-76
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<> {
  mouse_move(x, y)?;
  MouseEvent::button_down(Point::new(x, y), button)
@@ -151,7 +151,7 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<> {
 **注入与监听都需要「辅助功能」权限**（2026-09-16 真机实测纠正了早先"注入不需要授权"的说法：未授权身份 `CGEventPost` 被系统静默丢弃，窗口收到 0 个字符而进程 exit 0）。macOS 10.15 起，系统用 `CGPreflightListenEventAccess` / `CGRequestListenEventAccess` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 `rust
-// crates/vdev-hid/src/lib.rs:92-98
+// crates/vdev-hid/src/lib.rs:171-98
 pub fn listen(seconds: Option<u64>) -> Result<> {
  if !EventTap::preflight_listen_access {
  let _ = EventTap::request_listen_access;
@@ -164,7 +164,7 @@ request_listen_access` 会引导系统弹出授权提示；注意授权对象是
 过了权限关，创建 tap：
 
 `rust
-// crates/vdev-hid/src/lib.rs:103-107
+// crates/vdev-hid/src/lib.rs:182-107
 let handle = thread::spawn(move || {
  let tap = match EventTap::new(
  TapLocation::Session,

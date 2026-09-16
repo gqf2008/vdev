@@ -41,8 +41,14 @@ require_grep 'VDEV_HID_SKIP_ACCESS_CHECK=1' scripts/acceptance/macos-hid-access-
 require_grep 'unauth.$$.' scripts/acceptance/macos-hid-access-verify.sh '未授权对照必须用每次全新的 bundle id（固定 id 会被历史授权污染）'
 require_grep 'EnableSecureEventInput' scripts/acceptance/macos-hid-access-verify.sh '安全输入必须用 EnableSecureEventInput 确定性开启，不能靠人工凑状态'
 require_grep 'secure_input=true' scripts/acceptance/macos-hid-access-verify.sh '安全输入用例必须先确认系统真的处于安全输入，再断言行为'
+require_grep 'HID_ACCESS_RESULT=NOT_RUN' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收必须保留 NOT_RUN 出口（锁屏/无权限身份等环境不具备时不算通过）'
+require_grep 'exit 2' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收的环境不具备分支必须 exit 2（与用例失败区分）'
 require_grep '辅助功能' crates/vdev-hid/src/lib.rs '注入路径必须有可诊断的「辅助功能」权限报错文案'
 require_grep 'secure_input' crates/vdev-hid/src/lib.rs '注入路径必须报出安全输入状态'
+# 相机像素池（#54-1）：单测只能证明"池本身会对/会回落"，证明不了 send_bgra 真的用了池——
+# 这条守卫钉住调用点，防止优化被悄悄摘掉却仍然全绿（审查 B1）。
+require_grep 'let Some(pb) = acquire_pixel_buffer(w, h) else {' crates/vdev-camera-ext/src/main.rs 'send_bgra 必须走 acquire_pixel_buffer（像素池复用）'
+require_grep 'fn acquire_buffer_with<FP, FB, FD>' crates/vdev-camera-ext/src/main.rs '像素池必须有可注入的决策内核（复用/回落两条路径要能被单测钉住）'
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "FAIL: 未找到 python3（check-docs.py 需要）" >&2
