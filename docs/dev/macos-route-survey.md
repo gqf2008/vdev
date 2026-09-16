@@ -6,7 +6,7 @@
 
 - **方案**：CGEventPost（Quartz Event Services）合成键盘/鼠标/滚轮事件。
 - **Rust crate**：[cgevents](https://github.com/doom-fish/cgevents-rs)（0.10.1；经 Swift bridge 调用 CoreGraphics，运行期需要 Swift 运行时）。
-- 注入不需要辅助功能权限；拦截（CGEventTap）需要。
+- 注入与拦截（CGEventTap）**都需要「辅助功能」权限**：未授权时 `CGEventPost` 被静默丢弃（实测窗口 0 字符、进程 exit 0），故注入前用 `CGPreflightPostEventAccess()` 预检。
 - 替代路线：DriverKit `IOUserHIDDevice`（C++ only，Rust 需 C ABI 桥，后续再说）。
 
 ## 2. 虚拟摄像头（⚠️ 旧路：CoreMediaIO DAL 已死，现代走 CMIOExtension）

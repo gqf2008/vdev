@@ -18,7 +18,9 @@ use objc2::rc::Retained;
 use objc2::ClassType;
 use objc2_core_media::CMTime;
 use objc2_foundation::NSObjectProtocol;
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSSet, NSString, NSUUID};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSMutableDictionary, NSNumber, NSObject, NSSet, NSString, NSUUID,
+};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,6 +78,11 @@ fn log_server() {
             });
         }
     });
+}
+
+/// 供 `frame_channel` 复用同一日志口（模块间只走这一条日志路径）。
+pub(crate) fn elog_for_channel(msg: impl AsRef<str>) {
+    elog(msg);
 }
 
 fn elog(msg: impl AsRef<str>) {
@@ -146,6 +153,10 @@ struct CVPixelBuffer(*mut c_void);
 unsafe impl Send for CVPixelBuffer {}
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct CVPixelBufferPool(*mut c_void);
+unsafe impl Send for CVPixelBufferPool {}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CMSampleBuffer(*mut c_void);
 unsafe impl Send for CMSampleBuffer {}
 
@@ -165,6 +176,17 @@ extern "C" {
         height: usize,
         pixel_format: u32,
         attrs: *const c_void,
+        out: *mut CVPixelBuffer,
+    ) -> i32;
+    fn CVPixelBufferPoolCreate(
+        allocator: *const c_void,
+        pool_attrs: *const c_void,
+        pixel_buffer_attrs: *const c_void,
+        out: *mut CVPixelBufferPool,
+    ) -> i32;
+    fn CVPixelBufferPoolCreatePixelBuffer(
+        allocator: *const c_void,
+        pool: CVPixelBufferPool,
         out: *mut CVPixelBuffer,
     ) -> i32;
     fn CVPixelBufferLockBaseAddress(buf: CVPixelBuffer, opts: u64) -> i32;
@@ -237,6 +259,29 @@ static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 上一次 `sendSampleBuffer` 里程碑（时刻, 累计帧数），用于打印窗口实测帧率。
 static LAST_MARK: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+/// 像素缓冲池缓存：`(宽, 高, 池)`。帧循环是唯一使用者，尺寸可能被推流方改来改去。
+static POOLS: Mutex<Vec<(u32, u32, CVPixelBufferPool)>> = Mutex::new(Vec::new());
+/// 池缓存上限。**必须有上限**：池按尺寸持有 IOSurface，尺寸是推流方给的，
+/// 无上限时反复换尺寸会把扩展内存顶爆（单个 8K 池就上百 MB）。
+const MAX_POOLS: usize = 4;
+/// 单个池最多同时持有的缓冲数（`CVPixelBufferPoolAllocationThreshold`）。
+/// 超出时 `CreatePixelBuffer` 会失败 → 我们回落「每帧新建」，不会卡住出帧。
+const POOL_ALLOC_THRESHOLD: i32 = 8;
+
+/// 在既有池尺寸表里找匹配项（纯函数，单测用；生产路径内联同样匹配以免每帧分配）。
+#[cfg(test)]
+fn find_pool(keys: &[(u32, u32)], w: u32, h: u32) -> Option<usize> {
+    keys.iter().position(|(pw, ph)| *pw == w && *ph == h)
+}
+
+/// 池数量到达上限时要淘汰的下标（FIFO，淘汰最早创建的）；未到上限返回 `None`。
+fn evict_slot(len: usize, cap: usize) -> Option<usize> {
+    if len >= cap {
+        Some(0)
+    } else {
+        None
+    }
+}
 
 /// 客户端接入：返回接入后的连接数。
 fn client_connected(clients: &AtomicUsize) -> usize {
@@ -509,6 +554,187 @@ fn copy_bgra_rows(dst: &mut [u8], src: &[u8], w: u32, h: u32, stride: u32, dst_s
     }
 }
 
+// ---------------- 像素缓冲池 ----------------
+/// 构造「IOSurface 支撑 + BGRA + w×h」的像素缓冲属性字典（池与回退路径共用口径）。
+///
+/// 键名用 `CoreVideo` 的字符串常量值（`kCVPixelBuffer*Key` 的字符串形态），
+/// 避免为了几个常量再拉一层绑定。
+#[allow(clippy::cast_possible_wrap)]
+fn pixel_buffer_attrs(w: u32, h: u32) -> Retained<NSDictionary<NSObject, NSObject>> {
+    let dict: Retained<NSMutableDictionary<NSObject, NSObject>> = NSMutableDictionary::new();
+    let iosurf: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
+    unsafe {
+        let set = |key: &str, value: &NSObject| {
+            let k = NSString::from_str(key);
+            let _: () = msg_send![&*dict, setObject: value, forKey: &*k];
+        };
+        let fmt = NSNumber::numberWithUnsignedInt(BGR_A);
+        let ww = NSNumber::numberWithUnsignedInt(w);
+        let hh = NSNumber::numberWithUnsignedInt(h);
+        set("PixelFormatType", &fmt);
+        set("Width", &ww);
+        set("Height", &hh);
+        set("IOSurfaceProperties", &iosurf);
+    }
+    // NSMutableDictionary → NSDictionary 是同一实例（子类关系），直接转换所有权
+    unsafe { Retained::cast_unchecked(dict) }
+}
+
+/// 建一个新池（池属性只带并发上限，缓冲属性决定 `IOSurface` 与尺寸）。
+fn create_pixel_buffer_pool(w: u32, h: u32) -> Option<CVPixelBufferPool> {
+    let attrs = pixel_buffer_attrs(w, h);
+    let pool_attrs: Retained<NSMutableDictionary<NSObject, NSObject>> = NSMutableDictionary::new();
+    let k = NSString::from_str("AllocationThreshold");
+    let v = NSNumber::numberWithInt(POOL_ALLOC_THRESHOLD);
+    unsafe {
+        let _: () = msg_send![&*pool_attrs, setObject: &*v, forKey: &*k];
+    }
+    let mut pool = CVPixelBufferPool(ptr::null_mut());
+    let st = unsafe {
+        CVPixelBufferPoolCreate(
+            ptr::null(),
+            std::ptr::from_ref(&*pool_attrs).cast::<c_void>(),
+            std::ptr::from_ref(&*attrs).cast::<c_void>(),
+            std::ptr::from_mut(&mut pool),
+        )
+    };
+    if st != 0 || pool.0.is_null() {
+        // 走节流：建池失败不会被记住，下一帧还会再试，裸 elog 会是 60 行/秒
+        log_pool_fallback(&format!("CVPixelBufferPoolCreate 失败 st={st} {w}x{h}"));
+        return None;
+    }
+    Some(pool)
+}
+
+/// 取（必要时创建）指定尺寸的池。命中缓存时不重复建池。
+fn pool_for(w: u32, h: u32) -> Option<CVPixelBufferPool> {
+    let mut pools = POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 直接定位，避免每帧 collect 一个 Vec（find_pool 保留给单测做纯函数断言）
+    if let Some((_, _, pool)) = pools.iter().find(|(pw, ph, _)| *pw == w && *ph == h) {
+        return Some(*pool);
+    }
+    let pool = create_pixel_buffer_pool(w, h)?;
+    if let Some(slot) = evict_slot(pools.len(), MAX_POOLS) {
+        // 真 FIFO：淘汰队头（最旧）并把新池追加到队尾，保证"最近用过的尺寸"
+        // 不会被后来的尺寸反复顶掉。
+        let (_, _, old) = pools.remove(slot);
+        unsafe { CFRelease(old.0.cast_const()) };
+    }
+    pools.push((w, h, pool));
+    Some(pool)
+}
+
+/// 每帧新建像素缓冲（池不可用时的回退路径，等价于优化前的行为）。
+#[allow(clippy::cast_possible_wrap)]
+fn create_pixel_buffer_direct(w: u32, h: u32) -> Option<CVPixelBuffer> {
+    let attrs = pixel_buffer_attrs(w, h);
+    let mut pb = CVPixelBuffer(ptr::null_mut());
+    let st = unsafe {
+        CVPixelBufferCreate(
+            ptr::null(),
+            w as usize,
+            h as usize,
+            BGR_A,
+            std::ptr::from_ref(&*attrs).cast::<c_void>(),
+            std::ptr::from_mut(&mut pb),
+        )
+    };
+    if st != 0 || pb.0.is_null() {
+        elog(format!("CVPixelBufferCreate 失败 st={st} {w}x{h}"));
+        return None;
+    }
+    Some(pb)
+}
+
+/// 取到缓冲走的是哪条路（供日志节流与单测断言）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquirePath {
+    /// 池复用成功（这是常态，也是本优化唯一的收益来源）
+    Pool,
+    /// 有池但取缓冲失败（典型原因：在途帧数超过 `AllocationThreshold`）
+    DirectPoolFailed,
+    /// 没有可用池（首次建池失败等）
+    DirectNoPool,
+}
+
+/// 取缓冲的**决策内核**：池从哪来、怎么从池里取、怎么回落，全部由调用方注入。
+///
+/// 抽这一层的理由很直白——真机验收只能给出"CPU 降了多少"，无法证明"复用真的发生了"；
+/// 把三条路径抽出来之后，单测可以注入替身直接断言：命中池时**不**走回落、
+/// 池失败时**一定**走回落。没有这层，把 `acquire_pixel_buffer` 换回
+/// `create_pixel_buffer_direct` 也不会有任何测试变红（审查 B1）。
+fn acquire_buffer_with<FP, FB, FD>(
+    pool_fn: FP,
+    from_pool: FB,
+    direct: FD,
+) -> Option<(CVPixelBuffer, AcquirePath)>
+where
+    FP: FnOnce() -> Option<CVPixelBufferPool>,
+    FB: FnOnce(CVPixelBufferPool) -> Option<CVPixelBuffer>,
+    FD: FnOnce() -> Option<CVPixelBuffer>,
+{
+    match pool_fn() {
+        Some(pool) => match from_pool(pool) {
+            Some(pb) => Some((pb, AcquirePath::Pool)),
+            None => direct().map(|pb| (pb, AcquirePath::DirectPoolFailed)),
+        },
+        None => direct().map(|pb| (pb, AcquirePath::DirectNoPool)),
+    }
+}
+
+/// 池失败日志节流：池耗尽（消费端滞后）是**正常瞬态**，但回落是每帧发生的，
+/// 不节流就会以 60 行/秒写进不轮转的日志文件（审查 S5）。
+static LAST_POOL_FALLBACK_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// 同一条回落日志的最小间隔。
+const POOL_FALLBACK_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 节流后的池回落日志：首次立即打，之后同一条至少间隔 `POOL_FALLBACK_LOG_INTERVAL`。
+/// 建池失败**不缓存失败**、下一帧会重试，所以这条路径本身就是高频的。
+fn log_pool_fallback(msg: &str) {
+    let mut last = LAST_POOL_FALLBACK_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let due = last.is_none_or(|t| t.elapsed() >= POOL_FALLBACK_LOG_INTERVAL);
+    if !due {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    elog(msg);
+}
+
+/// 取一个可写的、IOSurface 支撑的像素缓冲：优先复用池里的（免掉每帧
+/// `IOSurface` 分配 + 清零，这是 60fps 下主要固定成本），池不可用则回退新建。
+///
+/// 复用安全性：`CMSampleBufferCreateForImageBuffer` 会 retain 该缓冲，客户端
+/// 拿着 sample buffer 时缓冲的引用计数不为 0，池不会把它再发出来——不存在
+/// 「回收了还在用的缓冲」。
+fn acquire_pixel_buffer(w: u32, h: u32) -> Option<CVPixelBuffer> {
+    let acquired = acquire_buffer_with(
+        || pool_for(w, h),
+        |pool| {
+            let mut pb = CVPixelBuffer(ptr::null_mut());
+            // SAFETY: pool 来自 CVPixelBufferPoolCreate（我们持有其所有权）；
+            // out 指针指向栈上局部，调用期间有效。
+            let st = unsafe {
+                CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, ptr::from_mut(&mut pb))
+            };
+            if st == 0 && !pb.0.is_null() {
+                Some(pb)
+            } else {
+                log_pool_fallback(&format!("池取缓冲失败 st={st} {w}x{h}"));
+                None
+            }
+        },
+        || create_pixel_buffer_direct(w, h),
+    );
+    acquired.map(|(pb, _path)| pb)
+}
+
+/// 旧签名保留给"直接走池"的调用点（当前只有 `acquire_pixel_buffer`）。
+#[allow(dead_code)]
 // ---------------- 帧循环 ----------------
 /// 把一帧 BGRA 数据包成 `CMSampleBuffer` 发给流。
 // 单个 unsafe 块按流水线顺序组合一组 C FFI / ObjC 调用（创建像素缓冲 → 拷贝 →
@@ -523,27 +749,11 @@ fn send_bgra(
     stride: u32,
     pts_ns: u64,
 ) {
+    // 取缓冲（池复用优先，失败回落每帧新建）；拿不到就这帧不发，下帧再来
+    let Some(pb) = acquire_pixel_buffer(w, h) else {
+        return;
+    };
     unsafe {
-        let iosurf_key = NSString::from_str("IOSurfaceProperties");
-        let empty_dict: Retained<NSDictionary<NSObject, NSObject>> = NSDictionary::new();
-        let attrs: Retained<NSDictionary<NSObject, NSObject>> = msg_send![
-            <NSDictionary<NSObject, NSObject>>::class(),
-            dictionaryWithObject: &*empty_dict,
-            forKey: &*iosurf_key
-        ];
-        let mut pb = CVPixelBuffer(ptr::null_mut());
-        let st = CVPixelBufferCreate(
-            ptr::null(),
-            w as usize,
-            h as usize,
-            BGR_A,
-            std::ptr::from_ref(&*attrs).cast::<c_void>(),
-            std::ptr::from_mut(&mut pb),
-        );
-        if st != 0 || pb.0.is_null() {
-            elog(format!("CVPixelBufferCreate 失败 st={st} {w}x{h}"));
-            return;
-        }
         CVPixelBufferLockBaseAddress(pb, 0);
         let base = CVPixelBufferGetBaseAddress(pb);
         let dst_stride = CVPixelBufferGetBytesPerRow(pb);
@@ -896,9 +1106,18 @@ fn main() {
     let _: () = unsafe { msg_send![provider_cls, startServiceWithProvider: provider] };
     // 启动真实帧推流通道（宿主 App / 外部桥连 127.0.0.1:27890 推帧）
     frame_channel::start();
+    // 配置通道（27892）：真机上扩展读不到用户写的任何文件，配置只能走网络
+    frame_channel::start_control();
+    // 设备侧滤镜状态进日志口：真机验收要看得到「启用/未配置」与配置来源
     if let Some(desc) = filters::describe() {
         eprintln!("vdev-camera-ext: 设备侧滤镜已启用（{desc}）");
+        elog(format!("设备侧滤镜已启用（{desc}）"));
+    } else {
+        let line = format!("设备侧滤镜未配置（直通，来源={}）", filters::source());
+        eprintln!("vdev-camera-ext: {line}");
+        elog(line);
     }
+    elog(format!("滤镜配置探测: {}", filters::probe_report()));
     eprintln!("vdev-camera-ext: 服务已启动，进入 runloop");
     elog("startService 完成，进入 runloop");
     unsafe { CFRunLoopRun() };
@@ -907,9 +1126,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        client_connected, client_disconnected, copy_bgra_rows, log_skip, should_produce,
-        window_fps, Pacer, FRAME_PERIOD, MIN_YIELD,
+        acquire_buffer_with, client_connected, client_disconnected, copy_bgra_rows, evict_slot,
+        find_pool, log_skip, pixel_buffer_attrs, should_produce, window_fps, AcquirePath,
+        CVPixelBuffer, CVPixelBufferPool, Pacer, BGR_A, FRAME_PERIOD, MAX_POOLS, MIN_YIELD,
     };
+    use objc2::msg_send;
+    use objc2_foundation::{NSObject, NSString};
+    use std::ffi::c_void;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1062,6 +1285,134 @@ mod tests {
     }
 
     // ---- 产帧生命周期（issue #52）----
+
+    // ---- 像素缓冲池（issue #54-1）----
+
+    #[test]
+    fn find_pool_matches_exact_size_only() {
+        let keys = [(1920u32, 1080u32), (640, 480)];
+        assert_eq!(find_pool(&keys, 1920, 1080), Some(0));
+        assert_eq!(find_pool(&keys, 640, 480), Some(1));
+        assert_eq!(find_pool(&keys, 1280, 720), None);
+        // 宽高颠倒不算命中：否则会把 1080x1920 的帧塞进 1920x1080 的池
+        assert_eq!(find_pool(&keys, 1080, 1920), None);
+    }
+
+    #[test]
+    fn pool_cache_is_fifo_and_stays_bounded() {
+        // 模拟 pool_for 的缓存策略：命中复用、未满追加、满则淘汰队头。
+        // 尺寸是推流方给的，若不封顶，反复换尺寸会让池数量（与 IOSurface 内存）
+        // 无限增长——这条断言就是那个上限。
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        for i in 0..12u32 {
+            let (w, h) = (640 + i, 480 + i);
+            if find_pool(&keys, w, h).is_none() {
+                if let Some(slot) = evict_slot(keys.len(), MAX_POOLS) {
+                    keys.remove(slot);
+                }
+                keys.push((w, h));
+            }
+            assert!(
+                keys.len() <= MAX_POOLS,
+                "池数量 {} 超过上限 {MAX_POOLS}（内存会随尺寸爆炸）",
+                keys.len()
+            );
+            assert!(find_pool(&keys, w, h).is_some(), "刚放入的尺寸必须命中");
+        }
+        assert_eq!(keys.len(), MAX_POOLS);
+        // FIFO：最早插入的尺寸已被淘汰，最近的还在
+        assert_eq!(find_pool(&keys, 640, 480), None, "队头应被淘汰");
+        assert!(find_pool(&keys, 641, 481).is_none(), "队头之后一个也应淘汰");
+        assert!(find_pool(&keys, 651, 491).is_some(), "最新尺寸必须在缓存里");
+    }
+
+    /// 造一个假的像素缓冲/池句柄：只用于"决策路径"断言，**绝不**喂给任何 C 函数。
+    fn fake_buf(tag: usize) -> CVPixelBuffer {
+        CVPixelBuffer(tag as *mut c_void)
+    }
+    fn fake_pool(tag: usize) -> CVPixelBufferPool {
+        CVPixelBufferPool(tag as *mut c_void)
+    }
+
+    #[test]
+    fn acquire_prefers_pool_and_never_falls_back_when_pool_hits() {
+        // 把池复用去掉（acquire_pixel_buffer 换回 create_pixel_buffer_direct）时这条立刻红：
+        // 命中的必须是池给出的那块缓冲，且回落路径一次都不该被调用。
+        let pooled = fake_buf(0xA1);
+        let direct_called = std::cell::Cell::new(false);
+        let got = acquire_buffer_with(
+            || Some(fake_pool(1)),
+            |_| Some(pooled),
+            || {
+                direct_called.set(true);
+                Some(fake_buf(0xD0))
+            },
+        );
+        let (pb, path) = got.expect("池命中必须返回缓冲");
+        assert_eq!(path, AcquirePath::Pool);
+        assert_eq!(pb.0, pooled.0, "池命中时不该走回落");
+        assert!(!direct_called.get(), "池命中时回落路径必须一次都不调用");
+    }
+
+    #[test]
+    fn acquire_falls_back_to_direct_when_pool_fails() {
+        // 池存在但取缓冲失败（在途帧超 AllocationThreshold 的瞬态）：必须回落，
+        // 而不是这一帧不发——否则瞬态会被放大成掉帧。
+        let direct = fake_buf(0xD0);
+        let (pb, path) = acquire_buffer_with(|| Some(fake_pool(1)), |_| None, || Some(direct))
+            .expect("池失败时必须回落到新建");
+        assert_eq!(path, AcquirePath::DirectPoolFailed);
+        assert_eq!(pb.0, direct.0);
+    }
+
+    #[test]
+    fn acquire_falls_back_to_direct_without_pool() {
+        let direct = fake_buf(0xD0);
+        let (pb, path) = acquire_buffer_with(
+            || None,
+            |_| panic!("无池时不该调 from_pool"),
+            || Some(direct),
+        )
+        .expect("无池时必须回落到新建");
+        assert_eq!(path, AcquirePath::DirectNoPool);
+        assert_eq!(pb.0, direct.0);
+    }
+
+    #[test]
+    fn acquire_reports_none_when_everything_fails() {
+        assert!(acquire_buffer_with(|| None, |_| None, || None).is_none());
+        assert!(acquire_buffer_with(|| Some(fake_pool(1)), |_| None, || None).is_none());
+    }
+
+    #[test]
+    fn pixel_buffer_attrs_carry_format_size_and_iosurface() {
+        // 键名是**字符串常量**：写错只会让 CVPixelBufferPoolCreate 失败并静默回落
+        // 每帧新建（功能正常、收益消失），所以必须逐键断言（审查 B1-3）。
+        let attrs = pixel_buffer_attrs(1920, 1080);
+        let number = |key: &str| -> Option<i64> {
+            let k = NSString::from_str(key);
+            let v: *const NSObject = unsafe { msg_send![&*attrs, objectForKey: &*k] };
+            if v.is_null() {
+                return None;
+            }
+            Some(unsafe { msg_send![v, longLongValue] })
+        };
+        assert_eq!(number("Width"), Some(1920));
+        assert_eq!(number("Height"), Some(1080));
+        assert_eq!(number("PixelFormatType"), Some(i64::from(BGR_A)));
+        // IOSurfaceProperties 必须在（缺了它 CMIO 客户端拿不到帧）
+        let k = NSString::from_str("IOSurfaceProperties");
+        let v: *const NSObject = unsafe { msg_send![&*attrs, objectForKey: &*k] };
+        assert!(!v.is_null(), "缺 IOSurfaceProperties");
+    }
+
+    #[test]
+    fn evict_slot_only_when_full() {
+        assert_eq!(evict_slot(0, MAX_POOLS), None);
+        assert_eq!(evict_slot(MAX_POOLS - 1, MAX_POOLS), None);
+        assert_eq!(evict_slot(MAX_POOLS, MAX_POOLS), Some(0));
+        assert_eq!(evict_slot(MAX_POOLS + 3, MAX_POOLS), Some(0));
+    }
 
     #[test]
     fn produce_only_when_a_client_is_streaming() {

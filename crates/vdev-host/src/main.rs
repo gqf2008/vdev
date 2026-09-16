@@ -1,6 +1,6 @@
 //! vdev — macOS 虚拟设备工具箱 CLI。
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 
@@ -56,6 +56,8 @@ enum HidCmd {
     },
     /// 滚轮滚动（正数向上）
     Scroll { delta_y: i32 },
+    /// 打印当前身份的输入权限/环境状态（辅助功能权限、安全输入）
+    Access,
     /// 监听键盘/鼠标事件（需要辅助功能权限）
     Listen {
         #[arg(long, default_value_t = 10)]
@@ -77,7 +79,7 @@ enum ScreenCmd {
         name: String,
         #[arg(long, default_value_t = 60.0)]
         refresh: f64,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_display_id)]
         mirror: Option<u32>,
         #[arg(long, default_value_t = 10)]
         hold: u64,
@@ -86,6 +88,19 @@ enum ScreenCmd {
 
 #[derive(Subcommand)]
 enum CameraCmd {
+    /// 设置设备侧滤镜（经 127.0.0.1:27892 控制通道，立即生效、无需重启扩展）
+    ///
+    /// spec 形如 "0.3,1,1,0,0,0,0"（亮度,对比度,饱和度,绿幕阈值,锐化,美颜,美白）；
+    /// 传 "off" **全部关闭**（参数滤镜与背景模糊）。
+    ///
+    /// 语义是**整段替换**：本命令总会把 `VDEV_FILTER` / `VDEV_BG` 两个键都发过去，
+    /// 没显式打开的那个按关闭处理（所以 `filter 0.3` 会把背景模糊一起关掉，
+    /// 要同时开就写 `filter 0.3 --bg blur`）。
+    Filter {
+        spec: String,
+        #[arg(long, default_value = "none")]
+        bg: String,
+    },
     /// 渲染一帧测试图案并写出（PPM），验证帧核心
     Frame {
         #[arg(long, default_value_t = 640)]
@@ -169,6 +184,21 @@ fn validate_screen_geometry(width: u32, height: u32, refresh: f64) -> Result<()>
 
 fn run_hid(cmd: HidCmd) -> Result<()> {
     match cmd {
+        HidCmd::Access => {
+            let a = vdev_hid::input_access();
+            // 机器可读：验收脚本按 key=value 解析，不要改成人类散文
+            println!("post_access={}", a.post);
+            println!("listen_access={}", a.listen);
+            println!("secure_input={}", a.secure_input);
+            if !a.post {
+                println!(
+                    "hint=缺少「辅助功能」权限时 CGEventPost 会被静默丢弃（窗口收不到任何字符，命令仍 exit 0）"
+                );
+            }
+            if a.secure_input {
+                println!("hint=系统处于安全输入（Secure Input），合成事件会被丢弃");
+            }
+        }
         HidCmd::Type { text } => {
             vdev_hid::type_text(&text)?;
             println!("typed {} chars", text.chars().count());
@@ -266,6 +296,54 @@ fn run_screen(cmd: ScreenCmd) -> Result<()> {
     }
 }
 
+/// 显示器 ID 解析：接受十进制或 `0x` 十六进制。
+///
+/// `vdev screen list` 打的是十六进制（`0x00000001`），而 clap 的 u32 默认只吃十进制，
+/// 用户没法把 list 的输出直接粘给 `--mirror`——这个解析器就是补这个缺口。
+fn parse_display_id(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => t.parse::<u32>(),
+    };
+    parsed.map_err(|e| format!("显示器 ID 只接受十进制或 0x 十六进制（收到 {s}）：{e}"))
+}
+
+/// 设备侧滤镜控制通道（扩展监听 127.0.0.1:27892）。
+///
+/// 为什么不是环境变量/配置文件：扩展由 cmiod 以 `_cmiodalassistants` 身份拉起，
+/// 它的家目录是 `/var/db/cmiodalassistants/...`（用户写不进去）、也读不到 /tmp，
+/// 唯一被沙盒放行的配置途径就是网络——所以走这条和推流同源的 TCP 通道。
+const CAMERA_CONTROL_PORT: u16 = 27892;
+const CAMERA_CHANNEL_MAGIC: u32 = 0x5644_4652; // "VDFR"，与扩展侧一致
+const CAMERA_CHANNEL_VERSION: u32 = 1;
+const CAMERA_OP_SET_FILTER: u32 = 1;
+
+fn send_camera_control(payload: &str) -> Result<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", CAMERA_CONTROL_PORT))
+        .map_err(|e| anyhow!("连不上设备侧控制通道 127.0.0.1:{CAMERA_CONTROL_PORT}：{e}（虚拟摄像头扩展没在跑？）"))?;
+    // 不设超时的话，端口被别的进程占着且不应答时 CLI 会一直挂着（审查 S3）
+    let timeout = Some(std::time::Duration::from_secs(3));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    let len = u32::try_from(payload.len()).map_err(|_| anyhow!("配置过长"))?;
+    let mut hdr = [0u8; 36];
+    hdr[0..4].copy_from_slice(&CAMERA_CHANNEL_MAGIC.to_le_bytes());
+    hdr[4..8].copy_from_slice(&CAMERA_CHANNEL_VERSION.to_le_bytes());
+    hdr[8..12].copy_from_slice(&0u32.to_le_bytes()); // width=0 → 控制消息
+    hdr[12..16].copy_from_slice(&CAMERA_OP_SET_FILTER.to_le_bytes());
+    // stride / pts 保持 0
+    hdr[28..32].copy_from_slice(&len.to_le_bytes());
+    stream.write_all(&hdr)?;
+    stream.write_all(payload.as_bytes())?;
+    let mut ack = String::new();
+    stream
+        .read_to_string(&mut ack)
+        .map_err(|e| anyhow!("控制通道无响应（{e}）：扩展可能没在跑，或 127.0.0.1:{CAMERA_CONTROL_PORT} 被别的进程占着"))?;
+    Ok(ack)
+}
+
 /// `camera frame` 入口校验：非法尺寸此前直达 `render`，只会静默写出 0×0 空
 /// PPM，先在 CLI 层拦下并给出可操作的范围提示（与 C ABI 共用同一规则）。
 fn validate_camera_dims(width: u32, height: u32) -> Result<()> {
@@ -282,6 +360,23 @@ fn validate_camera_dims(width: u32, height: u32) -> Result<()> {
 #[allow(clippy::cast_precision_loss)]
 fn run_camera(cmd: CameraCmd) -> Result<()> {
     match cmd {
+        CameraCmd::Filter { spec, bg } => {
+            // 设备侧按"整段替换"处理配置，所以这里**两个键都显式给出**：
+            // `off`/`none` 发空值（等于关掉），命令结果可预期、不受上一次设置影响。
+            let filter_value = if spec == "off" { "" } else { spec.as_str() };
+            let bg_value = match bg.as_str() {
+                "blur" | "1" => "blur",
+                "none" | "off" | "" => "",
+                other => bail!("--bg 只接受 blur / none，收到 {other}"),
+            };
+            let payload = format!("VDEV_FILTER={filter_value}\nVDEV_BG={bg_value}\n");
+            let ack = send_camera_control(&payload)?;
+            print!("{ack}");
+            if !ack.starts_with("ok") {
+                bail!("设备侧拒绝该配置：{}", ack.trim());
+            }
+            Ok(())
+        }
         CameraCmd::Frame {
             width,
             height,
@@ -392,6 +487,20 @@ mod tests {
         for line in after_help.lines() {
             assert_eq!(line, line.trim_end(), "after_help 存在行尾空白: {line:?}");
         }
+    }
+
+    #[test]
+    fn parse_display_id_accepts_hex_and_decimal() {
+        // list 输出 0x00000001 → 用户原样粘贴必须能用（这正是本轮验收发现的缺口）
+        assert_eq!(super::parse_display_id("0x00000001"), Ok(1));
+        assert_eq!(super::parse_display_id("0X1234"), Ok(0x1234));
+        assert_eq!(super::parse_display_id("1"), Ok(1));
+        assert_eq!(super::parse_display_id("4660"), Ok(4660));
+        assert_eq!(super::parse_display_id(" 0x0a "), Ok(10));
+        // 非法输入要有可读错误，而不是 panic
+        assert!(super::parse_display_id("0xzz").is_err());
+        assert!(super::parse_display_id("").is_err());
+        assert!(super::parse_display_id("-1").is_err());
     }
 
     /// 回归：--modifiers 的 `value_delimiter` 是 ','，帮助示例必须写

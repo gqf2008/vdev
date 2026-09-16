@@ -1,6 +1,6 @@
 # 用 Rust 写 macOS 虚拟键盘/鼠标：CGEventPost 注入与 EventTap 监听
 
-**CGEventPost 注入键鼠不需要任何授权，监听却是 TCC 管制的敏感能力——一薄一厚两面，vdev-hid 只用了 400 行。**
+**CGEventPost 注入键鼠与事件监听都受 TCC 管制；注入前必须查「辅助功能」权限，否则会被系统静默丢弃——vdev-hid 只用了 400 行，把静默失败变成了可诊断报错。**
 
 > 本文是 vdev 虚拟设备驱动开发系列之一（共 9 篇）。完整源码与代码位置标注见仓库对应文章。
 
@@ -32,7 +32,7 @@ macOS 把所有输入事件汇成一条流，Quartz Event Services 在这条流�
 `CGEventPost` 的 target 参数就是这三选一。vdev 把注入点固定在最上游：
 
 `rust
-// crates/vdev-hid/src/lib.rs:19
+// crates/vdev-hid/src/lib.rs:25
 /// 事件注入位置：HID 会话层，全局生效。
 const LOCATION: TapLocation = TapLocation::Hid;
 `
@@ -75,7 +75,7 @@ vdev 提供一张"键名 → 键码"表。字母与控制键复用 `cgevents::Ke
 最底层的是 `key`：一个 `KeyEvent::down/up(keycode)` 构造出键盘事件，`post(LOCATION)` 注入了事。往上一层是点按 `tap_key`：
 
 `rust
-// crates/vdev-hid/src/lib.rs:40-51
+// crates/vdev-hid/src/lib.rs:115-127
 pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<> {
  KeyEvent::down(keycode)
  .with_modifiers(modifiers)
@@ -128,7 +128,7 @@ CLI 一行 `vdev hid type "hello from vdev"` 即可（每字符约 2×`GAP`，�
 **点击**：先 `mouse_move` 到目标，再 `button_down` + GAP + `button_up`：
 
 `rust
-// crates/vdev-hid/src/lib.rs:66-76
+// crates/vdev-hid/src/lib.rs:168-179
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<> {
  mouse_move(x, y)?;
  MouseEvent::button_down(Point::new(x, y), button)
@@ -148,10 +148,10 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<> {
 
 ## 五、监听侧：vdev hid listen
 
-注入不需要任何授权，监听则相反——**全局事件监听是 TCC 管制的敏感能力**。macOS 10.15 起，系统用 `CGPreflightListenEventAccess` / `CGRequestListenEventAccess` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
+**注入与监听都需要「辅助功能」权限**（2026-09-16 真机实测纠正了早先"注入不需要授权"的说法：未授权身份 `CGEventPost` 被系统静默丢弃，窗口收到 0 个字符而进程 exit 0）。macOS 10.15 起，系统用 `CGPreflightListenEventAccess` / `CGRequestListenEventAccess` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 `rust
-// crates/vdev-hid/src/lib.rs:92-98
+// crates/vdev-hid/src/lib.rs:196-202
 pub fn listen(seconds: Option<u64>) -> Result<> {
  if !EventTap::preflight_listen_access {
  let _ = EventTap::request_listen_access;
@@ -164,7 +164,7 @@ request_listen_access` 会引导系统弹出授权提示；注意授权对象是
 过了权限关，创建 tap：
 
 `rust
-// crates/vdev-hid/src/lib.rs:103-107
+// crates/vdev-hid/src/lib.rs:207-211
 let handle = thread::spawn(move || {
  let tap = match EventTap::new(
  TapLocation::Session,
@@ -182,7 +182,7 @@ let handle = thread::spawn(move || {
 最后是**线程归属**——这是这个函数注释里写了整整七行、也是坑 1 的主角：
 
 `rust
-// crates/vdev-hid/src/lib.rs:100-101,143-144
+// crates/vdev-hid/src/lib.rs:204-205,247-248
 // 创建与运行同线程（见函数注释）；创建结果经 channel 交还主线程，
 // 成功后主线程持有 Arc 句柄用于到点 stop。
 ...
@@ -270,7 +270,7 @@ vdev hid scroll 3 # 滚轮，正数向上（行单位）
 vdev hid click 100 100 --button right # left / right / middle
 `
 
-权限三态：注入（type/key/move/click/scroll/down/up）不需要任何授权，直接可用；监听（listen）需要「辅助功能」，无权限时报错并以非零码退出，按提示在 系统设置 → 隐私与安全性 → 辅助功能 勾选你的终端后重试。
+权限：注入（type/key/move/click/scroll/down/up）与监听（listen）**都需要「辅助功能」**；两者都在动手前预检，缺权限时明确报错并以非零码退出。`vdev hid access` 打印当前身份的权限与安全输入状态；安全输入开启时合成事件整体失效。
 
 ## 八、现状与局限
 
