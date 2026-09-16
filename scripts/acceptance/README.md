@@ -20,9 +20,10 @@
 - 判定：窗口 `TYPED == 输入` **且**（`tap_ok=false` 或 `tap_delta >= 字符数`）→ PASS。
   `.app` 身份通常拿不到辅助功能权限（`tap_ok=false`），此时以窗口逐字一致为准；
   `tap_ok=true` 时 EventTap 计数作为交叉校验。
-- 假绿边界：`swiftc`/`open` 失败、探针未就绪、`tap_ok` 字段非法 → FAIL（exit 2 的启动失败路径）；
-  所有用例都 SKIP / 没执行（`executed=0`）→ `NOT_RUN` exit 2；`TYPED` 不匹配且结束焦点已丢失
-  → 该用例按 SKIP 处理（`TYPED` 完全匹配时焦点在 SUMMARY 时刻的变化不影响 PASS，因为注入已完成）。
+- 假绿边界：`swiftc`/`open`/`python3` 缺失 → 立即 FAIL **exit 2**；探针未就绪、`tap_ok` 字段非法
+  → FAIL（计入 fails，最终 exit 1）；所有用例都 SKIP / 没执行（`executed=0`）→ `NOT_RUN` exit 2；
+  `TYPED` 不匹配且结束焦点已丢失 → 该用例按 SKIP 处理（`TYPED` 完全匹配时焦点在 SUMMARY
+  时刻的变化不影响 PASS，因为注入已完成）。
 - 注入窗口 3s，覆盖当前 ≤19 字符的用例（每字符约 2×12ms）；CASES 加长用例时需同步加大窗口。
 - 阳性对照：修复前窗口只收到 **2/17**（EventTap 2/15）；修复后 8/8 PASS，
   15/17/19/9/4/4/16/10 字符逐字一致。对照 fake `vdev`（什么都不注入）→ 7 FAIL + 1 SKIP，

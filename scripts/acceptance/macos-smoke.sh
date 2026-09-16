@@ -33,8 +33,8 @@ require_grep '-y -i /tmp/vdev-audio-loopback.wav' crates/vdev-audio/test_loopbac
 require_grep ': > /tmp/vdev-audio-loopback.wav' crates/vdev-audio/test_loopback.sh '录音前必须清空 WAV（#35：否则旧 WAV 可让 make test 假绿）'
 require_grep 'executed}" -eq 0' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须保留 executed==0 判定（防全 SKIP 假绿）'
 require_grep 'NOT_RUN' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须有 NOT_RUN 出口（防全 SKIP 假绿）'
-require_grep 'open -W -n' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须用最小 .app + open 启动（裸二进制拿不到前台焦点）'
-require_grep 'tap_ok' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须保留 tap_ok 回退判定'
+require_grep 'open -W -n "${PROBE_APP}" --args "${out}"' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须用最小 .app + open 启动每个用例（裸二进制拿不到前台焦点）'
+require_grep 'tap_ok=$(echo' scripts/acceptance/macos-hid-type-verify.sh 'HID 验收必须保留 tap_ok 回退判定'
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "FAIL: 未找到 python3（check-docs.py 需要）" >&2
