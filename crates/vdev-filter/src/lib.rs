@@ -139,14 +139,26 @@ fn green_screen(p: Pixel, threshold: u8) -> Pixel {
     }
 }
 
-/// 走 no-op 快返回的次数（仅测试观测用）。
+// 走 no-op 快返回的次数（仅测试观测用）。
+//
+// 必须是 thread-local：`cargo test` 同一二进制内测试并行跑，进程级 atomic
+// 会被其它测试的 `process_frame` 调用污染——`default_params_take_zero_cost_fast_path`
+// 清零后读到别的测试的 +1，全量偶发假红（2026-09-16 vdev 验收实测）。
 #[cfg(test)]
-static NOOP_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static NOOP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// 读取并清零 no-op 快返回计数（仅测试用）。
 #[cfg(test)]
 fn take_noop_hits() -> usize {
-    NOOP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    NOOP_HITS.with(|c| c.replace(0))
+}
+
+/// 记录一次 no-op 快返回（仅测试用）。
+#[cfg(test)]
+fn note_noop_hit() {
+    NOOP_HITS.with(|c| c.set(c.get() + 1));
 }
 
 /// 对一整帧 BGRA 应用滤镜（原地处理，无分配）。
@@ -157,7 +169,7 @@ pub fn process_frame(bgra: &mut [u8], width: u32, height: u32, params: &FilterPa
     // 无滤镜：直接返回，不做逐像素遍历（「未配置零额外开销」的兑现点）。
     if params.is_noop() {
         #[cfg(test)]
-        NOOP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_noop_hit();
         return;
     }
     let px = (width * height) as usize;
