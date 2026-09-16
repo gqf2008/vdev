@@ -10,7 +10,9 @@ vdev（虚拟设备集合）是一个 Rust workspace：在 macOS / Windows 上�
   - collab CLI：`walgit --config ~/.walgit/walgit.toml collab <ls|thread|pr|report|board> ...`
     （`walgit` 在 PATH：`~/.local/bin/walgit`；底层二进制在 `/Applications/walgit-tray.app/Contents/Resources/walgit`）。
 - **GitHub = 只读镜像 + 发布通道**（remote `github`：`https://github.com/gqf2008/vdev.git`）。
-  日常开发/评审不直接走 GitHub。
+  日常开发/评审不直接走 GitHub。该仓库的 **Issues / Wiki / Projects / Discussions 四个入口已关闭**
+  （仓库只承担镜像与 Release），issue/PR/评审一律在 walgit collab；需要临时读 GitHub issue 时
+  得先 `gh repo edit --enable-issues=true`，读完再关回去（关闭状态下 GitHub 连 API 都不返回这些 issue）。
   - 镜像：本机 `~/.walgit/sync-to-github.sh` 常驻循环（screen `walgit-sync-github`，60s）自动发现
     walgit 上的仓库，把 `refs/heads/*` + `refs/tags/*` 镜像到 GitHub（`refs/collab/*` 属 walgit 特有，不推）；
   - 发布：在 main 打 tag → push `origin`（walgit）→ 镜像自动同步到 GitHub →
