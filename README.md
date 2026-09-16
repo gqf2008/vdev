@@ -25,6 +25,15 @@ DriverKit 只支持 C++，Rust 只能做 C ABI 内核、工程成本高。macOS 
 分布不同：摄像头有用户态 DirectShow 捷径，显示器有官方 IddCx UMDF，只有声卡与内核 HID
 必须走内核。选型细节见 [`docs/dev/macos-route-survey.md`](docs/dev/macos-route-survey.md)。
 
+## 协同拓扑（主仓 / 镜像 / 发布）
+
+- **主仓 = walgit**（本机 Git 托管，仓库存在 Cloudflare R2）：`git clone http://127.0.0.1:8081/gqf2008/vdev.git`，
+  Web UI 与 Collab（issue/PR/看板）都在 `http://127.0.0.1:8081`；日常 push 走 `origin`。
+- **GitHub 只是镜像 + 发布通道**（remote `github`）：本机 `~/.walgit/sync-to-github.sh` 常驻循环
+  （screen `walgit-sync-github`，60s）把 walgit 的 heads/tags 镜像过去；**不要手动双推**。
+- **发布**：在 main 打 tag → push `origin`（walgit）→ 镜像自动同步 → `gh release create <tag> --generate-notes`。
+- 开发流程与 collab 记账要求见 `AGENTS.md`。
+
 ## 快速开始
 
 ```bash

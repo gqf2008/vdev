@@ -1,0 +1,16 @@
+# walgit 去中心化 CI 任务声明（规范见 walgit 仓库 docs/D1_CI_PROTOCOL.md）
+# 任务随代码走：被测提交里存在本文件才触发；runner 客户端认领并回传签名结果。
+#
+# 这里只放**快、无外设依赖**的门禁；需要真机（摄像头/声卡/HID 前台焦点）的验收
+# 与 Windows 矩阵仍在 GitHub Actions 上跑（镜像 push 触发）。
+version = 1
+
+[[task]]
+name = "fmt"
+command = "cargo fmt --all -- --check"
+timeout = "10m"
+
+[[task]]
+name = "acceptance-smoke"
+command = "bash scripts/acceptance/macos-smoke.sh"
+timeout = "10m"
