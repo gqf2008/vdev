@@ -25,6 +25,11 @@ static INJECTED: Mutex<Option<InjectedFrame>> = Mutex::new(None);
 static CURRENT_CLIENT: Mutex<Option<TcpStream>> = Mutex::new(None);
 
 const HEADER_SIZE: usize = 36;
+/// 控制通道端口：与推流通道（27890）分开。27890 的新连接会 `shutdown` 掉旧连接
+/// （那是"推流接管"语义），配置操作不该把正在推流的客户端踢掉。
+const CONTROL_PORT: u16 = 27892;
+/// 控制消息 opcode（放在头的 `height` 字段）：设置设备侧滤镜。
+pub const OP_SET_FILTER: u32 = 1;
 const MAGIC: u32 = 0x5644_4652; // "VDFR"
 const VERSION: u32 = 1;
 /// 头字段钳制：宽高 ≤ 8K；stride 允许 padded（w*4 ≤ stride ≤ w*4 + 8KiB）；
@@ -84,6 +89,37 @@ fn u64le(b: &[u8], off: usize) -> u64 {
         b[off + 6],
         b[off + 7],
     ])
+}
+
+/// 解析并校验 36 字节**控制**头（`width == 0` 即控制消息）。
+///
+/// 复用同一套头布局，便于两端共用常量：`width=0`、`height=opcode`、
+/// `stride=0`、`pts=0`、`payloadLen` = 配置文本字节数。
+fn parse_control(raw: &[u8; HEADER_SIZE]) -> Result<(u32, usize), HeaderError> {
+    if u32le(raw, 0) != MAGIC {
+        return Err(HeaderError::Magic);
+    }
+    if u32le(raw, 4) != VERSION {
+        return Err(HeaderError::Version);
+    }
+    if u32le(raw, 8) != 0 {
+        return Err(HeaderError::Width);
+    }
+    let opcode = u32le(raw, 12);
+    if opcode != OP_SET_FILTER {
+        return Err(HeaderError::Height);
+    }
+    if u32le(raw, 16) != 0 {
+        return Err(HeaderError::Stride);
+    }
+    let len = u64le(raw, 28);
+    // 配置文本很小；沿用 256MiB 上限会给出不必要的分配空间，这里单独收紧
+    if len > 64 * 1024 {
+        return Err(HeaderError::PayloadLen);
+    }
+    // 目标平台 64 位 macOS：u64→usize 截断不可能
+    #[allow(clippy::cast_possible_truncation)]
+    Ok((opcode, len as usize))
 }
 
 /// 解析并校验 36 字节帧头（纯函数，网络层薄壳 `handle_conn` 调用；
@@ -189,6 +225,51 @@ fn handle_conn(mut stream: TcpStream) {
     }
 }
 
+/// 处理一条控制连接：读一条控制消息 → 应用配置 → 回一行 ack（便于 CLI 立即可见）。
+fn handle_control(mut stream: TcpStream) {
+    let mut raw = [0u8; HEADER_SIZE];
+    if std::io::Read::read_exact(&mut stream, &mut raw).is_err() {
+        return;
+    }
+    let Ok((_opcode, len)) = parse_control(&raw) else {
+        let _ = std::io::Write::write_all(&mut stream, "err 控制头校验失败\n".as_bytes());
+        return;
+    };
+    let mut payload = vec![0u8; len];
+    if len > 0 && std::io::Read::read_exact(&mut stream, &mut payload).is_err() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&payload);
+    let ack = match crate::filters::apply_config(&text) {
+        Ok(summary) => {
+            crate::elog_for_channel(format!("控制通道：设备侧滤镜已更新 → {summary}"));
+            format!("ok {summary}\n")
+        }
+        Err(e) => {
+            crate::elog_for_channel(format!("控制通道：配置被拒绝（{e}）"));
+            format!("err {e}\n")
+        }
+    };
+    let _ = std::io::Write::write_all(&mut stream, ack.as_bytes());
+}
+
+/// 启动控制通道监听（后台线程；端口见 `CONTROL_PORT`）。
+pub fn start_control() {
+    std::thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", CONTROL_PORT)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("vdev-camera-ext: 控制通道 bind 127.0.0.1:{CONTROL_PORT} 失败: {e}");
+                return;
+            }
+        };
+        eprintln!("vdev-camera-ext: 控制通道监听 127.0.0.1:{CONTROL_PORT}");
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || handle_control(stream));
+        }
+    });
+}
+
 /// 启动推流通道监听（后台线程）。
 pub fn start() {
     std::thread::spawn(move || {
@@ -240,6 +321,56 @@ mod tests {
         b[20..28].copy_from_slice(&pts.to_le_bytes());
         b[28..36].copy_from_slice(&len.to_le_bytes());
         b
+    }
+
+    /// 造一个控制头（测试与控制通道的客户端共用口径）。
+    fn control_header(opcode: u32, stride: u32, len: u64) -> [u8; HEADER_SIZE] {
+        let mut raw = [0u8; HEADER_SIZE];
+        raw[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        raw[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        raw[8..12].copy_from_slice(&0u32.to_le_bytes()); // width = 0 → 控制消息
+        raw[12..16].copy_from_slice(&opcode.to_le_bytes());
+        raw[16..20].copy_from_slice(&stride.to_le_bytes());
+        raw[28..36].copy_from_slice(&len.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn control_header_accepts_set_filter() {
+        let raw = control_header(OP_SET_FILTER, 0, 32);
+        assert_eq!(parse_control(&raw), Ok((OP_SET_FILTER, 32)));
+    }
+
+    #[test]
+    fn control_header_rejects_unknown_opcode_and_bad_magic() {
+        assert_eq!(
+            parse_control(&control_header(7, 0, 8)),
+            Err(HeaderError::Height)
+        );
+        let mut raw = control_header(OP_SET_FILTER, 0, 8);
+        raw[0] ^= 0xFF;
+        assert_eq!(parse_control(&raw), Err(HeaderError::Magic));
+        let mut raw2 = control_header(OP_SET_FILTER, 0, 8);
+        raw2[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(parse_control(&raw2), Err(HeaderError::Version));
+    }
+
+    #[test]
+    fn control_header_rejects_frame_shaped_and_oversized_messages() {
+        // width != 0 → 这是帧，不是控制消息（控制口不接受推流）
+        let mut raw = control_header(OP_SET_FILTER, 0, 8);
+        raw[8..12].copy_from_slice(&1920u32.to_le_bytes());
+        assert_eq!(parse_control(&raw), Err(HeaderError::Width));
+        // stride 必须为 0（控制消息没有行距概念）
+        assert_eq!(
+            parse_control(&control_header(OP_SET_FILTER, 4, 8)),
+            Err(HeaderError::Stride)
+        );
+        // 配置文本上限 64 KiB：超过即拒（不给 256MiB 的分配空间）
+        assert_eq!(
+            parse_control(&control_header(OP_SET_FILTER, 0, 64 * 1024 + 1)),
+            Err(HeaderError::PayloadLen)
+        );
     }
 
     #[test]

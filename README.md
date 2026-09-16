@@ -30,11 +30,12 @@ DriverKit 只支持 C++，Rust 只能做 C ABI 内核、工程成本高。macOS 
 ```bash
 cargo build --release
 
-# 键盘 / 鼠标（注入无需辅助功能权限；listen 需要）
+# 键盘 / 鼠标（注入与 listen 都需要「辅助功能」权限；无权限时立即报错、非零退出）
+vdev hid access                    # 打印当前身份的权限与安全输入状态
 vdev hid type "hello from vdev"
 vdev hid key space                 # 键名只收名字，全表见 vdev hid key --help
 vdev hid move 100 100 && vdev hid click 100 100 --button left
-vdev hid listen --seconds 10       # 无权限时立即报错、非零退出
+vdev hid listen --seconds 10
 
 # 虚拟屏幕（私有 API，仅供学习）
 vdev screen list
@@ -111,7 +112,19 @@ make -C crates/vdev-audio  test           # 环回自测（需 ffmpeg + python3�
 
 摄像头推流：安装后在 App 里点「屏幕推流」，或用 `crates/vdev-camera/tools/push_frames.swift`
 推图片 / 屏幕 / 视频；扩展监听 `127.0.0.1:27890`，收 36 字节小端头 + BGRA32 的帧。
-设备侧滤镜由扩展进程的环境变量配置（`VDEV_FILTER` / `VDEV_BG`）。
+设备侧滤镜（美颜/背景替换）经**控制通道热更新**，改配置不用重启扩展：
+
+```bash
+vdev camera filter 0.3,1,1,0,0,0,0   # 亮度,对比度,饱和度,绿幕阈值,锐化,美颜,美白
+vdev camera filter 0.3 --bg blur     # 同时开背景模糊（Vision 人像分割）
+vdev camera filter off               # 关闭（直通）
+```
+
+为什么不是环境变量/配置文件：扩展由 cmiod 以 `_cmiodalassistants` 身份拉起，
+家目录是 `/var/db/cmiodalassistants/...`（用户写不进）、也读不到 `/tmp`，
+唯一被沙盒放行的配置途径就是网络。控制通道是 `127.0.0.1:27892`（与推流口
+27890 分开，免得设置滤镜把正在推流的客户端踢掉）；扩展启动日志会打出
+`设备侧滤镜…来源=` 便于取证。
 
 ### Windows
 

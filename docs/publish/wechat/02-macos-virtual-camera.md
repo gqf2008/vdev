@@ -292,7 +292,7 @@ swift push_frames.swift screen [--display <id>] --fps 30 # 推屏幕（首次需
 swift push_frames.swift video /path/to/video.mp4 --fps 60 # 推视频文件（AVAssetReader 解码）
 `
 
-设备侧滤镜（美颜/背景替换）配在**扩展进程**的环境变量里：`VDEV_FILTER="brightness,contrast,saturation,green,sharpen,beauty,whiten"`、`VDEV_BG=blur`（Vision 人像分割）；未配置则走零开销快返回、原样直通（宿主 App 推视频时也读同一变量并同样快返回；把变量设成进程级会让两侧各处理一次）。组合玩法：`vdev screen create` 建一块虚拟屏，再 `swift push_frames.swift screen --display <虚拟屏ID>`，摄像头即显示虚拟屏内容，可再接 WebRTC/SFU 远程串流。
+设备侧滤镜（美颜/背景替换）经**控制通道**热更新、不用重启扩展：`vdev camera filter 0.3,1,1,0,0,0,0`（亮度,对比度,饱和度,绿幕阈值,锐化,美颜,美白）、`vdev camera filter 0.3 --bg blur`（背景模糊）、`vdev camera filter off`（直通）。为什么不是环境变量：扩展由 cmiod 以 `_cmiodalassistants` 身份拉起，家目录在 `/var/db/cmiodalassistants/...`、也读不到 `/tmp`，**用户写的任何文件它都读不到**，配置只能走网络（`127.0.0.1:27892`）。组合玩法：`vdev screen create` 建一块虚拟屏，再 `swift push_frames.swift screen --display <虚拟屏ID>`，摄像头即显示虚拟屏内容，可再接 WebRTC/SFU 远程串流。
 
 ## 7. 现状与局限
 
@@ -304,7 +304,7 @@ swift push_frames.swift video /path/to/video.mp4 --fps 60 # 推视频文件（AV
 
 - **主格式固定 1920x1080 BGRA@60**，未做多格式协商（`formats` 只返回一个格式，`activeFormatIndex` 恒 0）；
 - **推流通道是明文 TCP + 自定义协议**，只绑 127.0.0.1，靠沙盒隔离与头校验兜底，没有鉴权——本机恶意进程理论上可抢连接推帧（新连接会接管旧连接）；
-- 滤镜链的 `VDEV_FILTER`/`VDEV_BG` 只在扩展进程启动时读一次，改配置要重启扩展（重启扩展 = 触发版本号铁律那一套，开发期记得升 `CFBundleVersion`）；
+- 滤镜配置的运行期通道是 `127.0.0.1:27892`（明文 TCP、只绑本机、无鉴权）；进程启动时的环境变量/配置文件只作默认值；
 - 网络挂载（ossfs/FUSE/SMB）上的视频，AVAssetReader 初始化可能耗时 10~30 秒，期间显示彩条属已知行为；
 - 虚拟摄像头依赖的私有/半私有行为（cmiod 的坏状态策略、launchd 竞态）随 macOS 版本可能变化，实测基线是 macOS 26.5；
 - 扩展批准/替换涉及的用户引导（自动打开设置页、15 秒轮询自动修复）已做，但系统设置路径在不同 macOS 版本措辞不同，文案以实机为准。

@@ -1,6 +1,6 @@
 # 用 Rust 写 macOS 虚拟键盘/鼠标：CGEventPost 注入与 EventTap 监听
 
-**CGEventPost 注入键鼠不需要任何授权，监听却是 TCC 管制的敏感能力——一薄一厚两面，vdev-hid 只用了 400 行。**
+**CGEventPost 注入键鼠与事件监听都受 TCC 管制；注入前必须查「辅助功能」权限，否则会被系统静默丢弃——vdev-hid 只用了 400 行，把静默失败变成了可诊断报错。**
 
 > 本文是 vdev 虚拟设备驱动开发系列之一（共 9 篇）。完整源码与代码位置标注见仓库对应文章。
 
@@ -148,7 +148,7 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<> {
 
 ## 五、监听侧：vdev hid listen
 
-注入不需要任何授权，监听则相反——**全局事件监听是 TCC 管制的敏感能力**。macOS 10.15 起，系统用 `CGPreflightListenEventAccess` / `CGRequestListenEventAccess` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
+**注入与监听都需要「辅助功能」权限**（2026-09-16 真机实测纠正了早先"注入不需要授权"的说法：未授权身份 `CGEventPost` 被系统静默丢弃，窗口收到 0 个字符而进程 exit 0）。macOS 10.15 起，系统用 `CGPreflightListenEventAccess` / `CGRequestListenEventAccess` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 `rust
 // crates/vdev-hid/src/lib.rs:92-98
@@ -270,7 +270,7 @@ vdev hid scroll 3 # 滚轮，正数向上（行单位）
 vdev hid click 100 100 --button right # left / right / middle
 `
 
-权限三态：注入（type/key/move/click/scroll/down/up）不需要任何授权，直接可用；监听（listen）需要「辅助功能」，无权限时报错并以非零码退出，按提示在 系统设置 → 隐私与安全性 → 辅助功能 勾选你的终端后重试。
+权限：注入（type/key/move/click/scroll/down/up）与监听（listen）**都需要「辅助功能」**；两者都在动手前预检，缺权限时明确报错并以非零码退出。`vdev hid access` 打印当前身份的权限与安全输入状态；安全输入开启时合成事件整体失效。
 
 ## 八、现状与局限
 

@@ -1,6 +1,12 @@
 //! vdev-hid — 虚拟 HID：在 macOS 上用 `CGEventPost` 合成键盘/鼠标事件。
 //!
-//! 不需要 kext / DriverKit，也不需要「辅助功能」权限（合成事件系统默认放行）。
+//! 不需要 kext / DriverKit，但**注入需要「辅助功能」权限**（`CGPreflightPostEventAccess`
+//! 所判定的那条；早期注释写的"合成事件系统默认放行"是错的，2026-09-16 真机实测证伪：
+//! 未授权身份注入 24 个字符，前台窗口收到 **0** 个，而进程仍然 exit 0）。
+//! 所以每次注入前都过 `ensure_injection_ready()`：没权限 / 开着安全输入（Secure Input）
+//! 时**明确报错**，不再静默假成功。
+//!
+//! 监听（`listen`）走的是另一条权限（EventTap），报错文案在 `listen` 里。
 
 pub mod keycodes;
 
@@ -25,8 +31,68 @@ fn err(e: &cgevents::CGError) -> anyhow::Error {
     anyhow!("cgevents error: {e:?}")
 }
 
+/// 合成输入的权限 / 环境快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputAccess {
+    /// 能否发送事件（`CGPreflightPostEventAccess`）。`false` 时 `CGEventPost`
+    /// **静默无效**——这是真机实测的，不是推断。
+    pub post: bool,
+    /// 能否监听事件（EventTap 那条权限，`listen` 用）。
+    pub listen: bool,
+    /// 系统当前是否处于安全输入（Secure Input，如密码框）。
+    pub secure_input: bool,
+}
+
+/// 是否处于安全输入（Carbon `IsSecureEventInputEnabled`）。
+///
+/// 安全输入打开时系统会丢弃合成的键鼠事件（密码框、终端"安全键盘输入"等），
+/// 这是 `CGEvent` 用户态路线绕不过去的系统行为，只能提前告知。
+fn secure_event_input_enabled() -> bool {
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn IsSecureEventInputEnabled() -> u8;
+    }
+    // SAFETY: 无参数、无所有权转移的 Carbon 查询；失败只会返回 0/1。
+    unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+/// 读取当前身份的输入权限与环境状态（供 CLI 展示与验收脚本取证）。
+#[must_use]
+pub fn input_access() -> InputAccess {
+    InputAccess {
+        post: EventTap::preflight_post_access(),
+        listen: EventTap::preflight_listen_access(),
+        secure_input: secure_event_input_enabled(),
+    }
+}
+
+/// 注入前护栏：把"静默失败"变成"明确报错"。
+///
+/// 实测（macOS 26.5.2）：未授权身份 `CGEventPost` 直接丢弃事件，进程 exit 0、
+/// 窗口收到 0 个字符——调用方完全无法从返回值发现问题。设置 `VDEV_HID_SKIP_ACCESS_CHECK=1`
+/// 可跳过本检查（仅在确认 `CGPreflightPostEventAccess` 误报时使用）。
+pub fn ensure_injection_ready() -> Result<()> {
+    let access = input_access();
+    if access.secure_input {
+        return Err(anyhow!(
+            "系统正处于「安全输入」（Secure Input），合成事件会被系统丢弃。\
+             请先关闭密码框 / 终端的\"安全键盘输入\"（Terminal → 编辑 → 安全键盘输入）后重试。"
+        ));
+    }
+    if !access.post && std::env::var_os("VDEV_HID_SKIP_ACCESS_CHECK").is_none() {
+        return Err(anyhow!(
+            "缺少「辅助功能」权限：当前身份 `CGPreflightPostEventAccess=false`，\
+             CGEventPost 会被系统静默丢弃（不报错、也不产生按键）。\
+             请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选运行本命令的程序（终端 / 宿主 App），\
+             然后重试；确有必要时可设 VDEV_HID_SKIP_ACCESS_CHECK=1 跳过本检查。"
+        ));
+    }
+    Ok(())
+}
+
 /// 按住或松开一个键。
 pub fn key(keycode: u16, pressed: bool) -> Result<()> {
+    ensure_injection_ready()?;
     let ev = if pressed {
         KeyEvent::down(keycode)
     } else {
@@ -38,6 +104,7 @@ pub fn key(keycode: u16, pressed: bool) -> Result<()> {
 
 /// 点按一个键（按下 + 松开），可带修饰键。
 pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
+    ensure_injection_ready()?;
     KeyEvent::down(keycode)
         .with_modifiers(modifiers)
         .post(LOCATION)
@@ -58,6 +125,7 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 /// `GAP`）稳定得多。这里与 `tap_key` 对齐：down 后 `GAP`、up 后 `GAP`
 /// 再发下一个字符。
 pub fn type_text(text: &str) -> Result<()> {
+    ensure_injection_ready()?;
     // 整串共用一个 private EventSource（与原 cgevents::type_string 的资源口径一致），
     // 但按上面的节拍逐字符发射；每字符约 2*GAP，长文本按字符数线性耗时。
     let source = cgevents::EventSource::private().map_err(|e| err(&e))?;
@@ -81,6 +149,7 @@ pub fn type_text(text: &str) -> Result<()> {
 
 /// 移动鼠标到绝对坐标（点坐标，原点左上）。
 pub fn mouse_move(x: f64, y: f64) -> Result<()> {
+    ensure_injection_ready()?;
     MouseEvent::move_to(Point::new(x, y))
         .post(LOCATION)
         .map_err(|e| err(&e))
@@ -88,6 +157,8 @@ pub fn mouse_move(x: f64, y: f64) -> Result<()> {
 
 /// 点击：先移动到目标再按下/松开。
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
+    // mouse_move 内部已过护栏；这里再查一次是为了让点击在"移动后权限被改"时也拦得住
+    ensure_injection_ready()?;
     mouse_move(x, y)?;
     MouseEvent::button_down(Point::new(x, y), button)
         .post(LOCATION)
@@ -101,6 +172,7 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 
 /// 滚轮：`delta_y` 为正向上滚（行单位）。
 pub fn scroll(delta_y: i32) -> Result<()> {
+    ensure_injection_ready()?;
     ScrollEvent::lines(delta_y)
         .post(LOCATION)
         .map_err(|e| err(&e))

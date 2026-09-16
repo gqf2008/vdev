@@ -160,7 +160,10 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 
 ## 五、监听侧：vdev hid listen
 
-注入不需要任何授权，监听则相反——**全局事件监听是 TCC 管制的敏感能力**。macOS 10.15 起，系统用 `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
+**注入与监听都需要「辅助功能」权限**（2026-09-16 真机实测纠正了早先"注入不需要授权"的说法：
+未授权身份 `CGEventPost` 会被系统**静默丢弃**——前台窗口收到 0 个字符，进程却 exit 0）。
+vdev 在注入入口做 `CGPreflightPostEventAccess()` 预检，未授权时明确报错并给出授权指引；
+全局事件监听则是另一条同样受 TCC 管制的敏感能力。macOS 10.15 起，系统用 `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 ```rust
 // crates/vdev-hid/src/lib.rs:116-122
@@ -284,7 +287,11 @@ vdev hid scroll 3                          # 滚轮，正数向上（行单位�
 vdev hid click 100 100 --button right      # left / right / middle
 ```
 
-权限三态：注入（type/key/move/click/scroll/down/up）不需要任何授权，直接可用；监听（listen）需要「辅助功能」，无权限时报错并以非零码退出，按提示在 系统设置 → 隐私与安全性 → 辅助功能 勾选你的终端后重试。
+权限：注入（type/key/move/click/scroll/down/up）与监听（listen）**都需要「辅助功能」授权**。
+两者都在动手前预检：注入查 `CGPreflightPostEventAccess()`、监听查 `CGPreflightListenEventAccess()`，
+缺权限时明确报错并以非零码退出（不再静默假成功），按提示在 系统设置 → 隐私与安全性 → 辅助功能
+勾选你的终端 / 宿主 App 后重试。`vdev hid access` 可打印当前身份的 `post_access` / `listen_access` / `secure_input`。
+另：系统处于**安全输入**（密码框、终端"安全键盘输入"）时合成事件会整体失效，`vdev hid` 也会先报出来。
 
 ## 八、现状与局限
 
