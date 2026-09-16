@@ -14,7 +14,13 @@ fi
 ffmpeg -hide_banner -f lavfi -i "sine=frequency=440:duration=6" -f audiotoolbox -audio_device_index "$OUT_IDX" "x" > /tmp/vdev-audio-play.log 2>&1 &
 PLAY=$!
 sleep 2
-ffmpeg -hide_banner -f avfoundation -i ":$IN_IDX" -t 3 -y /tmp/vdev-audio-loopback.wav > /tmp/vdev-audio-rec.log 2>&1 || true
+# 先清空 wav：录音 ffmpeg 若在打开输入就失败，不会碰 -y 输出，上一轮的旧 wav
+# 会存活；后面转换再忠实转成 pcm，非静音的旧文件就会把"没录到"报成 PASS。
+: > /tmp/vdev-audio-loopback.wav
+if ! ffmpeg -hide_banner -f avfoundation -i ":$IN_IDX" -t 3 -y /tmp/vdev-audio-loopback.wav > /tmp/vdev-audio-rec.log 2>&1; then
+  echo "WARN: 录音 ffmpeg 退出非 0，见 /tmp/vdev-audio-rec.log"
+fi
+[ -s /tmp/vdev-audio-loopback.wav ] || { echo "FAIL: 录音未产出 WAV（设备不可用？）"; exit 1; }
 kill $PLAY 2>/dev/null || true
 sleep 1
 # -y 不能省：目标 PCM 已存在时 ffmpeg 会提示 overwrite，stdin 无输入则
