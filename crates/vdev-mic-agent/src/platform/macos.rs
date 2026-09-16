@@ -656,6 +656,13 @@ impl Core {
     /// 出口再缩回 [-1,1] 上环（与 Windows 后端的审查 M-g 修复同构）。
     #[inline]
     fn on_frame(&mut self, input: &[f32]) {
+        // 防二次标度：本函数入口契约是 [-1,1] float；若有人把 int16 标度
+        // 数据直接喂进来（典型错误是入口/出口缩放写反），debug/测试构建立即炸。
+        debug_assert!(
+            input.iter().all(|v| v.abs() <= 2.0),
+            "Core::on_frame expects [-1,1] float input"
+        );
+
         // 0) [-1,1] -> int16 标度（input 恒为 FRAME 长，见 den.process 的既有假设）
         for (d, &s) in self.in_scaled.iter_mut().zip(input) {
             *d = s * INT16_SCALE;
@@ -834,7 +841,7 @@ unsafe extern "C" fn capture_ioproc(
 /// pointer is the honest expression of that; it is never shared.
 struct AsmHolder(std::cell::UnsafeCell<FrameAssembler>);
 // SAFETY: `AsmHolder` is only ever reached from the single HAL audio thread
-// (see the `ASM.get()` call in `capture_input_cb`); no other thread touches it.
+// (see the `ASM.get()` call in `capture_ioproc`); no other thread touches it.
 unsafe impl Sync for AsmHolder {}
 
 impl AsmHolder {
@@ -883,7 +890,7 @@ const SEARCH_CAP: usize = 48_000; // 1 s: covers a 300 ms marker cadence with ro
 /// IOProc on the vdev virtual device: render (ring → device) and, in probe
 /// mode, marker detection in the same call.
 ///
-/// Wrapped in [`catch_unwind`] like [`capture_input_cb`]: a panic must not
+/// Wrapped in [`catch_unwind`] like [`capture_ioproc`]: a panic must not
 /// unwind into CoreAudio, so we report `'!pnc'` instead. `AssertUnwindSafe`
 /// covers only the pointers CoreAudio hands us plus the process-lifetime
 /// `InjectCtx` — see the leak note at its creation in `run`.
@@ -1114,7 +1121,7 @@ impl SpeakerCtx {
 
 /// AU render callback for the physical speaker (acoustic probe marker source).
 ///
-/// Wrapped in [`catch_unwind`] like [`capture_input_cb`]: a panic must not
+/// Wrapped in [`catch_unwind`] like [`capture_ioproc`]: a panic must not
 /// unwind into CoreAudio, so we report `'!pnc'` instead. `AssertUnwindSafe`
 /// covers only the pointers CoreAudio hands us plus the process-lifetime
 /// `SpeakerCtx` (leaked at creation in `run`).
