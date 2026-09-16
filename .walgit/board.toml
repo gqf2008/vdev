@@ -1,0 +1,44 @@
+# Work-unit board for vdev (规范见 walgit 仓库 docs/D1_COLLAB_DESIGN.md §8)。
+# 卡片只在往线程里追加**签名 status 条目**时才移动；本文件只声明确定性投影的泳道。
+
+version = 1
+
+[sort]
+by = "ts"
+direction = "desc"
+
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "ready"
+status = "ready"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+[[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# Catch-all：状态未知的线程也要能看到，不能凭空消失。
+[[column]]
+name = "other"
