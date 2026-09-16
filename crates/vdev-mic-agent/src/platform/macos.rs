@@ -151,8 +151,9 @@ mod ffi {
         pub m_data: *mut c_void,
     }
 
-    /// Variable-length in C; only `mBuffers[0]` is ever accessed here, and the
-    /// device does not hand out multi-buffer lists for interleaved formats.
+    /// C 里是变长数组：interleaved 只用 `mBuffers[0]`（多声道在同一 buffer
+    /// 内交错）；non-interleaved 时 `mNumberBuffers >= mChannelsPerFrame`，
+    /// 连续读取前 N 个 AudioBuffer（见 `capture_ioproc` 的 planar 分支）。
     #[repr(C)]
     pub struct AudioBufferList {
         pub m_number_buffers: u32,
@@ -742,19 +743,53 @@ fn note_cb_panic(cb: &'static str) {
     }
 }
 
-/// AU input callback (the physical mic's HAL thread → `Core::on_frame`).
-///
-/// The body runs under [`catch_unwind`]: a panic must not unwind across the C
-/// boundary (the HAL would abort the whole process), so we report `'!pnc'`
-/// instead. `AssertUnwindSafe` is honest here — the closure only touches the
-/// raw pointers CoreAudio handed us for this one call, plus state (`Core`,
-/// `ASM`) that is deliberately process-lifetime and single-thread.
-/// 采集侧状态：硬件格式 + 预分配的重采样缓冲 + `Core` 指针。
+/// 采集侧状态：设备格式 + 预分配的 downmix/重采样缓冲 + `Core` 指针。
 struct CaptureCtx {
     core: *mut Core,
     src_rate: f64,
+    channels: u32,
+    interleaved: bool,
+    /// 多声道降混到 mono 的预分配缓冲；RT 路径只写不扩容。
+    mono: Vec<f32>,
     /// 16k→48k 的 3x 线性插值输出；RT 路径只写不扩容。
     resample: Vec<f32>,
+    /// 预分配容量不足而丢弃的块数（正常应为 0；运行结束打印警告）。
+    dropped_blocks: u64,
+    /// 设备交付的 buffer layout 与 ASBD 不符而拒收的块数（正常应为 0）。
+    layout_errors: u64,
+}
+
+/// 非交错（每声道一个 buffer）-> mono：`sample(c, i)` 给出第 c 声道第 i 帧。
+fn downmix_planar<F: Fn(usize, usize) -> f32>(
+    channels: usize,
+    frames: usize,
+    sample: F,
+    dst: &mut [f32],
+) -> usize {
+    for (i, slot) in dst.iter_mut().take(frames).enumerate() {
+        let mut sum = 0.0f32;
+        for c in 0..channels {
+            sum += sample(c, i);
+        }
+        *slot = sum / channels as f32;
+    }
+    frames
+}
+
+/// 交错多声道 -> mono（逐帧平均）；返回写入 `dst` 的帧数。
+fn downmix_interleaved(src: &[f32], channels: usize, dst: &mut [f32]) -> usize {
+    if channels == 0 {
+        return 0;
+    }
+    let frames = src.len() / channels;
+    for i in 0..frames {
+        let mut sum = 0.0;
+        for c in 0..channels {
+            sum += src[i * channels + c];
+        }
+        dst[i] = sum / channels as f32;
+    }
+    frames
 }
 
 /// 3x 线性插值（16k→48k），返回写入 `dst` 的样本数（= src.len()*3）。
@@ -794,34 +829,101 @@ unsafe extern "C" fn capture_ioproc(
         // 与进程同生命周期；同一设备的 IOProc 串行回调。
         let ctx = unsafe { &mut *(client_data as *mut CaptureCtx) };
         let core = ctx.core;
+        let channels = ctx.channels as usize;
         // SAFETY: in_input_data 是 HAL 本次回调拥有的 buffer list。
         let abl = unsafe { &*in_input_data };
         if abl.m_number_buffers == 0 {
             return 0;
         }
-        let buf = &abl.m_buffers[0];
-        if buf.m_data.is_null() || buf.m_data_byte_size < 4 {
-            return 0;
-        }
-        let frames = (buf.m_data_byte_size / 4) as usize;
-        // SAFETY: build_capture_ioproc 已校验设备格式为线性 PCM f32 mono；
-        // buffer 在本回调期间有效。
-        let src = unsafe { std::slice::from_raw_parts(buf.m_data as *const f32, frames) };
+
+        let mono_src: &[f32] = if channels <= 1 {
+            let buf = &abl.m_buffers[0];
+            if buf.m_data.is_null() || buf.m_data_byte_size < 4 {
+                return 0;
+            }
+            let frames = (buf.m_data_byte_size / 4) as usize;
+            // SAFETY: 单声道 f32，buffer 生命周期就是本次回调。
+            unsafe { std::slice::from_raw_parts(buf.m_data as *const f32, frames) }
+        } else if ctx.interleaved {
+            let buf = &abl.m_buffers[0];
+            if buf.m_data.is_null() || buf.m_data_byte_size < 4 {
+                return 0;
+            }
+            let total = (buf.m_data_byte_size / 4) as usize;
+            let frames = total / channels;
+            if frames == 0 {
+                return 0;
+            }
+            if ctx.mono.capacity() < frames {
+                ctx.dropped_blocks += 1;
+                return 0;
+            }
+            ctx.mono.resize(frames, 0.0);
+            // SAFETY: 交错 f32，buffer 在本次回调期间有效；total/channels 帧。
+            let src = unsafe { std::slice::from_raw_parts(buf.m_data as *const f32, total) };
+            let n = downmix_interleaved(src, channels, &mut ctx.mono);
+            &ctx.mono[..n]
+        } else {
+            // 非交错：ABL 每个 buffer 一个声道（m_number_buffers >= channels）。
+            if (abl.m_number_buffers as usize) < channels {
+                ctx.layout_errors += 1;
+                return 0;
+            }
+            // SAFETY: C flexible array；第一个 buffer 后连续 channels 个 AudioBuffer。
+            let base = (&abl.m_buffers[0]) as *const AudioBuffer;
+            let first = unsafe { &*base };
+            if first.m_data.is_null() || first.m_data_byte_size < 4 {
+                ctx.layout_errors += 1;
+                return 0;
+            }
+            let frames = (first.m_data_byte_size / 4) as usize;
+            if frames == 0 {
+                ctx.layout_errors += 1;
+                return 0;
+            }
+            // 逐声道预校验，避免在 downmix 的 sample 回调里做错误分支。
+            for c in 0..channels {
+                // SAFETY: base.add(c) 在 m_number_buffers >= channels 范围内。
+                let b = unsafe { &*base.add(c) };
+                if b.m_data.is_null()
+                    || b.m_number_channels != 1
+                    || (b.m_data_byte_size as usize) < frames * 4
+                {
+                    ctx.layout_errors += 1;
+                    return 0;
+                }
+            }
+            if ctx.mono.capacity() < frames {
+                ctx.dropped_blocks += 1;
+                return 0;
+            }
+            ctx.mono.resize(frames, 0.0);
+            let n = downmix_planar(
+                channels,
+                frames,
+                |c, i| unsafe {
+                    let b = &*base.add(c);
+                    *(b.m_data as *const f32).add(i)
+                },
+                &mut ctx.mono,
+            );
+            &ctx.mono[..n]
+        };
 
         // SAFETY: `ASM` 只被采集 IOProc 这一个音频线程触碰；`core` 是
         // process-lifetime 的泄露 Box。
         let asm = unsafe { &mut *ASM.get() };
         if ctx.src_rate == 48_000.0 {
-            asm.push(src, |frame| unsafe { (*core).on_frame(frame) });
+            asm.push(mono_src, |frame| unsafe { (*core).on_frame(frame) });
         } else {
             // build 时已校验 src_rate == 16000。
-            let out_len = frames * 3;
+            let out_len = mono_src.len() * 3;
             if ctx.resample.capacity() < out_len {
-                // 预分配不足时丢弃本块，绝不在 RT 线程扩容。
+                ctx.dropped_blocks += 1;
                 return 0;
             }
             ctx.resample.resize(out_len, 0.0);
-            let n = resample_16k_to_48k(src, &mut ctx.resample);
+            let n = resample_16k_to_48k(mono_src, &mut ctx.resample);
             asm.push(&ctx.resample[..n], |frame| unsafe {
                 (*core).on_frame(frame)
             });
@@ -1318,15 +1420,15 @@ fn device_input_format(device: AudioDeviceID) -> Result<AudioStreamBasicDescript
     Ok(fmt)
 }
 
-/// 校验采集格式并返回采样率：只支持线性 PCM f32 mono 48k/16k。
-fn validate_capture_format(fmt: &AudioStreamBasicDescription) -> Result<f64> {
+/// 校验采集格式并返回 (采样率, 声道数, 是否交错)：只支持线性 PCM f32 48k/16k。
+fn validate_capture_format(fmt: &AudioStreamBasicDescription) -> Result<(f64, u32, bool)> {
     if fmt.m_format_id != FORMAT_LINEAR_PCM
         || fmt.m_bits_per_channel != 32
         || fmt.m_format_flags & FLAG_IS_FLOAT == 0
-        || fmt.m_channels_per_frame != 1
+        || fmt.m_channels_per_frame == 0
     {
         bail!(
-            "采集格式不支持：需要线性 PCM f32 mono（实际 id={:#x} flags={:#x} ch={} bits={}）",
+            "采集格式不支持：需要线性 PCM f32（实际 id={:#x} flags={:#x} ch={} bits={}）",
             fmt.m_format_id,
             fmt.m_format_flags,
             fmt.m_channels_per_frame,
@@ -1337,20 +1439,42 @@ fn validate_capture_format(fmt: &AudioStreamBasicDescription) -> Result<f64> {
     if rate != 48_000.0 && rate != 16_000.0 {
         bail!("采集采样率 {rate} 不支持（需要 48k 或 16k）");
     }
-    Ok(rate)
+    let interleaved = fmt.m_format_flags & FLAG_IS_NON_INTERLEAVED == 0;
+    let expected_bpf = if interleaved {
+        4 * fmt.m_channels_per_frame
+    } else {
+        4
+    };
+    if fmt.m_bytes_per_frame != expected_bpf {
+        bail!(
+            "采集格式帧宽不一致：channels={} interleaved={} bytesPerFrame={}（期望 {expected_bpf}）",
+            fmt.m_channels_per_frame,
+            interleaved,
+            fmt.m_bytes_per_frame
+        );
+    }
+    Ok((rate, fmt.m_channels_per_frame, interleaved))
 }
 
-/// 采集 IOProc：设备输入 -> FrameAssembler。要求线性 PCM f32 mono 48k/16k。
+/// 采集 IOProc：设备输入 -> （可选 downmix）-> （可选 16k→48k）-> FrameAssembler。
 fn build_capture_ioproc(
     device: AudioDeviceID,
     core: *mut Core,
 ) -> Result<(AudioDeviceIOProcID, Box<CaptureCtx>)> {
     let fmt = device_input_format(device)?;
-    let rate = validate_capture_format(&fmt)?;
+    let (rate, channels, interleaved) = validate_capture_format(&fmt)?;
+    let max_frames = get_prop::<u32>(device, &addr(DEV_BUFFER_FRAMES, SCOPE_GLOBAL))
+        .unwrap_or(4096)
+        .max(1) as usize;
     let mut ctx = Box::new(CaptureCtx {
         core,
         src_rate: rate,
-        resample: Vec::with_capacity(4096 * 3),
+        channels,
+        interleaved,
+        mono: Vec::with_capacity(max_frames),
+        resample: Vec::with_capacity(max_frames * 3),
+        dropped_blocks: 0,
+        layout_errors: 0,
     });
     let mut ioproc_id: AudioDeviceIOProcID = std::ptr::null_mut();
     // SAFETY: capture_ioproc 是 AudioDeviceIOProc；ctx 为 Box 持有的
@@ -1728,12 +1852,24 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     let cpu = (cpu_seconds() - cpu0).max(0.0);
 
     // ---- stop -------------------------------------------------------------
-    if let Some((dev, id, _, _)) = &capture_io {
+    if let Some((dev, id, _, ctx)) = &capture_io {
         // SAFETY: `(dev, id)` is our live capture pair; Stop quiesces callbacks,
         // then Destroy removes the IOProc. Errors are ignored on this exit path.
         unsafe {
             AudioDeviceStop(*dev, *id);
             AudioDeviceDestroyIOProcID(*dev, *id);
+        }
+        if ctx.dropped_blocks > 0 {
+            eprintln!(
+                "vdev-mic-agent: capture dropped {} block(s): preallocated mono/resample buffer too small",
+                ctx.dropped_blocks
+            );
+        }
+        if ctx.layout_errors > 0 {
+            eprintln!(
+                "vdev-mic-agent: capture rejected {} block(s): device buffer layout did not match ASBD (channels/number_channels/bytes)",
+                ctx.layout_errors
+            );
         }
     }
     // SAFETY: `vdev`/`ioproc_id` are the live pair created above; Stop first
@@ -2006,9 +2142,17 @@ mod capture_tests {
             m_sample_rate: rate,
             m_format_id: FORMAT_LINEAR_PCM,
             m_format_flags: flags,
-            m_bytes_per_packet: 4 * ch,
+            m_bytes_per_packet: if flags & FLAG_IS_NON_INTERLEAVED != 0 {
+                4
+            } else {
+                4 * ch
+            },
             m_frames_per_packet: 1,
-            m_bytes_per_frame: 4 * ch,
+            m_bytes_per_frame: if flags & FLAG_IS_NON_INTERLEAVED != 0 {
+                4
+            } else {
+                4 * ch
+            },
             m_channels_per_frame: ch,
             m_bits_per_channel: bits,
             m_reserved: 0,
@@ -2038,15 +2182,27 @@ mod capture_tests {
     }
 
     #[test]
-    fn capture_format_accepts_48k_and_16k_mono_float() {
+    fn capture_format_accepts_mono_and_stereo_48k_16k() {
         let f = FLAG_IS_FLOAT | FLAG_IS_PACKED;
         assert_eq!(
             validate_capture_format(&fmt(48_000.0, 1, f, 32)).unwrap(),
-            48_000.0
+            (48_000.0, 1, true)
         );
         assert_eq!(
             validate_capture_format(&fmt(16_000.0, 1, f, 32)).unwrap(),
-            16_000.0
+            (16_000.0, 1, true)
+        );
+        assert_eq!(
+            validate_capture_format(&fmt(48_000.0, 2, f, 32)).unwrap(),
+            (48_000.0, 2, true)
+        );
+        assert_eq!(
+            validate_capture_format(&fmt(48_000.0, 8, f, 32)).unwrap(),
+            (48_000.0, 8, true)
+        );
+        assert_eq!(
+            validate_capture_format(&fmt(48_000.0, 2, f | FLAG_IS_NON_INTERLEAVED, 32)).unwrap(),
+            (48_000.0, 2, false)
         );
     }
 
@@ -2063,8 +2219,35 @@ mod capture_tests {
     fn capture_format_rejects_unsupported_rate_channels_bits() {
         let f = FLAG_IS_FLOAT | FLAG_IS_PACKED;
         assert!(validate_capture_format(&fmt(44_100.0, 1, f, 32)).is_err());
-        assert!(validate_capture_format(&fmt(48_000.0, 2, f, 32)).is_err());
+        assert!(validate_capture_format(&fmt(48_000.0, 0, f, 32)).is_err());
         assert!(validate_capture_format(&fmt(48_000.0, 1, f, 16)).is_err());
         assert!(validate_capture_format(&fmt(48_000.0, 1, FLAG_IS_PACKED, 32)).is_err());
+    }
+
+    #[test]
+    fn downmix_interleaved_averages_each_frame() {
+        let src = [1.0f32, 3.0, 2.0, 4.0];
+        let mut dst = [0.0f32; 2];
+        assert_eq!(downmix_interleaved(&src, 2, &mut dst), 2);
+        assert_eq!(dst, [2.0, 3.0]);
+    }
+
+    #[test]
+    fn downmix_planar_averages_channels() {
+        let l = [1.0f32, 2.0];
+        let r = [3.0f32, 4.0];
+        let mut dst = [0.0f32; 2];
+        let n = downmix_planar(2, 2, |c, i| if c == 0 { l[i] } else { r[i] }, &mut dst);
+        assert_eq!(n, 2);
+        assert_eq!(dst, [2.0, 3.0]);
+    }
+
+    #[test]
+    fn downmix_interleaved_ignores_partial_tail() {
+        let src = [1.0f32, 3.0, 2.0];
+        let mut dst = [0.0f32; 2];
+        assert_eq!(downmix_interleaved(&src, 2, &mut dst), 1);
+        assert_eq!(dst[0], 2.0);
+        assert_eq!(dst[1], 0.0);
     }
 }
