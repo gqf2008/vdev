@@ -3,10 +3,11 @@
 # 门禁语义（看 CI 前先读本注释：红不等于阻塞，先区分硬门禁与顾问 job）：
 #
 # - 硬门禁（红即阻塞）：
-#   * macos：仓库根主 workspace（fmt / check / test / clippy -D warnings /
-#     build --release）。**最后一步的 build 不可省**：check/test/clippy 都不做
-#     最终链接，FFI 声明错框架（如把 AudioUnit 符号挂在 CoreAudio 上）只有真
-#     build 二进制才在 ld 阶段报未定义符号——vdev-mic-agent 就踩过这个盲区。
+#   * macos：仓库根主 workspace（acceptance scripts smoke / fmt / check /
+#     test / clippy -D warnings / build --release）。**最后一步的 build 不可省**：
+#     check/test/clippy 都不做最终链接，FFI 声明错框架（如把 AudioUnit 符号
+#     挂在 CoreAudio 上）只有真 build 二进制才在 ld 阶段报未定义符号——
+#     vdev-mic-agent 就踩过这个盲区。
 #   * windows-user 矩阵：五个 Windows 独立 workspace 的用户态门禁——
 #     vdev-camera-win / vdev-hid-win / vdev-app-win / vdev-audio-win /
 #     vdev-display-win（只测 WDK-free 的用户态包）；外加主 workspace 成员
