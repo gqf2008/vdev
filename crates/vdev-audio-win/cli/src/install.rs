@@ -10,8 +10,9 @@ use std::path::Path;
 use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW,
-    CR_SUCCESS, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIIRFLAG_FORCE_INF, DiInstallDriverW,
+    CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_Get_Device_IDW, CM_LOCATE_DEVNODE_NORMAL,
+    CM_Locate_DevNodeW, CM_PROB, CM_Query_And_Remove_SubTreeW, CR_SUCCESS, DICD_GENERATE_ID,
+    DIF_REGISTERDEVICE, DIGCF_PRESENT, DIIRFLAG_FORCE_INF, DN_HAS_PROBLEM, DiInstallDriverW,
     GUID_DEVCLASS_MEDIA, HDEVINFO, SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY,
     SP_DEVINFO_DATA, SPDRP_DRIVER, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
     SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
@@ -132,6 +133,16 @@ fn open_class_devices() -> Result<HDEVINFO> {
     .context("SetupDiGetClassDevsW failed")
 }
 
+/// 打开 Media 类设备集合，但只枚举**在场**节点（`DIGCF_PRESENT`）。
+///
+/// 与 `open_class_devices`（flags=0，含非 present 幽灵）配对使用：判断一个设备
+/// 节点是否真的在场必须靠这个枚举，**不能靠计数**——本 bug 的历史现场就是一个
+/// non-present 幽灵节点（`ROOT\MEDIA\0002/0003` + `0xC000009A`）。
+fn open_class_devices_present() -> Result<HDEVINFO> {
+    unsafe { SetupDiGetClassDevsW(Some(&GUID_DEVCLASS_MEDIA), None, None, DIGCF_PRESENT) }
+        .context("SetupDiGetClassDevsW(DIGCF_PRESENT) failed")
+}
+
 /// 在调用方自己的设备信息集合上按实例 ID 重新打开设备，
 /// 返回配对该集合的 [`SP_DEVINFO_DATA`]（元素必须属于传入的集合，SetupAPI 契约）。
 fn open_device(devs: HDEVINFO, instance_id: &str) -> Result<SP_DEVINFO_DATA> {
@@ -232,6 +243,158 @@ pub fn vdev_instance_ids() -> Result<Vec<String>> {
     }
     unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
     Ok(out)
+}
+
+/// 读取设备信息元素对应的设备实例 ID；`CM_Get_Device_IDW` 失败时返回 `None`。
+fn instance_id_of(info: &SP_DEVINFO_DATA) -> Option<String> {
+    let mut id_buf = [0u16; 512];
+    // SAFETY: info.DevInst 来自 SetupDiEnumDeviceInfo；id_buf 可写且有长度
+    let cr = unsafe { CM_Get_Device_IDW(info.DevInst, &mut id_buf, 0) };
+    if cr != CR_SUCCESS {
+        return None;
+    }
+    let end = id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len());
+    Some(String::from_utf16_lossy(&id_buf[..end]))
+}
+
+/// 查询在场设备节点的 problem code（`CM_Get_DevNode_Status`）。
+///
+/// 返回 `None` = 无 problem（`DN_HAS_PROBLEM` 未置位）；`Some(code)` = 带 problem
+/// code（如 `CM_PROB_FAILED_START` = 10）。查询本身失败（理论上只对 `DIGCF_PRESENT`
+/// 枚举出的在场节点调用，不该发生）按「有 problem」保守处理：宁可让调用方走
+/// Recreate / 非零退出，也不把状态未知的节点当健康节点放行。
+fn problem_code(devinst: u32) -> Option<u32> {
+    let mut status = CM_DEVNODE_STATUS_FLAGS(0);
+    let mut problem = CM_PROB(0);
+    // SAFETY: devinst 来自 SetupDiEnumDeviceInfo；两个出参均为本地有效可写变量
+    let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
+    if cr != CR_SUCCESS {
+        return Some(0);
+    }
+    if status.0 & DN_HAS_PROBLEM.0 != 0 {
+        Some(problem.0)
+    } else {
+        None
+    }
+}
+
+/// vdev-audio 设备节点的「在场 + 健康」快照。
+///
+/// 这是独立审查第 4 条的修法：原断言只数 `vdev_instance_ids().len()`，而该计数
+/// 口径（flags=0）**含非 present 幽灵节点**，于是「唯一一个不在场、或带 problem
+/// code 的节点」会被判成安装成功——而本 bug 的历史现场恰恰就是幽灵节点
+/// （`ROOT\MEDIA\0002/0003` + `0xC000009A`）。所以判定与断言都必须看 present /
+/// problem，而不是看个数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VdevNode {
+    instance_id: String,
+    /// 由 `DIGCF_PRESENT` 单独枚举确定（不靠计数，也不靠 CM 错误码语义）
+    present: bool,
+    /// `CM_Get_DevNode_Status` 给出的 problem code；`None` = 无 problem
+    problem: Option<u32>,
+}
+
+impl VdevNode {
+    /// present 且无 problem code —— 断言与 `install_plan` 只认这种节点。
+    fn is_healthy(&self) -> bool {
+        self.present && self.problem.is_none()
+    }
+
+    /// 判定用的可用性摘要（纯数据，便于在非 Windows 宿主单测 `install_plan`）
+    fn health(&self) -> NodeHealth {
+        if self.is_healthy() {
+            NodeHealth::Healthy
+        } else {
+            NodeHealth::Unhealthy
+        }
+    }
+
+    /// 供错误信息打印：`ROOT\MEDIA\0001[ok]` / `…[present,problem=10]` / `…[not-present]`
+    fn describe(&self) -> String {
+        let id = &self.instance_id;
+        match (self.present, self.problem) {
+            (true, None) => format!("{id}[ok]"),
+            (true, Some(code)) => format!("{id}[present,problem={code}]"),
+            (false, _) => format!("{id}[not-present]"),
+        }
+    }
+}
+
+/// 把所有节点的状态拼成一行（空集合给 `<none>`），失败时给出**实际枚举结果**。
+fn describe_nodes(nodes: &[VdevNode]) -> String {
+    if nodes.is_empty() {
+        "<none>".to_string()
+    } else {
+        nodes
+            .iter()
+            .map(VdevNode::describe)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// 枚举 Media 类下所有 vdev-audio 节点，并标注每个节点的「在场 / problem」状态。
+///
+/// 「在场」用 `DIGCF_PRESENT` 单独枚举确定，「problem」对在场节点查
+/// `CM_Get_DevNode_Status`；两者都不看计数，因此不会被「唯一一个幽灵节点」骗过。
+/// 非 present 节点也会列出来（判定与报错都要给出全貌）。
+fn vdev_nodes() -> Result<Vec<VdevNode>> {
+    // 全部节点（含非 present 幽灵）——用于给出全貌
+    let all: Vec<String> = {
+        let devs = open_class_devices()?;
+        let ids: Vec<String> = collect_vdev_nodes(devs)
+            .iter()
+            .filter_map(instance_id_of)
+            .collect();
+        unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+        ids
+    };
+    // 在场节点（DIGCF_PRESENT）——只有这里的节点才可能被算作「可用」
+    let present: Vec<(String, u32)> = {
+        let devs = open_class_devices_present()?;
+        let nodes: Vec<(String, u32)> = collect_vdev_nodes(devs)
+            .iter()
+            .filter_map(|info| instance_id_of(info).map(|id| (id, info.DevInst)))
+            .collect();
+        unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+        nodes
+    };
+
+    let mut nodes: Vec<VdevNode> = all
+        .into_iter()
+        .map(|instance_id| VdevNode {
+            instance_id,
+            present: false,
+            problem: None,
+        })
+        .collect();
+    for (instance_id, devinst) in present {
+        match nodes
+            .iter_mut()
+            .find(|n| n.instance_id.eq_ignore_ascii_case(&instance_id))
+        {
+            Some(node) => {
+                node.present = true;
+                node.problem = problem_code(devinst);
+            }
+            // 理论上不会走到（flags=0 的枚举必然包含在场节点）；兜底补上，
+            // 免得因为两次枚举之间的 TOCTOU 丢掉一个在场节点。
+            None => nodes.push(VdevNode {
+                instance_id,
+                present: true,
+                problem: problem_code(devinst),
+            }),
+        }
+    }
+    Ok(nodes)
+}
+
+/// 安装后断言的判据：**恰好一个节点，且该节点 present 且无 problem**。
+///
+/// 比「present 且无 problem 的节点数 == 1」更严：连非 present 幽灵节点一起挡掉
+/// （否则「1 个健康 + 1 个幽灵」也会通过，幽灵会在设备树里越堆越多）。
+fn install_satisfied(nodes: &[VdevNode]) -> bool {
+    matches!(nodes, [node] if node.is_healthy())
 }
 
 /// 轮询等待某个实例 ID 从设备树消失（最多 `tries` × 500ms）
@@ -372,16 +535,35 @@ fn remove_all_nodes() -> Result<usize> {
 enum InstallPlan {
     /// 设备树里一个 `Root\vdev-audio` 节点都没有：需要新建一个
     Create,
-    /// 恰好一个节点：就地更新驱动，不重建节点（端点 GUID 保持不变）
+    /// 恰好一个**可用**（present 且无 problem）的节点：就地更新驱动、不重建节点
+    /// （端点 GUID 保持不变）
     Reuse,
-    /// 多个节点（历史残留）：先全部清掉再重建
+    /// 唯一节点不在场（幽灵）/带 problem，或 ≥2 个节点（历史残留）：先全部清掉再重建
     Recreate,
 }
 
-fn install_plan(existing_nodes: usize) -> InstallPlan {
-    match existing_nodes {
-        0 => InstallPlan::Create,
-        1 => InstallPlan::Reuse,
+/// 单节点可用性摘要（`install_plan` 的输入；纯数据，便于在非 Windows 宿主单测）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeHealth {
+    /// present 且无 problem code —— 只有这种节点才走 Reuse
+    Healthy,
+    /// 非 present（幽灵）或带 problem code —— 就地更新救不回来
+    Unhealthy,
+}
+
+/// 安装时的节点处置决策（纯函数，Windows 宿主可单测）。
+///
+/// 判定口径见 `VdevNode`：只有「present 且无 problem」的节点才算可用节点。唯一节点
+/// 若是不在场（幽灵）或带 problem code，`Reuse` 救不回来——`DiInstallDriverW` 既不
+/// 能把 phantom 变回 present，也不会清掉 problem code——必须改判 `Recreate` 先清后建，
+/// 否则又回到「断言通过、实际没有可用端点」的老现场（审查第 4 条）。
+fn install_plan(nodes: &[NodeHealth]) -> InstallPlan {
+    match nodes {
+        // 没有节点：新建
+        [] => InstallPlan::Create,
+        // 唯一节点且健康：就地更新驱动、不重建节点（端点 GUID 保持不变）
+        [NodeHealth::Healthy] => InstallPlan::Reuse,
+        // 唯一节点不在场/带 problem，或 ≥2 个节点（历史残留）：先全部清掉再重建
         _ => InstallPlan::Recreate,
     }
 }
@@ -466,22 +648,24 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         .collect();
 
     // 幂等处置：理由见 `install_plan` 的注释（删旧建新会漂移端点 GUID；残留节点
-    // 会因驱动单例而上报 0xC000009A）
-    let existing = vdev_instance_ids()?;
-    let plan = install_plan(existing.len());
+    // 会因驱动单例而上报 0xC000009A）。判定只看「present 且无 problem」的节点：
+    // 唯一节点不在场（幽灵）/带 problem 时改判 Recreate——见 `VdevNode`。
+    let existing = vdev_nodes()?;
+    let healths: Vec<NodeHealth> = existing.iter().map(VdevNode::health).collect();
+    let plan = install_plan(&healths);
     match plan {
         InstallPlan::Create => {}
         InstallPlan::Reuse => {
             println!(
-                "已存在设备节点 {}，就地更新驱动（不重建节点，端点 GUID 保持不变）",
-                existing.join(", ")
+                "已存在可用设备节点 {}，就地更新驱动（不重建节点，端点 GUID 保持不变）",
+                describe_nodes(&existing)
             );
         }
         InstallPlan::Recreate => {
             eprintln!(
-                "检测到 {} 个 vdev-audio 节点（应为 1）：{}，先全部清理后重建",
+                "检测到 {} 个 vdev-audio 节点（应为「恰好一个 present 且无 problem」）：{}，先全部清理后重建",
                 existing.len(),
-                existing.join(", ")
+                describe_nodes(&existing)
             );
             let removed = remove_all_nodes()?;
             println!("已清理 {removed} 个残留设备节点");
@@ -515,29 +699,27 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         println!("系统提示需要重启以完成安装");
     }
 
-    // 事后断言：安装完成后必须**恰好一个**节点（设备注册/移除是异步的，给它最多
-    // ~3s）。多节点意味着后建的节点必然因驱动单例失败——宁可 CLI 非零退出，也不要
-    // 静默留下「看着装好了、其实有个死节点」的现场。
-    let mut ids = vdev_instance_ids()?;
+    // 事后断言（口径升级：present 且无 problem，不再只看计数）：安装完成后必须
+    // **恰好一个「在场且无 problem」的节点**（设备注册/移除是异步的，给它最多 ~3s）。
+    // 纯计数会漏掉「唯一一个 non-present 或带 problem code 的幽灵节点」——那正是本
+    // bug 的历史现场（幽灵节点 + 0xC000009A）。多节点 / 幽灵 / 带 problem 一律非零
+    // 退出并打印实际枚举结果，不静默留下「看着装好了、其实没有可用端点」的现场。
+    let mut nodes = vdev_nodes()?;
     for _ in 0..6 {
-        if ids.len() == 1 {
+        if install_satisfied(&nodes) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
-        ids = vdev_instance_ids()?;
+        nodes = vdev_nodes()?;
     }
-    if ids.len() != 1 {
+    if !install_satisfied(&nodes) {
         bail!(
-            "安装后 vdev-audio 节点数为 {}（应为 1）：{}（残留节点请先 uninstall 清理）",
-            ids.len(),
-            if ids.is_empty() {
-                "<none>".to_string()
-            } else {
-                ids.join(", ")
-            }
+            "安装后设备节点不是「恰好一个 present 且无 problem 的节点」（实枚举 {} 个）：{}（not-present 幽灵或带 problem 的节点请先 uninstall 清理）",
+            nodes.len(),
+            describe_nodes(&nodes)
         );
     }
-    println!("虚拟声卡驱动已安装（设备节点 {}）", ids[0]);
+    println!("虚拟声卡驱动已安装（设备节点 {}）", nodes[0].describe());
     Ok(())
 }
 
@@ -662,14 +844,77 @@ mod tests {
         assert!(!hwid_matches(&ids2, r"Root\vdev-audio"));
     }
 
-    /// 安装幂等决策回归：0 → 新建、1 → 就地更新、≥2 → 先清后建。
+    fn node(instance_id: &str, present: bool, problem: Option<u32>) -> VdevNode {
+        VdevNode {
+            instance_id: instance_id.to_string(),
+            present,
+            problem,
+        }
+    }
+
+    /// 安装幂等决策回归：0 → 新建、1 个健康节点 → 就地更新、≥2 → 先清后建。
     /// 回归点是「每次 install 都删旧建新」——清空那步一旦假成功，节点就会堆成
     /// `ROOT\MEDIA\0001/0002/0003`，后建的节点因驱动单例上报 `0xC000009A`。
     #[test]
     fn install_plan_is_idempotent() {
-        assert_eq!(install_plan(0), InstallPlan::Create);
-        assert_eq!(install_plan(1), InstallPlan::Reuse);
-        assert_eq!(install_plan(2), InstallPlan::Recreate);
-        assert_eq!(install_plan(3), InstallPlan::Recreate);
+        assert_eq!(install_plan(&[]), InstallPlan::Create);
+        assert_eq!(install_plan(&[NodeHealth::Healthy]), InstallPlan::Reuse);
+        assert_eq!(
+            install_plan(&[NodeHealth::Healthy, NodeHealth::Healthy]),
+            InstallPlan::Recreate
+        );
+        assert_eq!(
+            install_plan(&[
+                NodeHealth::Healthy,
+                NodeHealth::Unhealthy,
+                NodeHealth::Unhealthy
+            ]),
+            InstallPlan::Recreate
+        );
+    }
+
+    /// 审查第 4 条：唯一节点**不在场**（幽灵）时必须改判 Recreate——`Reuse` 走的是
+    /// 就地更新，`DiInstallDriverW` 不能把 phantom 变回 present。
+    #[test]
+    fn install_plan_recreates_when_single_node_not_present() {
+        let phantom = node(r"ROOT\MEDIA\0001", false, None);
+        assert!(!phantom.is_healthy());
+        assert_eq!(phantom.health(), NodeHealth::Unhealthy);
+        assert_eq!(install_plan(&[phantom.health()]), InstallPlan::Recreate);
+    }
+
+    /// 唯一节点在场但带 problem code（如 `CM_PROB_FAILED_START` = 10）同样 Recreate。
+    #[test]
+    fn install_plan_recreates_when_single_node_has_problem() {
+        let broken = node(r"ROOT\MEDIA\0002", true, Some(10));
+        assert!(!broken.is_healthy());
+        assert_eq!(broken.health(), NodeHealth::Unhealthy);
+        assert_eq!(install_plan(&[broken.health()]), InstallPlan::Recreate);
+    }
+
+    /// 只有「present 且无 problem」的唯一节点才走 Reuse。
+    #[test]
+    fn install_plan_reuses_only_healthy_single_node() {
+        let healthy = node(r"ROOT\MEDIA\0000", true, None);
+        assert!(healthy.is_healthy());
+        assert_eq!(install_plan(&[healthy.health()]), InstallPlan::Reuse);
+    }
+
+    /// 装完断言：必须**恰好一个节点**且它 present 且无 problem；phantom / 带 problem /
+    /// 多节点 / 空集合一律不通过（不能只看计数）。
+    #[test]
+    fn install_satisfied_requires_single_present_problem_free_node() {
+        assert!(install_satisfied(&[node(r"ROOT\MEDIA\0000", true, None)]));
+        assert!(!install_satisfied(&[node(r"ROOT\MEDIA\0001", false, None)]));
+        assert!(!install_satisfied(&[node(
+            r"ROOT\MEDIA\0002",
+            true,
+            Some(10)
+        )]));
+        assert!(!install_satisfied(&[
+            node(r"ROOT\MEDIA\0000", true, None),
+            node(r"ROOT\MEDIA\0001", false, None),
+        ]));
+        assert!(!install_satisfied(&[]));
     }
 }
