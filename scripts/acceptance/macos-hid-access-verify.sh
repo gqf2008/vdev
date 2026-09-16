@@ -12,6 +12,10 @@
 #   C) 安全输入开启      → 必须报错（用 EnableSecureEventInput 确定性开启）
 #   D) 稳定注入器身份    → 人工在系统设置里授权过的话，此时应当能送达（信息项）
 #
+# 注意：本脚本注入的是真实合成键事件，"逐字一致"断言在**机器满载**时会因系统丢弃
+# 事件而失败（实测 load 165 时 B/D 段丢字、空载即全绿）。真机跑验收请在空闲机器上做，
+# 失败时先看 `uptime` 再判断是被测功能坏了还是被负载拖了。
+#
 # 用法：macos-hid-access-verify.sh [path/to/vdev]
 # 退出码：0 = 全部通过；1 = 有用例失败；2 = 环境不具备（没验证，不算通过）
 set -u
@@ -103,20 +107,35 @@ resolve_sign_identity() {
   printf '%s' "-"   # 没有任何可用身份 → ad-hoc（并会在下面 WARN）
 }
 
-# 返回 0=刚准备好（重写/重签过），1=复用了现有 bundle
+# 盘上这份 bundle 当前的实际签名状态：`adhoc` 或 `signed:<Authority 叶子 CN>`。
+signature_state() {
+  local app=$1
+  if codesign -dv "${app}" 2>&1 | grep -q '^Signature=adhoc'; then
+    printf 'adhoc'
+  else
+    printf 'signed:%s' "$(codesign -dv --verbose=4 "${app}" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+  fi
+}
+
+# 返回 0=刚准备好（重写/重签过），1=复用了现有 bundle，2=没签成（下轮重试）
 prepare_injector_app() {
   local src=$1 app=$2 stamp=$3 identity=$4
   local bin="${app}/Contents/MacOS/VdevHidInjector"
-  local want_state
-  if [ "${identity}" = "-" ]; then want_state="adhoc"; else want_state="signed:${identity}"; fi
+  # 戳里存三段：源 sha、**请求的**身份串、**实际**签名状态。
+  # - 请求串用于"操作者显式换了身份就该重签"；
+  # - 实际状态用于"盘上是不是真的这个签名"（防 `--sign -` 悄悄降级）；
+  # - 两者分开存，别名身份（如传证书 SHA-1）才不会被误判成"每轮都变了"而反复重签。
   local src_sha
   src_sha=$(shasum -a 256 "${src}" | awk '{print $1}')
-  # 复用条件：三个都满足。只看 sha 会让"签名坏了/身份降级"永久固化（审查 B1）。
   if [ -f "${bin}" ] && [ -f "${stamp}" ]; then
-    local got_sha got_state
+    local got_sha got_req got_actual actual_now
     got_sha=$(cut -f1 "${stamp}" 2>/dev/null)
-    got_state=$(cut -f2 "${stamp}" 2>/dev/null)
-    if [ "${got_sha}" = "${src_sha}" ] && [ "${got_state}" = "${want_state}" ] \
+    got_req=$(cut -f2 "${stamp}" 2>/dev/null)
+    got_actual=$(cut -f3 "${stamp}" 2>/dev/null)
+    actual_now="$(signature_state "${app}")"
+    if [ "${got_sha}" = "${src_sha}" ] && [ "${got_req}" = "${identity}" ] \
+       && [ "${got_actual}" = "${actual_now}" ] \
+       && { [ "${identity}" = "-" ] || [ "${actual_now}" != "adhoc" ]; } \
        && codesign --verify --strict "${app}" >/dev/null 2>&1; then
       return 1
     fi
@@ -146,27 +165,23 @@ PLIST
   if ! codesign --force --sign "${identity}" -i com.vdev.hid.injector \
        --options runtime --timestamp=none "${app}" >/dev/null 2>&1; then
     echo "WARN: 签名失败（identity='${identity}'）：本 bundle 不会被标记就绪，下次运行会重试。" >&2
-    return 0
+    return 2
   fi
   if ! codesign --verify --strict "${app}" >/dev/null 2>&1; then
     echo "WARN: 签名后 codesign --verify --strict 失败：不写戳，下次运行会重试。" >&2
-    return 0
+    return 2
   fi
   # 实际签成了什么？**不能拿请求值当结果**（审查 L2）：`--sign -` 或身份失效时
   # codesign 仍可能以 ad-hoc 成功，此时戳若写 signed:<身份> 就是撒谎，复用条件
   # 会把降级的 bundle 当"最新"，且永不自愈。
   local actual_state
-  if codesign -dv "${app}" 2>&1 | grep -q '^Signature=adhoc'; then
-    actual_state="adhoc"
-  else
-    actual_state="signed:$(codesign -dv --verbose=4 "${app}" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
-  fi
+  actual_state="$(signature_state "${app}")"
   if [ "${identity}" != "-" ] && [ "${actual_state}" = "adhoc" ]; then
     echo "WARN: 请求用身份 '${identity}' 签名，实际落成 ad-hoc（证书不可用？）：不写戳，下次重试。" >&2
     return 2
   fi
   # 只有"签名 + 校验"都过了才写戳，且写的是**实际**状态
-  printf '%s\t%s' "${src_sha}" "${actual_state}" > "${stamp}"
+  printf '%s\t%s\t%s' "${src_sha}" "${identity}" "${actual_state}" > "${stamp}"
   return 0
 }
 
@@ -197,7 +212,8 @@ if [ "${SELF_TEST}" = "1" ]; then
   echo "== 1) 首跑：应重写并写状态戳 =="
   prepare_injector_app "${SELF_SRC}" "${SELF_APP}" "${SELF_STAMP}" "-" >/dev/null || true
   [ -f "${SELF_STAMP}" ] || { echo "FAIL: 首跑没有写戳"; SELF_OK=0; }
-  grep -q "adhoc" "${SELF_STAMP}" 2>/dev/null || { echo "FAIL: 戳里没有身份状态"; SELF_OK=0; }
+  grep -q "adhoc" "${SELF_STAMP}" 2>/dev/null || { echo "FAIL: 戳里没有实际签名状态"; SELF_OK=0; }
+  [ "$(cut -f3 "${SELF_STAMP}" 2>/dev/null)" = "adhoc" ] || { echo "FAIL: 第 3 字段应为实际状态 adhoc"; SELF_OK=0; }
   SELF_M1=$(stat_of "${SELF_BIN}")
   SELF_SHA1=$(sha_of "${SELF_SRC2}")
 
@@ -228,18 +244,24 @@ if [ "${SELF_TEST}" = "1" ]; then
   fi
 
   echo "== 5) 身份变化：应重签（戳里记了身份，不只是 sha）=="
-  if prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "signed:fake-identity" >/dev/null 2>&1; then
-    echo "  身份变化已触发重做 ✓"
+  # 注意返回码：0=重做过，1=复用了，2=没签成（身份不可用时正是这条）。
+  # "没有复用"才是本步要断言的（rc != 1）。
+  set +e
+  prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "signed:fake-identity" >/dev/null 2>&1
+  SELF_RC5=$?
+  set -e
+  if [ "${SELF_RC5}" != "1" ]; then
+    echo "  身份变化没有复用（rc=${SELF_RC5}）✓"
   else
-    echo "FAIL: 身份变化没有触发重签（戳只比了 sha）"; SELF_OK=0
+    echo "FAIL: 身份变化被复用了（戳只比了 sha）"; SELF_OK=0
   fi
 
   echo "== 6) 请求一个不可用的身份：绝不能把 ad-hoc 结果记成 signed:（审查 L2）=="
   prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "Apple Development: 不存在的证书 (XXXXXXXXXX)" >/dev/null 2>&1 || true
   if grep -q "signed:Apple Development: 不存在的证书" "${SELF_STAMP}" 2>/dev/null; then
     echo "FAIL: 戳把 ad-hoc 结果记成了 signed:<请求身份>（戳会撒谎，复用条件不再可信）"; SELF_OK=0
-  elif codesign -dv "${SELF_APP}" 2>&1 | grep -q '^Signature=adhoc' && [ "$(cut -f2 "${SELF_STAMP}" 2>/dev/null)" != "adhoc" ]; then
-    echo "FAIL: 实际是 ad-hoc，戳状态却不是 adhoc（$(cut -f2 "${SELF_STAMP}" 2>/dev/null)）"; SELF_OK=0
+  elif codesign -dv "${SELF_APP}" 2>&1 | grep -q '^Signature=adhoc' && [ "$(cut -f3 "${SELF_STAMP}" 2>/dev/null)" != "adhoc" ]; then
+    echo "FAIL: 实际是 ad-hoc，戳的实际状态字段却不是 adhoc（$(cut -f3 "${SELF_STAMP}" 2>/dev/null)）"; SELF_OK=0
   else
     echo "  戳状态与实际签名一致 ✓"
   fi
