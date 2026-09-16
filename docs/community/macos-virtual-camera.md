@@ -69,9 +69,9 @@ offset  size  字段
 
 ### 3.2 扩展内的帧管线
 
-`main()`（`crates/vdev-camera-ext/src/main.rs:726`）按 8 步线性初始化：建 `CMVideoFormatDescription`（1920x1080 BGRA@60）→ 建 `CMIOExtensionStreamFormat` → 建三个 source 对象 → 建 `CMIOExtensionStream` → 建 `CMIOExtensionDevice` → 建 `CMIOExtensionProvider`（`clientQueue` 必须给真实 dispatch queue，NULL 会注册不上 XPC）→ **先 `addStream` 再 `addDevice`** → 起帧线程、`startServiceWithProvider`、进 `CFRunLoopRun`。
+`main()`（`crates/vdev-camera-ext/src/main.rs:761`）按 8 步线性初始化：建 `CMVideoFormatDescription`（1920x1080 BGRA@60）→ 建 `CMIOExtensionStreamFormat` → 建三个 source 对象 → 建 `CMIOExtensionStream` → 建 `CMIOExtensionDevice` → 建 `CMIOExtensionProvider`（`clientQueue` 必须给真实 dispatch queue，NULL 会注册不上 XPC）→ **先 `addStream` 再 `addDevice`** → 起帧线程、`startServiceWithProvider`、进 `CFRunLoopRun`。
 
-帧线程 `frame_loop`（`crates/vdev-camera-ext/src/main.rs:649`）用 `Pacer` 按**固定 deadline 节拍**（60fps，只补足到下一个 tick）循环：`streamingClients` 非空（还有客户端在拉流）时才产帧——先看 `INJECTED` 槽里有没有 2 秒内的注入帧——有就走滤镜（可选）直发；没有就调用核心库的 `vdev_camera_render_bgra32` 渲染一帧 SMPTE 彩条发出去。也就是说**摄像头永不黑屏**：没有推流源时它是一个彩条测试源，这正是验证链路时最有用的行为。
+帧线程 `frame_loop`（`crates/vdev-camera-ext/src/main.rs:673`）用 `Pacer` 按**固定 deadline 节拍**（60fps，只补足到下一个 tick）循环：`streamingClients` 非空（还有客户端在拉流）时才产帧——先看 `INJECTED` 槽里有没有 2 秒内的注入帧——有就走滤镜（可选）直发；没有就调用核心库的 `vdev_camera_render_bgra32` 渲染一帧 SMPTE 彩条发出去。也就是说**摄像头永不黑屏**：没有推流源时它是一个彩条测试源，这正是验证链路时最有用的行为。
 
 彩条回落窗口为什么是 2 秒？因为推流端可能"喘"：读网络挂载的视频、屏幕静止不产生新帧，都会让注入停顿。停顿小于窗口时靠推流端保活（重发最后一帧）顶住，超过窗口才回落彩条——这套"保持注入新鲜"的机制让画面在源停顿时也不闪彩条。
 
@@ -100,7 +100,7 @@ extern_protocol!(
 );
 ```
 
-方法签名逐字对照 `CMIOExtension*.h` 头文件，`#[unsafe(method(...))]` 保证 selector 拼写编译期即正确。实现侧用 `define_class!` 挂到自定义类上（`crates/vdev-camera-ext/src/main.rs:280` 的 `VdevRustProviderSource` 等），返回对象的方法用 `method_id` 处理。
+方法签名逐字对照 `CMIOExtension*.h` 头文件，`#[unsafe(method(...))]` 保证 selector 拼写编译期即正确。实现侧用 `define_class!` 挂到自定义类上（`crates/vdev-camera-ext/src/main.rs:308` 的 `VdevRustProviderSource` 等），返回对象的方法用 `method_id` 处理。
 
 另一个容易翻车的点是**属性常量**。`availableProperties` 要返回 `CMIOExtensionPropertyProviderName` 这类 `NSString*` 全局常量的集合，字符串字面值无从得知（猜错就静默不工作）。正确姿势是运行时从 framework 里取（`crates/vdev-camera-ext/src/cmio.rs:128–149`）：
 
@@ -148,9 +148,9 @@ fn did_fail(&self, _req: &AnyObject, error: &AnyObject) {
 
 ### 4.3 出帧：CVPixelBuffer → CMSampleBuffer → sendSampleBuffer
 
-每帧的发送在 `send_bgra`（`crates/vdev-camera-ext/src/main.rs:494`）：`CVPixelBufferCreate`（带 `IOSurfaceProperties` 属性）→ lock → 拷贝 BGRA → unlock → `CMSampleBufferCreateForImageBuffer` 打包时间戳 → `[stream sendSampleBuffer:discontinuity:hostTimeInNanoseconds:]` → 释放。有两个细节值得展开。
+每帧的发送在 `send_bgra`（`crates/vdev-camera-ext/src/main.rs:517`）：`CVPixelBufferCreate`（带 `IOSurfaceProperties` 属性）→ lock → 拷贝 BGRA → unlock → `CMSampleBufferCreateForImageBuffer` 打包时间戳 → `[stream sendSampleBuffer:discontinuity:hostTimeInNanoseconds:]` → 释放。有两个细节值得展开。
 
-其一是 **stride 处理**（`crates/vdev-camera-ext/src/main.rs:476–480`）。协议允许推流方带行尾填充，而 CoreVideo 分配的像素缓冲行距（`CVPixelBufferGetBytesPerRow`）未必等于 `w*4`，两侧都可能不齐：
+其一是 **stride 处理**（`crates/vdev-camera-ext/src/main.rs:499–510`）。协议允许推流方带行尾填充，而 CoreVideo 分配的像素缓冲行距（`CVPixelBufferGetBytesPerRow`）未必等于 `w*4`，两侧都可能不齐：
 
 ```rust
 fn copy_bgra_rows(dst: &mut [u8], src: &[u8], w: u32, h: u32, stride: u32, dst_stride: usize) {
@@ -167,16 +167,16 @@ fn copy_bgra_rows(dst: &mut [u8], src: &[u8], w: u32, h: u32, stride: u32, dst_s
 }
 ```
 
-只拷每行前 `w*4` 有效字节、行内长度再与两个 stride 取 min——此前按整行拷贝，推流方发 padded stride 且 CV 分配的 `dst_stride = w*4` 时，最后一行索引越界 panic（每帧黑屏 + 日志刷屏）。现在四个方向的单测都在 `crates/vdev-camera-ext/src/main.rs:882–930`。
+只拷每行前 `w*4` 有效字节、行内长度再与两个 stride 取 min——此前按整行拷贝，推流方发 padded stride 且 CV 分配的 `dst_stride = w*4` 时，最后一行索引越界 panic（每帧黑屏 + 日志刷屏）。现在四个方向的单测都在 `crates/vdev-camera-ext/src/main.rs:917–965`。
 
-其二是 **C 对象的 Copy 规则**：`CMSampleBufferCreateForImageBuffer` 与 `CVPixelBufferCreate` 都是 Create 规则（返回 +1），发送完要各 `CFRelease` 一次（`crates/vdev-camera-ext/src/main.rs:588,592`）；`streamPropertiesForProperties:error:` 里 `CMTimeCopyAsDictionary` 返回的字典也是 +1，`setFrameDuration:` 内部已 retain，所以取完同样要释放自己的那份，否则每次读取流属性泄漏一个字典（`crates/vdev-camera-ext/src/main.rs:433–438` 的 SAFETY 注释写明了这条规则）。哪次该释放、哪次严禁释放，全看返回规则是 Copy/Create 还是 get——第 5 节有个反例。
+其二是 **C 对象的 Copy 规则**：`CMSampleBufferCreateForImageBuffer` 与 `CVPixelBufferCreate` 都是 Create 规则（返回 +1），发送完要各 `CFRelease` 一次（`crates/vdev-camera-ext/src/main.rs:611,615`）；`streamPropertiesForProperties:error:` 里 `CMTimeCopyAsDictionary` 返回的字典也是 +1，`setFrameDuration:` 内部已 retain，所以取完同样要释放自己的那份，否则每次读取流属性泄漏一个字典（`crates/vdev-camera-ext/src/main.rs:458–463` 的 SAFETY 注释写明了这条规则）。哪次该释放、哪次严禁释放，全看返回规则是 Copy/Create 还是 get——第 5 节有个反例。
 
 ### 4.4 异常与 panic 的三道边界
 
 扩展进程一旦消失，`cmiod` 会记住这个 bundle id 的坏状态，之后连进程都不再拉起（详见第 5 节）。所以 vdev 给帧链路设了三道边界：
 
-1. **ObjC 异常**：`sendSampleBuffer:` 在流被外部停止等时机会抛 NSException，Rust 没有 exception 边界，逃逸即 `___rust_foreign_exception` abort。发送处用 `objc2::exception::catch` 包住（`crates/vdev-camera-ext/src/main.rs:565–575`），异常只记日志；
-2. **Rust panic**：整个帧循环体包 `catch_unwind`（`crates/vdev-camera-ext/src/main.rs:658`），配合 `std::panic::set_hook` 把 panic 写进日志，循环继续跑下一帧；
+1. **ObjC 异常**：`sendSampleBuffer:` 在流被外部停止等时机会抛 NSException，Rust 没有 exception 边界，逃逸即 `___rust_foreign_exception` abort。发送处用 `objc2::exception::catch` 包住（`crates/vdev-camera-ext/src/main.rs:588–595`），异常只记日志；
+2. **Rust panic**：整个帧循环体包 `catch_unwind`（`crates/vdev-camera-ext/src/main.rs:686`），配合 `std::panic::set_hook` 把 panic 写进日志，循环继续跑下一帧；
 3. **日志通道**：沙盒扩展写文件不可靠、`NSLog` 不进 unified log，所以扩展自带一个 TCP 日志口（`127.0.0.1:27891`，`crates/vdev-camera-ext/src/main.rs:44` 的 `log_server`）+ 多路径落盘兜底（App Group 容器 → `$HOME` → `/tmp` → `/var/tmp`，`crates/vdev-camera-ext/src/main.rs:102–127`）。进程一启动就把日志服务拉起来——"任何提前退出都能看到"。
 
 ## 5. 踩坑实录
@@ -215,8 +215,8 @@ fn copy_bgra_rows(dst: &mut [u8], src: &[u8], w: u32, h: u32, stride: u32, dst_s
 三个"不报错但设备残废"的运行时规则：
 
 - `CMIOExtensionProvider` 是**进程级单例**，创建第二个直接 `NSInvalidArgumentException "There should be only one CMIOProvider per extension"` 崩溃；
-- `device.addStream(...)` 必须**先于** `provider.addDevice(...)`（`crates/vdev-camera-ext/src/main.rs:845–851`）：cmiod 在 addDevice 那一刻冻结 streams 列表，顺序反了会得到"零流设备"——AVFoundation 能枚举到摄像头，但 `startStream` 永远不触发，画面 0 帧。这个症状（能枚举、0 帧、QuickTime 也黑）极难与权限问题区分，纯属顺序 bug；
-- `legacyDeviceID` 填 UUID 字符串（`crates/vdev-camera-ext/src/main.rs:822`，传 `device_id.UUIDString()`）。nil 在 macOS 26 上可能被 cmiod 拒绝正确暴露。
+- `device.addStream(...)` 必须**先于** `provider.addDevice(...)`（`crates/vdev-camera-ext/src/main.rs:880–892`）：cmiod 在 addDevice 那一刻冻结 streams 列表，顺序反了会得到"零流设备"——AVFoundation 能枚举到摄像头，但 `startStream` 永远不触发，画面 0 帧。这个症状（能枚举、0 帧、QuickTime 也黑）极难与权限问题区分，纯属顺序 bug；
+- `legacyDeviceID` 填 UUID 字符串（`crates/vdev-camera-ext/src/main.rs:857`，传 `device_id.UUIDString()`）。nil 在 macOS 26 上可能被 cmiod 拒绝正确暴露。
 
 ```rust
 // 7) 接线：addStream 先于 addDevice（macOS 26 顺序要求）

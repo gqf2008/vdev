@@ -268,13 +268,26 @@ fn should_produce(streaming_clients: usize) -> bool {
 ///
 /// 属性是 `copy` 语义的 getter（返回 +0 / autorelease），按「getter 取出的对象
 /// 绝不 release」的规则读走即用。
+///
+/// `ObjC` 异常包一层：这一路是帧循环唯一的门闩，异常逃逸会直接 abort 扩展
+/// （而扩展崩溃会被 cmiod 记成坏状态，见文档第 5 节坑 2）。异常按「没有客户端
+/// 在拉流」处理——最多让本轮不产帧，下一轮自恢复。
 fn streaming_client_count(stream: *mut NSObject) -> usize {
-    let stream_ref: &NSObject = unsafe { &*stream };
-    let arr: *const NSArray<NSObject> = unsafe { msg_send![stream_ref, streamingClients] };
-    if arr.is_null() {
-        return 0;
+    let probed = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+        let stream_ref: &NSObject = unsafe { &*stream };
+        let arr: *const NSArray<NSObject> = unsafe { msg_send![stream_ref, streamingClients] };
+        if arr.is_null() {
+            return 0usize;
+        }
+        unsafe { msg_send![arr, count] }
+    }));
+    match probed {
+        Ok(n) => n,
+        Err(ex) => {
+            elog(format!("streamingClients 异常: {ex:?}"));
+            0
+        }
     }
-    unsafe { msg_send![arr, count] }
 }
 
 fn class(name: &str) -> &'static objc2::runtime::AnyClass {
@@ -314,13 +327,10 @@ define_class!(
 
         #[unsafe(method(disconnectClient:))]
         unsafe fn disconnectClient(&self, _client: &NSObject) {
+            // 仅日志：停帧与否完全由 streamingClients 决定，这里只记录回调时序
+            // （这两个回调不保证配对，计数只作参考，不能当状态用）。
             let n = client_disconnected(&CLIENTS);
-            if n == 0 {
-                // 客户端可能已被强杀（不会补发 stopStream）：此处是唯一的兜底停帧点
-                elog("provider: disconnectClient clients=0 → 暂停产帧");
-            } else {
-                elog(format!("provider: disconnectClient clients={n}"));
-            }
+            elog(format!("provider: disconnectClient clients={n}"));
         }
 
         #[unsafe(method_id(availableProperties))]
@@ -645,17 +655,18 @@ impl Pacer {
     /// 过载（帧耗时 ≥ period）：deadline 重锚到 `now + period`，本轮只让出
     /// `MIN_YIELD`——不追赶、不补帧风暴；速率退化为「帧耗时 + 让出」，
     /// 而不是掉到「帧耗时 + period」的半个帧率。
+    ///
+    /// 注意 `MIN_YIELD` 只挂在**重锚分支**上：帧耗时恰好等于 period 时
+    /// `wait == 0` 属于「踩线」而非「落后」，此时应立即进入下一轮（周期仍严格
+    /// = period），不该平白多加 0.5ms（那会把边界帧率压到 ~58fps）。
     fn tick(&mut self, now: std::time::Instant) -> std::time::Duration {
         let wait = self.next.saturating_duration_since(now);
         self.next += self.period;
         if self.next <= now {
             self.next = now + self.period;
+            return MIN_YIELD;
         }
-        if wait.is_zero() {
-            MIN_YIELD
-        } else {
-            wait
-        }
+        wait
     }
 }
 
@@ -667,6 +678,10 @@ fn frame_loop() {
     // 彩条缓冲复用，避免每帧 8.3MB 分配
     let mut bars_buf = vec![0u8; (WIDTH as usize) * (HEIGHT as usize) * 4];
     let mut pacer = Pacer::new(std::time::Instant::now(), FRAME_PERIOD);
+    // 上一轮是否在产帧：仅用于在状态翻转时打一条带 streamingClients 条数的日志，
+    // 这是「产帧判定确实跟着客户端存亡走」的现场证据（强杀客户端时应当立刻看到
+    // `暂停产帧 streamingClients=0`）。
+    let mut producing = false;
     loop {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let stream = STREAM
@@ -675,7 +690,15 @@ fn frame_loop() {
                 .unwrap() as *mut NSObject;
             // 每轮都问一次权威列表：没有客户端在拉流时既不发帧也不烧 CPU，
             // 新客户端接入后下一轮就会自动恢复产帧。
-            if should_produce(streaming_client_count(stream)) {
+            let streaming = streaming_client_count(stream);
+            if should_produce(streaming) != producing {
+                producing = !producing;
+                elog(format!(
+                    "产帧{} streamingClients={streaming}",
+                    if producing { "开始" } else { "暂停" }
+                ));
+            }
+            if should_produce(streaming) {
                 // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
                 let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
                 if let Some((data, w, h, stride, pts)) = injected {
@@ -990,6 +1013,29 @@ mod tests {
         );
         // 顺带钉住量级：60fps 与 32fps 必须能被区分
         assert!(avg < Duration::from_millis(20), "平均帧间隔 {avg:?} 仍偏大");
+    }
+
+    #[test]
+    fn pacer_at_exact_period_work_keeps_full_rate() {
+        // 边界：帧耗时恰好 == period。若把「踩线」（wait==0）也当成落后而加
+        // MIN_YIELD，周期会被抬到 17.166ms ≈ 58.25fps；正确语义下应立即进入
+        // 下一轮，周期仍严格 = period。
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, FRAME_PERIOD);
+        let mut now = t0;
+        let mut starts = Vec::new();
+        for _ in 0..60 {
+            starts.push(now);
+            now += FRAME_PERIOD; // 产一帧，耗时恰好一个周期
+            now += pacer.tick(now);
+        }
+        let span = starts[starts.len() - 1].saturating_duration_since(starts[0]);
+        #[allow(clippy::cast_possible_truncation)]
+        let avg = span / (starts.len() as u32 - 1);
+        assert!(
+            avg.abs_diff(FRAME_PERIOD) <= Duration::from_micros(1),
+            "平均帧间隔 {avg:?} 应等于 {FRAME_PERIOD:?}（边界处不应多付 {MIN_YIELD:?}）"
+        );
     }
 
     #[test]
