@@ -573,6 +573,10 @@ fn describe(dev: AudioDeviceID) -> DeviceInfo {
 const RECORD_SECONDS: usize = 120;
 const RECORD_SAMPLES: usize = 48_000 * RECORD_SECONDS;
 
+/// 本 crate 的统一信号标度：RNNoise / AdaptiveMixer / wavio / metrics 均按
+/// int16 标度（±32768）工作；Core 入口从 [-1,1] 放大，出口缩回再上环。
+const INT16_SCALE: f32 = 32_768.0;
+
 struct Core {
     adaptive: bool,
     mix: f32,
@@ -586,6 +590,10 @@ struct Core {
     frame: Vec<f32>,
     /// Dry frame, delayed in place before blending.
     dry_frame: Vec<f32>,
+    /// [-1,1] 输入放大到 int16 标度的每帧暂存。
+    in_scaled: Vec<f32>,
+    /// int16 标度的 `frame` 缩回 [-1,1] 的每帧暂存（上环前）。
+    out_float: Vec<f32>,
 
     rec_in: Vec<f32>,
     rec_out: Vec<f32>,
@@ -628,6 +636,8 @@ impl Core {
             out_ring,
             frame: vec![0.0; engine.frame_size],
             dry_frame: vec![0.0; engine.frame_size],
+            in_scaled: vec![0.0; engine.frame_size],
+            out_float: vec![0.0; engine.frame_size],
             rec_in,
             rec_out,
             timing: Vec::with_capacity(60 * 1000), // 60 s of 10 ms frames
@@ -641,30 +651,35 @@ impl Core {
 
     /// One 480-sample frame: model, blend, ship. Mirrors `agent::process`'s
     /// inner loop exactly, so the offline numbers stay valid.
+    ///
+    /// 输入放大到 int16 标度（模型、延迟线、混音、A/B 录音全在该标度），
+    /// 出口再缩回 [-1,1] 上环（与 Windows 后端的审查 M-g 修复同构）。
     #[inline]
     fn on_frame(&mut self, input: &[f32]) {
-        // 1) raw capture, for the A/B file
-        // `wavio::write` 的约定是 i16 标度浮点（离线 read/run 链路也如此）；
-        // live 采集/处理链路全程是 [-1,1]，这里统一乘 32768 后再录，否则
-        // 低电平样本会被 write 直接 cast 成 0（全零 WAV）。
+        // 0) [-1,1] -> int16 标度（input 恒为 FRAME 长，见 den.process 的既有假设）
+        for (d, &s) in self.in_scaled.iter_mut().zip(input) {
+            *d = s * INT16_SCALE;
+        }
+
+        // 1) raw capture, for the A/B file（int16 标度，与 wavio::write 的约定一致）
         if self.rec_in.len() + FRAME <= RECORD_SAMPLES {
-            self.rec_in.extend(input.iter().map(|&v| v * 32_768.0));
+            self.rec_in.extend_from_slice(&self.in_scaled);
         }
 
         let t0 = Instant::now();
-        let (vad, wet_frame) = self.den.process(input);
+        let (vad, wet_frame) = self.den.process(&self.in_scaled);
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if self.timing.len() < self.timing.capacity() {
             self.timing.push(dt_ms);
         }
 
         // 2) dry path, delayed to the model's lookahead (see frames::DelayLine)
-        self.dry_frame.copy_from_slice(input);
+        self.dry_frame.copy_from_slice(&self.in_scaled);
         self.dry.process(&mut self.dry_frame);
 
-        // 3) blend
+        // 3) blend（mixer 拿到 int16 标度输入，noise_floor_dbfs 才是真实 dBFS）
         let w = if self.adaptive {
-            self.mixer.update(input, vad)
+            self.mixer.update(&self.in_scaled, vad)
         } else {
             self.mix as f64
         };
@@ -682,13 +697,16 @@ impl Core {
         }
 
         if self.rec_out.len() + FRAME <= RECORD_SAMPLES {
-            self.rec_out
-                .extend(self.frame.iter().map(|&v| v * 32_768.0));
+            self.rec_out.extend_from_slice(&self.frame);
         }
 
         // 4) ship it. Dropping on a full ring is the right failure mode: the
         // render side is starving, and stale audio would be worse than a gap.
-        self.out_ring.push_or_drop(&self.frame);
+        // 上环前缩回 [-1,1]——渲染侧按 float [-1,1] 写出。
+        for (d, &s) in self.out_float.iter_mut().zip(&self.frame) {
+            *d = s / INT16_SCALE;
+        }
+        self.out_ring.push_or_drop(&self.out_float);
 
         self.frames += 1;
         self.vad_sum += vad as f64;
@@ -2023,6 +2041,15 @@ mod capture_tests {
             validate_capture_format(&fmt(16_000.0, 1, f, 32)).unwrap(),
             16_000.0
         );
+    }
+
+    #[test]
+    fn int16_scale_roundtrip_is_exact_enough() {
+        for v in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let scaled = v * INT16_SCALE;
+            assert!((scaled / INT16_SCALE - v).abs() < 1e-7);
+        }
+        assert_eq!(1.0f32 * INT16_SCALE, 32_768.0);
     }
 
     #[test]
