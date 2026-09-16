@@ -17,7 +17,9 @@ sleep 2
 ffmpeg -hide_banner -f avfoundation -i ":$IN_IDX" -t 3 -y /tmp/vdev-audio-loopback.wav > /tmp/vdev-audio-rec.log 2>&1 || true
 kill $PLAY 2>/dev/null || true
 sleep 1
-ffmpeg -hide_banner -i /tmp/vdev-audio-loopback.wav -f s16le -acodec pcm_s16le /tmp/vdev-audio-loopback.pcm 2>/dev/null
+# -y 不能省：目标 PCM 已存在时 ffmpeg 会提示 overwrite，stdin 无输入则
+# `Not overwriting - exiting`，但退出码仍是 0（set -e 抓不住）——不加 -y 会拿旧 PCM 做分析。
+ffmpeg -hide_banner -y -i /tmp/vdev-audio-loopback.wav -f s16le -acodec pcm_s16le /tmp/vdev-audio-loopback.pcm 2>/dev/null
 python3 - <<'PY'
 import struct
 import sys
