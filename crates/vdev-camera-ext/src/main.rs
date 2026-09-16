@@ -21,7 +21,7 @@ use objc2_foundation::NSObjectProtocol;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSSet, NSString, NSUUID};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 static LOG_BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -228,13 +228,11 @@ extern "C" {
 static STREAM: Mutex<Option<usize>> = Mutex::new(None);
 static STREAM_FORMAT: Mutex<Option<usize>> = Mutex::new(None);
 static FORMAT_DESC: Mutex<Option<CMFormatDescription>> = Mutex::new(None);
-/// 流是否被客户端启动过（`startStream` 置位、`stopStream` 清位）。
-/// **不能单独拿它当产帧开关**：客户端被强杀时 CMIO 不会补发 `stopStream`，
-/// 该位会永久留在 `true`（issue #52 的现场）。
-static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// 当前已连接客户端数，由 provider 的 `connectClient:` / `disconnectClient:` 维护。
-/// 与 `STREAM_ACTIVE` 一起决定是否产帧：客户端计数归零是「客户端已经不在了」
-/// 唯一可靠的信号，也是强杀后无需重启扩展就能自动恢复的关键。
+/// 已连接客户端数，由 provider 的 `connectClient:` / `disconnectClient:` 维护。
+/// **只用于日志，不参与产帧判定**：真机实测这两个回调并不总是配对——构建 22 的
+/// 扩展启动时那次 `connectClient` 之后再没有对应的 `disconnectClient`（进程早已
+/// 退出），计数会永久停在 1。产帧判定改用 cmiod 的权威列表
+/// `CMIOExtensionStream.streamingClients`（见 `streaming_client_count`）。
 static CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 上一次 `sendSampleBuffer` 里程碑（时刻, 累计帧数），用于打印窗口实测帧率。
@@ -254,12 +252,29 @@ fn client_disconnected(clients: &AtomicUsize) -> usize {
         .map_or(0, |prev| prev.saturating_sub(1))
 }
 
-/// 产帧开关：**流已被启动** 且 **仍有客户端连着**，两者同时成立才产帧。
+/// 产帧判定：只要还有**真正在拉流**的客户端就产帧。
 ///
-/// 旧实现只看 `stream_active`：客户端强杀不补发 `stopStream` → 永久空转烧 CPU，
-/// 且新客户端接入后只能从旧失效队列的缝里拿到残帧（真机实测 2.3fps）。
-fn should_produce(stream_active: bool, clients: usize) -> bool {
-    stream_active && clients > 0
+/// 旧实现看的是 `startStream` 置的 RUNNING：客户端强杀不补发 `stopStream` →
+/// 永久空转烧 CPU，新客户端还只能从旧失效队列的缝里拿到残帧（真机 2.3fps）。
+fn should_produce(streaming_clients: usize) -> bool {
+    streaming_clients > 0
+}
+
+/// 当前真正在拉流的客户端数——**权威信号**，取自 `CMIOExtensionStream.streamingClients`。
+///
+/// 这是 cmiod 自己维护、也是它路由帧的依据（头文件标注 key-value observable），
+/// 不依赖 `startStream`/`stopStream`/`connectClient:`/`disconnectClient:` 这些
+/// 对端不保证会发的回调。
+///
+/// 属性是 `copy` 语义的 getter（返回 +0 / autorelease），按「getter 取出的对象
+/// 绝不 release」的规则读走即用。
+fn streaming_client_count(stream: *mut NSObject) -> usize {
+    let stream_ref: &NSObject = unsafe { &*stream };
+    let arr: *const NSArray<NSObject> = unsafe { msg_send![stream_ref, streamingClients] };
+    if arr.is_null() {
+        return 0;
+    }
+    unsafe { msg_send![arr, count] }
 }
 
 fn class(name: &str) -> &'static objc2::runtime::AnyClass {
@@ -456,14 +471,12 @@ define_class!(
         #[unsafe(method(startStreamAndReturnError:))]
         unsafe fn startStreamAndReturnError(&self, _out_error: *mut *mut NSObject) -> bool {
             elog("stream: startStream");
-            STREAM_ACTIVE.store(true, Ordering::SeqCst);
             true
         }
 
         #[unsafe(method(stopStreamAndReturnError:))]
         unsafe fn stopStreamAndReturnError(&self, _out_error: *mut *mut NSObject) -> bool {
             elog("stream: stopStream");
-            STREAM_ACTIVE.store(false, Ordering::SeqCst);
             true
         }
     }
@@ -656,14 +669,13 @@ fn frame_loop() {
     let mut pacer = Pacer::new(std::time::Instant::now(), FRAME_PERIOD);
     loop {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if should_produce(
-                STREAM_ACTIVE.load(Ordering::SeqCst),
-                CLIENTS.load(Ordering::SeqCst),
-            ) {
-                let stream = STREAM
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .unwrap() as *mut NSObject;
+            let stream = STREAM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap() as *mut NSObject;
+            // 每轮都问一次权威列表：没有客户端在拉流时既不发帧也不烧 CPU，
+            // 新客户端接入后下一轮就会自动恢复产帧。
+            if should_produce(streaming_client_count(stream)) {
                 // 优先注入帧（2s 新鲜窗口），否则回落 Rust 彩条
                 let injected = frame_channel::take_fresh(std::time::Duration::from_secs(2));
                 if let Some((data, w, h, stride, pts)) = injected {
@@ -1006,34 +1018,24 @@ mod tests {
     // ---- 产帧生命周期（issue #52）----
 
     #[test]
-    fn produce_only_when_stream_started_and_client_still_connected() {
-        assert!(should_produce(true, 1));
-        assert!(should_produce(true, 2));
-        // 只连接、未起流：不空转产帧
-        assert!(!should_produce(false, 1));
-        assert!(!should_produce(false, 0));
-        // 客户端被强杀：计数归零必须停帧（旧实现只看 stream_active → 永久空转）
-        assert!(!should_produce(true, 0));
+    fn produce_only_when_a_client_is_streaming() {
+        // 判据是权威列表 `streamingClients` 的条数：0 → 停帧，≥1 → 产帧。
+        // 旧实现看的是 startStream 置的 RUNNING——强杀后它永久为真，于是
+        // 「没有客户端还在拉流」也会满速产帧（真机 32fps 空转 + 41.5% CPU）。
+        assert!(!should_produce(0), "没有客户端在拉流时必须停帧");
+        assert!(should_produce(1));
+        assert!(should_produce(2));
     }
 
     #[test]
-    fn client_counter_covers_kill_and_reconnect_without_start_stream() {
+    fn client_counter_is_logged_only_and_saturates() {
+        // CLIENTS 只用于日志（真机实测回调不总是配对），但计数器本身不能回绕：
+        // 未配对的 disconnect 必须饱和在 0，否则日志会打印天文数字。
         let clients = AtomicUsize::new(0);
-        // 接入 + 起流
         assert_eq!(client_connected(&clients), 1);
-        assert!(should_produce(true, clients.load(Ordering::SeqCst)));
-        // 强杀：只会有 disconnectClient，不会有 stopStream
+        assert_eq!(client_connected(&clients), 2);
+        assert_eq!(client_disconnected(&clients), 1);
         assert_eq!(client_disconnected(&clients), 0);
-        assert!(
-            !should_produce(true, clients.load(Ordering::SeqCst)),
-            "强杀后必须停帧，否则扩展 32fps 永久空转"
-        );
-        // 新客户端接入：CMIO 不再补发 startStream（stream_active 仍为 true），也必须恢复产帧
-        assert_eq!(client_connected(&clients), 1);
-        assert!(should_produce(true, clients.load(Ordering::SeqCst)));
-        // 正常收尾
-        assert_eq!(client_disconnected(&clients), 0);
-        // 防御：未配对的 disconnect 不回绕成巨大计数
         assert_eq!(client_disconnected(&clients), 0);
         assert_eq!(client_disconnected(&clients), 0);
         assert_eq!(clients.load(Ordering::SeqCst), 0);
