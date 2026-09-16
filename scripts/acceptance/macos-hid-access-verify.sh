@@ -68,9 +68,26 @@ cat > "${PROBE_APP}/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-# 2) 未授权注入器（全新 bundle id；LSUIElement 保证不抢探针焦点）
-mkdir -p "${INJECTOR_APP}/Contents/MacOS"
-cp "${VDEV}" "${INJECTOR_APP}/Contents/MacOS/VdevHidInjector"
+# 2) 稳定注入器 app（固定 id + **稳定签名**，供人工授权一次后长期有效）
+#
+# 为什么要签名：未签名的 app，TCC 的授权要求是 `cdhash H"..."`（实测 csreq 40 字节），
+# 而本脚本每轮都会把新的 vdev 二进制拷进 bundle —— cdhash 一变，人工授权立刻失配
+# （issue #58）。用 Apple Development/Developer ID 签名后，要求变成
+# `identifier "com.vdev.hid.injector" and anchor apple generic and certificate leaf[…]`，
+# 与二进制内容无关，授权才能跨运行跨重建稳定。
+#
+# 旁证：本机签名版 VDCamera.app 的 TCC csreq 就是这种身份型要求（160 字节）。
+INJECTOR_BIN="${INJECTOR_APP}/Contents/MacOS/VdevHidInjector"
+# 戳记必须记"源二进制的 sha256"，**不能**拿 bundle 内二进制去 cmp：
+# codesign 会把签名嵌进 Mach-O 本身，签过名的可执行文件永远不等于源文件。
+INJECTOR_STAMP="${INJECTOR_DIR}/.injector-source.sha256"
+mkdir -p "${INJECTOR_APP}/Contents/MacOS" "${INJECTOR_DIR}"
+VDEV_SHA=$(shasum -a 256 "${VDEV}" | awk '{print $1}')
+if [ ! -f "${INJECTOR_BIN}" ] || [ ! -f "${INJECTOR_STAMP}" ] \
+   || [ "$(cat "${INJECTOR_STAMP}" 2>/dev/null)" != "${VDEV_SHA}" ]; then
+  cp "${VDEV}" "${INJECTOR_BIN}"
+  INJECTOR_NEEDS_SIGN=1
+fi
 cat > "${INJECTOR_APP}/Contents/Info.plist" <<'IPLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -83,6 +100,32 @@ cat > "${INJECTOR_APP}/Contents/Info.plist" <<'IPLIST'
 <key>LSUIElement</key><true/>
 </dict></plist>
 IPLIST
+
+# 2a) 签名（身份可复现时）
+# 优先 Apple Development（与本仓 crates/vdev-camera/Makefile 的 SIGN_APP_IDENTITY 一致），
+# 其次 Developer ID；都没有则退回 ad-hoc 并**明确警告**——那种情况下 D 段的授权
+# 每轮都会失效，必须让使用者知道。
+INJECTOR_SIGN_IDENTITY="${VDEV_HID_SIGN_IDENTITY:-Apple Development: qingfeng gao (7L8FV63FAP)}"
+if [ -n "${INJECTOR_NEEDS_SIGN:-}" ]; then
+  if codesign --force --sign "${INJECTOR_SIGN_IDENTITY}" -i com.vdev.hid.injector \
+       --options runtime --timestamp=none "${INJECTOR_APP}" >/dev/null 2>&1; then
+    echo "  注入器已用稳定身份签名：${INJECTOR_SIGN_IDENTITY}"
+    printf '%s' "${VDEV_SHA}" > "${INJECTOR_STAMP}"
+  else
+    echo "WARN: 用 '${INJECTOR_SIGN_IDENTITY}' 签名失败 → 退回 ad-hoc。"
+    # 没签成也记戳：至少避免每轮都无谓重写（重写会让 TCC 的 cdhash 型授权失效）
+    echo "WARN: ad-hoc 的 TCC 授权要求是 cdhash，二进制一变授权就失效（issue #58）；"
+    echo "WARN: D 段（授权前报错 → 授权后可用）将无法跨运行复现。"
+    printf '%s' "${VDEV_SHA}" > "${INJECTOR_STAMP}"
+  fi
+fi
+# 把「TCC 会拿到的要求」打出来做证据：身份型要求里不该出现 cdhash
+INJECTOR_DR=$(codesign -dr - "${INJECTOR_APP}" 2>&1 | tail -1)
+echo "  注入器 designated requirement: ${INJECTOR_DR}"
+case "${INJECTOR_DR}" in
+  *cdhash*)
+    echo "WARN: 注入器身份是 cdhash 型 —— 人工授权只对当前这份二进制有效（issue #58）" ;;
+esac
 
 # 2b) 未授权对照 app（bundle id 每次不同 → 不可能有历史授权）
 mkdir -p "${INJECTOR_APP_UNAUTH}/Contents/MacOS"
@@ -201,7 +244,10 @@ run_case() {
         "${app}" --args "$@" 2>/dev/null
     fi
   else
-    "$@" > "${RUN_DIR}/inject.out" 2>&1
+    # READY 之后仍可能有极短的在途事件，注入前留一小段静默期（探针已在 READY
+  # 时清零计数，这里只是再降一点概率）
+  sleep 0.3
+  "$@" > "${RUN_DIR}/inject.out" 2>&1
   fi
   inject_out_text="$(cat "${RUN_DIR}/inject.out" "${RUN_DIR}/inject.err" 2>/dev/null)"
   echo "  inject_out=$(echo "${inject_out_text}" | tr '\n' ' ' | tail -c 160)"
@@ -307,6 +353,8 @@ if [ "${post_d}" = "true" ]; then
 else
   echo "  D: 该身份尚未授权——在 系统设置 → 隐私与安全性 → 辅助功能 里加入"
   echo "     ${INJECTOR_APP} 后重跑本脚本，可复现「授权前报错 → 授权后可用」"
+  echo "     （若列表里已有同名旧条目：那是 cdhash 型的失效授权，先 \"-\" 删掉再重新添加，"
+  echo "       否则会出现\"看着已勾选但 post_access 仍为 false\"的假象）"
 fi
 
 # ---- C) 安全输入 ----

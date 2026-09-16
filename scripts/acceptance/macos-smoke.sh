@@ -42,6 +42,10 @@ require_grep 'unauth.$$.' scripts/acceptance/macos-hid-access-verify.sh '未授�
 require_grep 'EnableSecureEventInput' scripts/acceptance/macos-hid-access-verify.sh '安全输入必须用 EnableSecureEventInput 确定性开启，不能靠人工凑状态'
 require_grep 'secure_input=true' scripts/acceptance/macos-hid-access-verify.sh '安全输入用例必须先确认系统真的处于安全输入，再断言行为'
 require_grep 'HID_ACCESS_RESULT=NOT_RUN' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收必须保留 NOT_RUN 出口（锁屏/无权限身份等环境不具备时不算通过）'
+require_grep 'codesign --force --sign' scripts/acceptance/macos-hid-access-verify.sh '注入器 app 必须用稳定身份签名（否则 TCC 授权是 cdhash 型，二进制一变就失效，issue #58）'
+require_grep 'INJECTOR_STAMP' scripts/acceptance/macos-hid-access-verify.sh '注入器必须用源二进制 sha256 戳判断是否重写（每轮重写会让 cdhash 型授权失效，issue #58）'
+require_grep 'window.typed = ""' scripts/acceptance/macos-hid-type-probe.swift '探针必须在 READY 前清零计数（开窗瞬间的迟到事件会污染逐字断言）'
+
 require_grep 'exit 2' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收的环境不具备分支必须 exit 2（与用例失败区分）'
 require_grep '辅助功能' crates/vdev-hid/src/lib.rs '注入路径必须有可诊断的「辅助功能」权限报错文案'
 require_grep 'secure_input' crates/vdev-hid/src/lib.rs '注入路径必须报出安全输入状态'

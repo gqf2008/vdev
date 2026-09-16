@@ -93,7 +93,13 @@ let deadline = Date().addingTimeInterval(4)
 while Date() < deadline && !(app.isActive && window.isKeyWindow) {
     RunLoop.current.run(until: Date().addingTimeInterval(0.05))
 }
-// tap 计数的基线放在 READY 行：验收脚本只应比较注入前后的增量，
+// 写 READY **之前**清零：开窗瞬间常有上一个用例的迟到合成事件落进来（实测
+// 偶发一个前导空格，把"逐字一致"断言打红）。清零后 READY 的语义变成
+// "从这一刻起计数"，验收脚本注入的字符数才等于增量。
+window.typed = ""
+window.keys = 0
+tapCount = 0
+// tap 计数的基线仍放在 READY 行：验收脚本只应比较注入前后的增量，
 // 避免用户/系统在同一窗口内产生的真实键事件被误算成注入丢失。
 report("READY active=\(app.isActive) key=\(window.isKeyWindow) tap_ok=\(tapOk) tap=\(tapCount)")
 
