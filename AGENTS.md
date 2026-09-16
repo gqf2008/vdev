@@ -33,6 +33,23 @@ vdev（虚拟设备集合）是一个 Rust workspace：在 macOS / Windows 上�
 
 命令/key/schema 细节见 walgit skill（`~/.agents/skills/walgit/SKILL.md`），签名 key `~/.walgit/keys/sqb.ed25519`。
 
+**新仓库首次使用（vdev 迁移实战）**：
+
+1. `collab` 的签名要能被验证，必须先在**本仓库**注册 principal，否则 `collab report`
+   显示 `0/N entries verified`（条目本身已推上去，但没人能验签）：
+   ```bash
+   walgit --config ~/.walgit/walgit.toml collab principal-register \
+     --principal sqb --key ~/.walgit/keys/sqb.ed25519 --push origin
+   ```
+   注册后 `collab report` 应为 `N/N entries verified`（vdev 实测 18/18）。
+2. walgit 的 CLI 命令要读 R2 凭证（服务自己的凭证在 `~/.walgit/.r2-credentials`，
+   不在环境里）：跑 `collab`/`repo` 等命令前先
+   `export R2_ACCESS_KEY=$(awk -F= '/^R2_ACCESS_KEY=/{print $2}' ~/.walgit/.r2-credentials)`
+   、`R2_SECRET_KEY` 同理。
+3. 新克隆要看 collab 线程得显式取 refspec（默认只取 heads）：
+   `git fetch origin '+refs/collab/*:refs/collab/*'`。
+4. 仓库首个 push 会自动建仓（服务端 `auto_create_on_push = true`），不需要预先 create。
+
 ## 本仓门禁（合并前必须全绿）
 
 ```bash
