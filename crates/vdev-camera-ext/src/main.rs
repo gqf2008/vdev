@@ -599,7 +599,8 @@ fn create_pixel_buffer_pool(w: u32, h: u32) -> Option<CVPixelBufferPool> {
         )
     };
     if st != 0 || pool.0.is_null() {
-        elog(format!("CVPixelBufferPoolCreate 失败 st={st} {w}x{h}"));
+        // 走节流：建池失败不会被记住，下一帧还会再试，裸 elog 会是 60 行/秒
+        log_pool_fallback(&format!("CVPixelBufferPoolCreate 失败 st={st} {w}x{h}"));
         return None;
     }
     Some(pool)
@@ -689,13 +690,14 @@ static LAST_POOL_FALLBACK_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(No
 /// 同一条回落日志的最小间隔。
 const POOL_FALLBACK_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 节流后的回落日志：`force` 用于首次与状态翻转（此时必须留痕）。
-fn log_pool_fallback(force: bool, msg: &str) {
+/// 节流后的池回落日志：首次立即打，之后同一条至少间隔 `POOL_FALLBACK_LOG_INTERVAL`。
+/// 建池失败**不缓存失败**、下一帧会重试，所以这条路径本身就是高频的。
+fn log_pool_fallback(msg: &str) {
     let mut last = LAST_POOL_FALLBACK_LOG
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let due = last.is_none_or(|t| t.elapsed() >= POOL_FALLBACK_LOG_INTERVAL);
-    if !force && !due {
+    if !due {
         return;
     }
     *last = Some(std::time::Instant::now());
@@ -722,7 +724,7 @@ fn acquire_pixel_buffer(w: u32, h: u32) -> Option<CVPixelBuffer> {
             if st == 0 && !pb.0.is_null() {
                 Some(pb)
             } else {
-                log_pool_fallback(false, &format!("池取缓冲失败 st={st} {w}x{h}"));
+                log_pool_fallback(&format!("池取缓冲失败 st={st} {w}x{h}"));
                 None
             }
         },

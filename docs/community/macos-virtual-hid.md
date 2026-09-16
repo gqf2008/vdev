@@ -94,7 +94,7 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 2. **flags 是"替换"而非"叠加"**——合成事件会整体覆盖 flags 字段，物理按住的修饰键在这一瞬间被"顶掉"。要做物理+合成组合键，得先读当前 flags 再合并（vdev 没做，它的用例不需要）；
 3. **GAP = 12ms**（`crates/vdev-hid/src/lib.rs:28`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
 
-修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:198–215`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
+修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:279–296`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
 
 ### 3.3 文本输入：另一条 Unicode 通道
 
@@ -166,7 +166,7 @@ vdev 在注入入口做 `CGPreflightPostEventAccess()` 预检，未授权时明�
 全局事件监听则是另一条同样受 TCC 管制的敏感能力。macOS 10.15 起，系统用 `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:196-122
+// crates/vdev-hid/src/lib.rs:196-202
 pub fn listen(seconds: Option<u64>) -> Result<()> {
     if !EventTap::preflight_listen_access() {
         let _ = EventTap::request_listen_access();
@@ -181,7 +181,7 @@ pub fn listen(seconds: Option<u64>) -> Result<()> {
 过了权限关，创建 tap：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:207-131
+// crates/vdev-hid/src/lib.rs:207-211
 let handle = thread::spawn(move || {
     let tap = match EventTap::new(
         TapLocation::Session,
@@ -199,7 +199,7 @@ let handle = thread::spawn(move || {
 最后是**线程归属**——这是这个函数注释里写了整整七行、也是坑 1 的主角：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:204-125,167-169
+// crates/vdev-hid/src/lib.rs:204-205,247-248
 // 创建与运行同线程（见函数注释）；创建结果经 channel 交还主线程，
 // 成功后主线程持有 Arc 句柄用于到点 stop。
 ...
