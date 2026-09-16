@@ -42,6 +42,15 @@ require_grep 'unauth.$$.' scripts/acceptance/macos-hid-access-verify.sh '未授�
 require_grep 'EnableSecureEventInput' scripts/acceptance/macos-hid-access-verify.sh '安全输入必须用 EnableSecureEventInput 确定性开启，不能靠人工凑状态'
 require_grep 'secure_input=true' scripts/acceptance/macos-hid-access-verify.sh '安全输入用例必须先确认系统真的处于安全输入，再断言行为'
 require_grep 'HID_ACCESS_RESULT=NOT_RUN' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收必须保留 NOT_RUN 出口（锁屏/无权限身份等环境不具备时不算通过）'
+# 注入器准备逻辑（#58）：字符串守卫钉"用的是身份变量"（`--sign -` 会退化回 cdhash 型），
+# 行为守卫交给脚本自带的 --self-test（下面直接跑），grep 挡不住的语义摘除由它兜住。
+require_grep 'prepare_injector_app "${VDEV}" "${INJECTOR_APP}" "${INJECTOR_STAMP}" "${INJECTOR_SIGN_IDENTITY}"' scripts/acceptance/macos-hid-access-verify.sh '注入器必须把解析出的稳定身份传进 prepare_injector_app，不能传 -（否则退回 cdhash 型授权，issue #58）'
+require_grep 'codesign --force --sign "${identity}"' scripts/acceptance/macos-hid-access-verify.sh '签名必须用函数传入的身份变量（写成 --sign - 会静默退回 ad-hoc，戳还会撒谎，审查 L2）'
+require_grep 'security find-identity' scripts/acceptance/macos-hid-access-verify.sh '注入器签名身份必须真的从 keychain 里解析，不能写死一个可能不存在的名字'
+require_grep 'INJECTOR_STAMP' scripts/acceptance/macos-hid-access-verify.sh '注入器必须用源二进制状态戳判断是否重写（每轮重写会让 cdhash 型授权失效，issue #58）'
+require_grep 'codesign --verify --strict' scripts/acceptance/macos-hid-access-verify.sh '签名后必须 codesign --verify --strict，失败不能写戳（否则坏状态被固化，审查 B1）'
+require_grep 'window.typed = ""' scripts/acceptance/macos-hid-type-probe.swift '探针必须在 READY 前清零计数（开窗瞬间的迟到事件会污染逐字断言）'
+
 require_grep 'exit 2' scripts/acceptance/macos-hid-access-verify.sh 'HID 权限验收的环境不具备分支必须 exit 2（与用例失败区分）'
 require_grep '辅助功能' crates/vdev-hid/src/lib.rs '注入路径必须有可诊断的「辅助功能」权限报错文案'
 require_grep 'secure_input' crates/vdev-hid/src/lib.rs '注入路径必须报出安全输入状态'
@@ -49,6 +58,15 @@ require_grep 'secure_input' crates/vdev-hid/src/lib.rs '注入路径必须报出
 # 这条守卫钉住调用点，防止优化被悄悄摘掉却仍然全绿（审查 B1）。
 require_grep 'let Some(pb) = acquire_pixel_buffer(w, h) else {' crates/vdev-camera-ext/src/main.rs 'send_bgra 必须走 acquire_pixel_buffer（像素池复用）'
 require_grep 'fn acquire_buffer_with<FP, FB, FD>' crates/vdev-camera-ext/src/main.rs '像素池必须有可注入的决策内核（复用/回落两条路径要能被单测钉住）'
+
+# 行为级守卫：#58 的修复是一段"有条件重写"的状态机，纯 grep 挡不住语义摘除
+# （把签名换成 --sign -、删掉复用条件、删掉写戳……）。用隔离临时目录直接跑它的
+# 自测模式：首跑写戳 / 源不变不重写 / 源变则重签 / 坏签名不被戳固化 / 身份变化重签。
+if ! bash scripts/acceptance/macos-hid-access-verify.sh --self-test >/tmp/vdev-injector-selftest.log 2>&1; then
+  echo "FAIL: 注入器准备逻辑自测未通过（issue #58 的复用/重签状态机回归）" >&2
+  cat /tmp/vdev-injector-selftest.log >&2
+  exit 1
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "FAIL: 未找到 python3（check-docs.py 需要）" >&2
