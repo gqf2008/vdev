@@ -49,8 +49,10 @@ cleanup() {
   pkill -x VdevHidProbe 2>/dev/null || true
   pkill -x SecureInputHold 2>/dev/null || true
   rm -rf "${RUN_DIR}"
-  # 注入器目录的互斥锁也让位于同一个 EXIT trap（脚本里只能有一处 EXIT trap）
-  rmdir "${INJECTOR_DIR:-/nonexistent}/.lock" 2>/dev/null || true
+  # 互斥锁只由**持锁者**删除：非持锁者也删锁会让"看到 NOT_RUN 再重跑"变成三实例并发（审查 L1）
+  if [ "${LOCK_HELD:-0}" = "1" ]; then
+    rmdir "${INJECTOR_DIR:-/nonexistent}/.lock" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -150,8 +152,21 @@ PLIST
     echo "WARN: 签名后 codesign --verify --strict 失败：不写戳，下次运行会重试。" >&2
     return 0
   fi
-  # 只有"签名 + 校验"都过了才写戳
-  printf '%s\t%s' "${src_sha}" "${want_state}" > "${stamp}"
+  # 实际签成了什么？**不能拿请求值当结果**（审查 L2）：`--sign -` 或身份失效时
+  # codesign 仍可能以 ad-hoc 成功，此时戳若写 signed:<身份> 就是撒谎，复用条件
+  # 会把降级的 bundle 当"最新"，且永不自愈。
+  local actual_state
+  if codesign -dv "${app}" 2>&1 | grep -q '^Signature=adhoc'; then
+    actual_state="adhoc"
+  else
+    actual_state="signed:$(codesign -dv --verbose=4 "${app}" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
+  fi
+  if [ "${identity}" != "-" ] && [ "${actual_state}" = "adhoc" ]; then
+    echo "WARN: 请求用身份 '${identity}' 签名，实际落成 ad-hoc（证书不可用？）：不写戳，下次重试。" >&2
+    return 2
+  fi
+  # 只有"签名 + 校验"都过了才写戳，且写的是**实际**状态
+  printf '%s\t%s' "${src_sha}" "${actual_state}" > "${stamp}"
   return 0
 }
 
@@ -219,6 +234,16 @@ if [ "${SELF_TEST}" = "1" ]; then
     echo "FAIL: 身份变化没有触发重签（戳只比了 sha）"; SELF_OK=0
   fi
 
+  echo "== 6) 请求一个不可用的身份：绝不能把 ad-hoc 结果记成 signed:（审查 L2）=="
+  prepare_injector_app "${SELF_SRC2}" "${SELF_APP}" "${SELF_STAMP}" "Apple Development: 不存在的证书 (XXXXXXXXXX)" >/dev/null 2>&1 || true
+  if grep -q "signed:Apple Development: 不存在的证书" "${SELF_STAMP}" 2>/dev/null; then
+    echo "FAIL: 戳把 ad-hoc 结果记成了 signed:<请求身份>（戳会撒谎，复用条件不再可信）"; SELF_OK=0
+  elif codesign -dv "${SELF_APP}" 2>&1 | grep -q '^Signature=adhoc' && [ "$(cut -f2 "${SELF_STAMP}" 2>/dev/null)" != "adhoc" ]; then
+    echo "FAIL: 实际是 ad-hoc，戳状态却不是 adhoc（$(cut -f2 "${SELF_STAMP}" 2>/dev/null)）"; SELF_OK=0
+  else
+    echo "  戳状态与实际签名一致 ✓"
+  fi
+
   rm -rf "${TMP_SELF}"
   if [ "${SELF_OK}" = "1" ]; then echo HID_INJECTOR_SELFTEST=PASS; exit 0; fi
   echo HID_INJECTOR_SELFTEST=FAIL
@@ -228,14 +253,21 @@ fi
 INJECTOR_STAMP="${INJECTOR_DIR}/.injector-source.sha256"
 mkdir -p "${INJECTOR_DIR}"
 # 并发保护：两份脚本同时改同一个 bundle 会把签名踩坏（审查 B1 实测）
-if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+if mkdir "${LOCK_DIR}" 2>/dev/null; then
+  LOCK_HELD=1
+else
   echo "NOT_RUN: 另一个 ${0##*/} 实例正在准备同一个注入器（${LOCK_DIR}）；本脚本不支持并发运行。"
+  echo "  若确认没有实例在跑（例如上次被 kill -9），手动清锁：rmdir '${LOCK_DIR}'"
   echo "HID_ACCESS_RESULT=NOT_RUN"
   exit 2
 fi
 
 INJECTOR_SIGN_IDENTITY=$(resolve_sign_identity)
-if prepare_injector_app "${VDEV}" "${INJECTOR_APP}" "${INJECTOR_STAMP}" "${INJECTOR_SIGN_IDENTITY}"; then
+PREP_RC=0
+prepare_injector_app "${VDEV}" "${INJECTOR_APP}" "${INJECTOR_STAMP}" "${INJECTOR_SIGN_IDENTITY}" || PREP_RC=$?
+if [ "${PREP_RC}" = "2" ]; then
+  echo "WARN: 注入器本次没有签成稳定身份（见上），下轮会重试；D 段可能因此无法持久。"
+elif [ "${PREP_RC}" = "0" ]; then
   if [ "${INJECTOR_SIGN_IDENTITY}" = "-" ]; then
     echo "WARN: 没有可用的签名身份 → 注入器退回 ad-hoc。"
     echo "WARN: ad-hoc 的 TCC 授权要求是 cdhash，二进制一变授权就失效（issue #58）；"

@@ -45,6 +45,7 @@ require_grep 'HID_ACCESS_RESULT=NOT_RUN' scripts/acceptance/macos-hid-access-ver
 # 注入器准备逻辑（#58）：字符串守卫钉"用的是身份变量"（`--sign -` 会退化回 cdhash 型），
 # 行为守卫交给脚本自带的 --self-test（下面直接跑），grep 挡不住的语义摘除由它兜住。
 require_grep 'prepare_injector_app "${VDEV}" "${INJECTOR_APP}" "${INJECTOR_STAMP}" "${INJECTOR_SIGN_IDENTITY}"' scripts/acceptance/macos-hid-access-verify.sh '注入器必须把解析出的稳定身份传进 prepare_injector_app，不能传 -（否则退回 cdhash 型授权，issue #58）'
+require_grep 'codesign --force --sign "${identity}"' scripts/acceptance/macos-hid-access-verify.sh '签名必须用函数传入的身份变量（写成 --sign - 会静默退回 ad-hoc，戳还会撒谎，审查 L2）'
 require_grep 'security find-identity' scripts/acceptance/macos-hid-access-verify.sh '注入器签名身份必须真的从 keychain 里解析，不能写死一个可能不存在的名字'
 require_grep 'INJECTOR_STAMP' scripts/acceptance/macos-hid-access-verify.sh '注入器必须用源二进制状态戳判断是否重写（每轮重写会让 cdhash 型授权失效，issue #58）'
 require_grep 'codesign --verify --strict' scripts/acceptance/macos-hid-access-verify.sh '签名后必须 codesign --verify --strict，失败不能写戳（否则坏状态被固化，审查 B1）'
