@@ -352,16 +352,91 @@ fn remove_all_nodes() -> Result<usize> {
     Ok(removed)
 }
 
-/// 安装驱动：清理旧节点 + 创建设备节点 + DiInstallDriverW 装入驱动存储
+/// 安装时的节点处置决策（纯函数，Windows 宿主可单测）。
+///
+/// 背景：`install` 原先每次都「先清空全部节点、再新建一个」，真机上踩了两件事：
+///
+/// 1. 清空那步会「假成功」——`CM_Query_And_Remove_SubTreeW` 回 `CR_SUCCESS` 而
+///    节点仍在设备树（2a2f4bd 的 M-c 修复）。一旦没清掉，本次新建的节点就与残留
+///    节点共存；而驱动侧适配器是**单例**（`adapter::create` 只允许一个实例，见
+///    `crates/vdev-audio-win/driver/src/adapter.rs`），第二个节点在 `start_device`
+///    里 create 返回 null，直接上报 `STATUS_INSUFFICIENT_RESOURCES`——设备管理器
+///    里 `ROOT\MEDIA\0002/0003` 的 `0xC000009A` 就是这么来的。
+/// 2. 即便清空成功，「删旧建新」也会换掉设备实例 ID，音频端点 GUID 随之漂移
+///    （每次 install 后 setupapi 日志里都有一对 `Delete Device - SWD\MMDEVAPI\{...}`），
+///    正在使用该端点的应用会被静默打断。
+///
+/// 所以安装必须**幂等**：没有节点才新建；已有一个节点就只更新驱动、不动节点；
+/// 发现多个（历史残留）才先全清再重建。
+#[derive(Debug, PartialEq, Eq)]
+enum InstallPlan {
+    /// 设备树里一个 `Root\vdev-audio` 节点都没有：需要新建一个
+    Create,
+    /// 恰好一个节点：就地更新驱动，不重建节点（端点 GUID 保持不变）
+    Reuse,
+    /// 多个节点（历史残留）：先全部清掉再重建
+    Recreate,
+}
+
+fn install_plan(existing_nodes: usize) -> InstallPlan {
+    match existing_nodes {
+        0 => InstallPlan::Create,
+        1 => InstallPlan::Reuse,
+        _ => InstallPlan::Recreate,
+    }
+}
+
+/// 在 Media 类下新建一个 `Root\vdev-audio` 设备节点（`DIF_REGISTERDEVICE`），
+/// 供随后的 `DiInstallDriverW` 绑定。
+fn create_device_node(class_guid: &windows::core::GUID, class_name: &[u16]) -> Result<()> {
+    let devs = unsafe { SetupDiCreateDeviceInfoList(Some(class_guid), None) }
+        .context("SetupDiCreateDeviceInfoList failed")?;
+
+    let result = (|| -> Result<()> {
+        let mut dev_info = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        // 审查 L2 修复：删除 0xE0000207 → SetupDiOpenDeviceInfoW(类名) 的"死路径"
+        // 回退——SetupDiOpenDeviceInfoW 要的是设备实例 ID，类名永远打不开设备
+        // （display 侧同款回退已标"死路径"并移除）；创建失败直接如实报错。
+        unsafe {
+            SetupDiCreateDeviceInfoW(
+                devs,
+                windows::core::PCWSTR(class_name.as_ptr()),
+                class_guid,
+                None,
+                None,
+                DICD_GENERATE_ID,
+                Some(&mut dev_info),
+            )
+        }
+        .context("SetupDiCreateDeviceInfoW failed")?;
+        let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
+        hwid.push(0);
+        hwid.push(0);
+        let bytes = hwid
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>();
+        unsafe {
+            SetupDiSetDeviceRegistryPropertyW(devs, &mut dev_info, SPDRP_HARDWAREID, Some(&bytes))
+        }
+        .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
+        unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
+            .with_context(|| "DIF_REGISTERDEVICE failed")?;
+        Ok(())
+    })();
+
+    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
+    result
+}
+
+/// 安装驱动：幂等处置设备节点 + `DiInstallDriverW` 装入驱动存储 + 事后断言恰好一个节点
 pub fn install(inf_dir: &Path) -> Result<()> {
     let inf_path = inf_dir.join("vdev-audio.inf");
     if !inf_path.exists() {
         bail!("找不到 INF: {}", inf_path.display());
-    }
-
-    let removed = remove_all_nodes()?;
-    if removed > 0 {
-        println!("已清理 {removed} 个残留设备节点");
     }
 
     // 从 INF 提取类 GUID 与类名
@@ -383,77 +458,87 @@ pub fn install(inf_dir: &Path) -> Result<()> {
         )
     }
     .context("SetupDiGetINFClassW failed")?;
+    let class_name_cstr: Vec<u16> = class_name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .copied()
+        .chain(std::iter::once(0))
+        .collect();
 
-    let devs = unsafe { SetupDiCreateDeviceInfoList(Some(&class_guid), None) }
-        .context("SetupDiCreateDeviceInfoList failed")?;
+    // 幂等处置：理由见 `install_plan` 的注释（删旧建新会漂移端点 GUID；残留节点
+    // 会因驱动单例而上报 0xC000009A）
+    let existing = vdev_instance_ids()?;
+    let plan = install_plan(existing.len());
+    match plan {
+        InstallPlan::Create => {}
+        InstallPlan::Reuse => {
+            println!(
+                "已存在设备节点 {}，就地更新驱动（不重建节点，端点 GUID 保持不变）",
+                existing.join(", ")
+            );
+        }
+        InstallPlan::Recreate => {
+            eprintln!(
+                "检测到 {} 个 vdev-audio 节点（应为 1）：{}，先全部清理后重建",
+                existing.len(),
+                existing.join(", ")
+            );
+            let removed = remove_all_nodes()?;
+            println!("已清理 {removed} 个残留设备节点");
+        }
+    }
+    if plan != InstallPlan::Reuse {
+        create_device_node(&class_guid, &class_name_cstr)?;
+    }
 
-    let result = (|| -> Result<()> {
-        let mut dev_info = SP_DEVINFO_DATA {
-            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        let class_name_cstr: Vec<u16> = class_name
-            .iter()
-            .take_while(|&&c| c != 0)
-            .copied()
-            .chain(std::iter::once(0))
-            .collect();
-        // 审查 L2 修复：删除 0xE0000207 → SetupDiOpenDeviceInfoW(类名) 的"死路径"
-        // 回退——SetupDiOpenDeviceInfoW 要的是设备实例 ID，类名永远打不开设备
-        // （display 侧同款回退已标"死路径"并移除）；创建失败直接如实报错。
-        unsafe {
-            SetupDiCreateDeviceInfoW(
-                devs,
-                windows::core::PCWSTR(class_name_cstr.as_ptr()),
-                &class_guid,
-                None,
-                None,
-                DICD_GENERATE_ID,
-                Some(&mut dev_info),
-            )
-        }
-        .context("SetupDiCreateDeviceInfoW failed")?;
-        let mut hwid: Vec<u16> = HARDWARE_ID.encode_utf16().collect();
-        hwid.push(0);
-        hwid.push(0);
-        let bytes = hwid
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect::<Vec<u8>>();
-        unsafe {
-            SetupDiSetDeviceRegistryPropertyW(devs, &mut dev_info, SPDRP_HARDWAREID, Some(&bytes))
-        }
-        .context("SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID) failed")?;
-        unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, devs, Some(&dev_info)) }
-            .with_context(|| "DIF_REGISTERDEVICE failed")?;
+    // DiInstallDriverW 装入驱动存储并安装：它按 INF 的硬件 ID 更新**所有**匹配设备
+    // （含刚新建的这个），所以复用路径不需要额外的绑定动作。
+    let inf_path = std::fs::canonicalize(&inf_path).context("无法解析 INF 绝对路径")?;
+    let inf_path_wide: Vec<u16> = inf_path
+        .as_os_str()
+        .to_str()
+        .context("INF 路径不是合法 UTF-8")?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut reboot = windows::Win32::Foundation::BOOL(0);
+    unsafe {
+        DiInstallDriverW(
+            None,
+            windows::core::PCWSTR(inf_path_wide.as_ptr()),
+            DIIRFLAG_FORCE_INF,
+            Some(&mut reboot),
+        )
+    }
+    .with_context(|| "DiInstallDriverW failed（内核驱动需测试签名或已签名证书）")?;
+    if reboot.as_bool() {
+        println!("系统提示需要重启以完成安装");
+    }
 
-        // DiInstallDriverW 装入驱动存储并安装
-        let inf_path = std::fs::canonicalize(&inf_path).context("无法解析 INF 绝对路径")?;
-        let inf_path_wide: Vec<u16> = inf_path
-            .as_os_str()
-            .to_str()
-            .context("INF 路径不是合法 UTF-8")?
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut reboot = windows::Win32::Foundation::BOOL(0);
-        unsafe {
-            DiInstallDriverW(
-                None,
-                windows::core::PCWSTR(inf_path_wide.as_ptr()),
-                DIIRFLAG_FORCE_INF,
-                Some(&mut reboot),
-            )
+    // 事后断言：安装完成后必须**恰好一个**节点（设备注册/移除是异步的，给它最多
+    // ~3s）。多节点意味着后建的节点必然因驱动单例失败——宁可 CLI 非零退出，也不要
+    // 静默留下「看着装好了、其实有个死节点」的现场。
+    let mut ids = vdev_instance_ids()?;
+    for _ in 0..6 {
+        if ids.len() == 1 {
+            break;
         }
-        .with_context(|| "DiInstallDriverW failed（内核驱动需测试签名或已签名证书）")?;
-        if reboot.as_bool() {
-            println!("系统提示需要重启以完成安装");
-        }
-        Ok(())
-    })();
-
-    unsafe { SetupDiDestroyDeviceInfoList(devs) }.ok();
-    result
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        ids = vdev_instance_ids()?;
+    }
+    if ids.len() != 1 {
+        bail!(
+            "安装后 vdev-audio 节点数为 {}（应为 1）：{}（残留节点请先 uninstall 清理）",
+            ids.len(),
+            if ids.is_empty() {
+                "<none>".to_string()
+            } else {
+                ids.join(", ")
+            }
+        );
+    }
+    println!("虚拟声卡驱动已安装（设备节点 {}）", ids[0]);
+    Ok(())
 }
 
 /// 卸载：移除全部 Root\vdev-audio 残留节点，并断言零残留（有残留非零退出）。
@@ -575,5 +660,16 @@ mod tests {
         // 也不能中更短的公共前缀
         let ids2 = multi(&[r"Root\vdev"]);
         assert!(!hwid_matches(&ids2, r"Root\vdev-audio"));
+    }
+
+    /// 安装幂等决策回归：0 → 新建、1 → 就地更新、≥2 → 先清后建。
+    /// 回归点是「每次 install 都删旧建新」——清空那步一旦假成功，节点就会堆成
+    /// `ROOT\MEDIA\0001/0002/0003`，后建的节点因驱动单例上报 `0xC000009A`。
+    #[test]
+    fn install_plan_is_idempotent() {
+        assert_eq!(install_plan(0), InstallPlan::Create);
+        assert_eq!(install_plan(1), InstallPlan::Reuse);
+        assert_eq!(install_plan(2), InstallPlan::Recreate);
+        assert_eq!(install_plan(3), InstallPlan::Recreate);
     }
 }

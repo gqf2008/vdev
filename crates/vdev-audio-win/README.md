@@ -94,6 +94,7 @@ $exe = ".\target\x86_64-pc-windows-msvc\release\vdev-audio-win.exe"
 - 环回积压：0.3.9.0 的 1 MB 环形缓冲 ≈ **5.46 s**；0.3.10.0 起 256 KB ≈ **1.37 s**（可按需再调）；
 - 音量/静音只有采集 topology 有节点（"记事本"语义，无 DSP 效果）；渲染拓扑直通；
 - 驱动不暴露 IOCTL/WriteFile 面；宿主注音走端点推流（`inject`）；
+- 驱动侧设备适配器是**单例**（`adapter::create` 只允许一个实例）：设备树里若出现第二个 `Root\vdev-audio` 节点，第二个会在 `start_device` 里直接上报 `STATUS_INSUFFICIENT_RESOURCES`（`0xC000009A`）——`install` 现已幂等，正常路径不会产生这种节点；
 - Driver Verifier（special pool + DDI compliance）专项尚未跑。
 
 ## 排查
@@ -105,3 +106,4 @@ $exe = ".\target\x86_64-pc-windows-msvc\release\vdev-audio-win.exe"
 | 端点存在但 `IAudioClient` 报 `0x80070491` | 开流 pin 的 `KSPROPERTY_PIN_INTERFACES` 是否给了 `KSINTERFACE_STANDARD_LOOPED_STREAMING(1)`；数据范围是否带 `KSDATARANGE_ATTRIBUTES` + 信号处理模式属性（详见社区文档"案例七～十一"） |
 | 能开流但没声音 / 采集无包 | 流是否真的拿到格式（`NewStream` 里应用格式，`bytes_per_sec` 不能是 0）；`GetCurrentPadding` 是否下降 |
 | 装了但行为没变 | INF `DriverVer` 是否升过；`C:\Windows\System32\drivers\vdev_audio.sys` 时间戳 |
+| `install` 后出现多个 `ROOT\MEDIA\000N` 节点 / 设备报 `0xC000009A` | 该驱动的设备适配器是**单例**：一个系统只允许一个设备节点，多出来的节点必然 `CM_PROB_FAILED_START`。0.3.10.0 之前的 CLI 卸载是「假成功」，会留下这种幽灵节点；现版本 `install` 已幂等（有节点就地更新、多节点先清后建、装完断言恰好一个），遇到残留直接 `uninstall` 清干净重装 |
