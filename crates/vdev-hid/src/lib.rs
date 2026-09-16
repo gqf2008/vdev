@@ -58,17 +58,22 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 /// `GAP`）稳定得多。这里与 `tap_key` 对齐：down 后 `GAP`、up 后 `GAP`
 /// 再发下一个字符。
 pub fn type_text(text: &str) -> Result<()> {
+    // 整串共用一个 private EventSource（与原 cgevents::type_string 的资源口径一致），
+    // 但按上面的节拍逐字符发射；每字符约 2*GAP，长文本按字符数线性耗时。
+    let source = cgevents::EventSource::private().map_err(|e| err(&e))?;
     for ch in text.chars() {
         let chunk = ch.to_string();
         KeyEvent::down(0)
             .with_unicode(&chunk)
-            .post(LOCATION)
-            .map_err(|e| err(&e))?;
+            .build(&source)
+            .map_err(|e| err(&e))?
+            .post(LOCATION);
         thread::sleep(GAP);
         KeyEvent::up(0)
             .with_unicode(&chunk)
-            .post(LOCATION)
-            .map_err(|e| err(&e))?;
+            .build(&source)
+            .map_err(|e| err(&e))?
+            .post(LOCATION);
         thread::sleep(GAP);
     }
     Ok(())
