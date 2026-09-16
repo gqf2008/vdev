@@ -113,7 +113,11 @@ for ch in s.chars {
 }
 `
 
-注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。vdev 的 `type_text`直接封装它，CLI 一行 `vdev hid type "hello from vdev"` 即可。
+注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。
+
+**vdev 没有直接封装 `type_string`**：上面的 down/up 背靠背连发没有间隔，macOS 26 实测会被 `WindowServer` 合并/丢弃——`vdev hid type "q1q1"` 三轮只到 2/0/2 个字符（`hello from vdev` 在 EventTap 上只到 2/15）。`type_text` 改成自己按 `tap_key` 的节拍逐字符发射：整串共用一个 private `EventSource`，每个字符 down 后 `GAP`、up 后再 `GAP`；修复后同一组 A/B 到达 15/15、17/17、4/4。验收脚本见 `scripts/acceptance/macos-hid-type-verify.sh`（探针拿不到前台焦点走 SKIP；编译失败或没有任何用例执行以非零退出，不会把"没验证"报成通过）。
+
+CLI 一行 `vdev hid type "hello from vdev"` 即可（每字符约 2×`GAP`，长文本按字符数线性耗时）。
 
 ## 四、鼠标注入
 

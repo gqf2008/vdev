@@ -1,6 +1,6 @@
-# Windows 驱动验收脚本
+# 驱动验收脚本（Windows + macOS）
 
-这些脚本是 Windows 虚拟设备（HID / 声卡 / 显示器）在**真机**上做验收时用的工具，随 PR #12/#17/#18/#19 的验收过程沉淀下来：
+这些脚本是 Windows/macOS 虚拟设备在**真机**上做验收时用的工具，随 PR #12/#17/#18/#19 的验收过程沉淀下来：
 它们不依赖 `SendInput`/测试桩，只走「设备节点 + 系统 API」这条真实路径，所以能真正回答"驱动装上了吗""注入生效了吗""链路通不通"。
 
 原先这些脚本散落在验收机的临时目录里、路径写死成 `E:\vdev-hid-fix`；入库时统一改成：
@@ -8,6 +8,24 @@
 - 仓库根默认按脚本位置推导（`scripts\acceptance\` 的上一级），需要时用 `-RepoRoot` 覆盖；
 - 日志/录音等产物默认写 `%TEMP%\vdev-acceptance\`，用 `-OutDir` 覆盖；
 - 需要管理员的脚本会**自动请求 UAC** 并把参数转发给提权后的自己。
+
+## macOS 驱动验收（HID 文本注入）
+
+`macos-hid-type-verify.sh` + `macos-hid-type-probe.swift` 验证 `vdev hid type` 是否逐字到达：
+
+- 探针开一个 AppKit 窗口：既统计窗口实际收到的 keyDown 文本，也用全局 EventTap 统计系统级 keyDown；
+- **只有探针窗口拿到 `active=true key=true` 才注入**；拿不到前台焦点就 SKIP，绝不把合成键打进用户当前窗口；
+- 判定：`tap_delta >= 字符数`（系统级没丢事件）且窗口 `TYPED == 输入`（应用层完整收到）；
+- 假绿边界：`swiftc` 编译失败 → exit 2；所有用例都拿不到焦点/没执行（`executed=0`）→ exit 2，不把"没验证"报成通过；注入期间焦点被抢走（`SUMMARY` 里 `active/key` 不再为真）→ 该用例按 SKIP 处理并打印原因；
+- 仍存在毫秒级的"READY 检查 → 注入"窗口，跑之前确认没有别人正在用这台机器；
+- 阳性对照：修复前 `cgevents::type_string` 背靠背发 down/up，`hello from vdev` 在 EventTap 上只到 **2/15**；修复后 **15/15**。
+
+```bash
+cargo build -p vdev-host --release
+./scripts/acceptance/macos-hid-type-verify.sh target/release/vdev
+```
+
+> 该脚本会在前台弹一个探针窗口数秒；跑之前确认没有别人正在用这台机器。
 
 ## 前置条件
 

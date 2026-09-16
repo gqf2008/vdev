@@ -94,7 +94,7 @@ pub fn tap_key(keycode: u16, modifiers: ModifierFlags) -> Result<()> {
 2. **flags 是"替换"而非"叠加"**——合成事件会整体覆盖 flags 字段，物理按住的修饰键在这一瞬间被"顶掉"。要做物理+合成组合键，得先读当前 flags 再合并（vdev 没做，它的用例不需要）；
 3. **GAP = 12ms**（`crates/vdev-hid/src/lib.rs:22`）：down 与 up 之间留一小段间隔，给接收方（尤其是跨进程的 AppKit 事件循环）留出稳定识别两个事件的时间。
 
-修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:174–191`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
+修饰键解析在 CLI 侧做成了别名表：`parse_modifiers` 接受 shift/cmd/ctrl/alt 及全称（`crates/vdev-hid/src/lib.rs:198–215`），于是有了 `vdev hid key space --modifiers cmd,shift` 这样的用法。
 
 ### 3.3 文本输入：另一条 Unicode 通道
 
@@ -111,18 +111,36 @@ for ch in s.chars() {
 }
 ```
 
-注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。vdev 的 `type_text`（`crates/vdev-hid/src/lib.rs:53–56`）直接封装它，CLI 一行 `vdev hid type "hello from vdev"` 即可。
+注意虚拟键码恒为 0，字符本体挂在 Unicode 附件里。读 `NSEvent.characters` 的常规 App 拿到的是真字符，中文照样进；但只认键码的目标（某些游戏、远程桌面客户端）会把每个字符看成一个 keycode 0 的怪键。
+
+**vdev 没有直接封装 `type_string`**：上面的 down/up 背靠背连发没有任何间隔，macOS 26 实测会被 `WindowServer` 合并/丢弃——`vdev hid type "q1q1"` 三轮只到达 2/0/2 个字符（`hello from vdev` 在全局 EventTap 上只看到 2/15 个 KeyDown），而同机同负载下 `System Events` 的 `keystroke` 三轮都是 4/4。`type_text`（`crates/vdev-hid/src/lib.rs:60–80`）因此自己按 `tap_key` 的节拍逐字符发射：整串共用一个 private `EventSource`，每个字符 down 后 `GAP`、up 后再 `GAP` 才发下一个：
+
+```rust
+// crates/vdev-hid/src/lib.rs:60-80（节选）
+let source = cgevents::EventSource::private()?;
+for ch in text.chars() {
+    let chunk = ch.to_string();
+    KeyEvent::down(0).with_unicode(&chunk).build(&source)?.post(LOCATION);
+    thread::sleep(GAP);
+    KeyEvent::up(0).with_unicode(&chunk).build(&source)?.post(LOCATION);
+    thread::sleep(GAP);
+}
+```
+
+修复后的真机 A/B（`scripts/acceptance/macos-hid-type-verify.sh`，AppKit 探针窗 + 全局 EventTap 双计数）：`hello from vdev` 15/15、`vdev-accept-中文-42` 17/17、`中文中文` 4/4。验收脚本只在探针拿到前台焦点时注入，拿不到焦点走 SKIP；探针编译失败或没有任何用例执行会以非零退出，不会把"没验证"报成通过。
+
+CLI 一行 `vdev hid type "hello from vdev"` 即可（每字符约 2×`GAP`，长文本按字符数线性耗时）。
 
 ## 四、鼠标注入
 
-鼠标三条命令对应三种事件构造，全部发生在 `crates/vdev-hid/src/lib.rs:59–83`：
+鼠标三条命令对应三种事件构造，全部发生在 `crates/vdev-hid/src/lib.rs:82–107`：
 
-**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`crates/vdev-hid/src/lib.rs:58` 注释），Retina 屏上这里是"点"不是物理像素。
+**移动**：`MouseEvent::move_to(Point::new(x, y))` —— 一个 `MouseMoved` 类型事件。坐标是 `CGPoint`（Double），**天然支持子像素**；坐标系是全局点坐标、原点在左上（`crates/vdev-hid/src/lib.rs:82` 注释），Retina 屏上这里是"点"不是物理像素。
 
 **点击**：先 `mouse_move` 到目标，再 `button_down` + GAP + `button_up`：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:66-76
+// crates/vdev-hid/src/lib.rs:90-100
 pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
     mouse_move(x, y)?;
     MouseEvent::button_down(Point::new(x, y), button)
@@ -138,14 +156,14 @@ pub fn mouse_click(x: f64, y: f64, button: MouseButton) -> Result<()> {
 
 先 move 再 down 不是多余的：目标 App 的悬停状态（tooltip、hover 高亮）依赖 moved 事件先到位。按钮经 CLI 的 `parse_button` 解析，支持 left/right/middle（middle 别名 center，`crates/vdev-host/src/main.rs:113–118`）。事件构造最终落在 Swift 侧的 `CGEvent(mouseEventSource:mouseType:mouseCursorPosition:mouseButton:)`——注意 vdev **没有显式设置 clickState**，即按系统默认的单击语义；要合成双击/三击，需自己给事件的 `kCGMouseEventClickState` 字段递增计数。
 
-**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`crates/vdev-hid/src/lib.rs:78–83`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
+**滚动**：`ScrollEvent::lines(delta_y)`，`delta_y` 为正向上滚、单位是"行"（`crates/vdev-hid/src/lib.rs:102–107`）。底层是 `CGEventCreateScrollWheelEvent` 的 line 单位变体；cgevents 还提供 `pixels` 系列构造器（像素精度滚动，触控板式平滑滚动场景用），vdev 的 CLI 暂未暴露。
 
 ## 五、监听侧：vdev hid listen
 
 注入不需要任何授权，监听则相反——**全局事件监听是 TCC 管制的敏感能力**。macOS 10.15 起，系统用 `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()` 两个 API 表达这件事；对应系统设置里的「辅助功能」与「输入监控」两类授权。vdev 在监听入口先做预检，失败则触发一次正式请求并直接报错退出：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:92-98
+// crates/vdev-hid/src/lib.rs:116-122
 pub fn listen(seconds: Option<u64>) -> Result<()> {
     if !EventTap::preflight_listen_access() {
         let _ = EventTap::request_listen_access();
@@ -155,12 +173,12 @@ pub fn listen(seconds: Option<u64>) -> Result<()> {
     }
 ```
 
-`request_listen_access()` 会引导系统弹出授权提示；注意授权对象是**运行 vdev 的终端 App**（iTerm/Terminal 等），不是 vdev 自己。权限被拒时以非零退出码结束——这对脚本化使用很关键（README 权限说明一节明确写了这一行为，`README.md:236`）。
+`request_listen_access()` 会引导系统弹出授权提示；注意授权对象是**运行 vdev 的终端 App**（iTerm/Terminal 等），不是 vdev 自己。权限被拒时以非零退出码结束——这对脚本化使用很关键（README 权限说明一节明确写了这一行为，`README.md:37`）。
 
 过了权限关，创建 tap：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:103-107
+// crates/vdev-hid/src/lib.rs:127-131
 let handle = thread::spawn(move || {
     let tap = match EventTap::new(
         TapLocation::Session,
@@ -178,7 +196,7 @@ let handle = thread::spawn(move || {
 最后是**线程归属**——这是这个函数注释里写了整整七行、也是坑 1 的主角：
 
 ```rust
-// crates/vdev-hid/src/lib.rs:100-101,143-144
+// crates/vdev-hid/src/lib.rs:124-125,167-169
 // 创建与运行同线程（见函数注释）；创建结果经 channel 交还主线程，
 // 成功后主线程持有 Arc 句柄用于到点 stop。
 ...
@@ -187,7 +205,7 @@ let handle = thread::spawn(move || {
     }
 ```
 
-EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`crates/vdev-hid/src/lib.rs:160–166`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
+EventTap 的 run loop source 在**创建线程**的 run loop 上，`run()` 也必须在同一线程调用。所以 listen 的结构是：专用线程里"创建 + 运行"，创建结果经 mpsc channel 交还主线程；主线程持有 `Arc<EventTap>`，`--seconds N` 到点后调 `tap.stop()`（stop 停的是创建线程的 run loop，线程安全，`crates/vdev-hid/src/lib.rs:184–190`）；不带超时的常驻模式则一直 `join`，Ctrl-C 直接杀进程。
 
 ## 六、踩坑实录
 
@@ -218,7 +236,7 @@ std::thread::sleep(Duration::from_secs(seconds));
 
 ### 坑 2：权限被拒也是静默的——报错了，退出码却是 0
 
-同一个初版里，权限预检失败走的是 `eprintln!` + `return Ok(())`：错误信息打出来了，进程退出码却是 0。用 vdev 做远控链路时，上游脚本判断"listen 成功启动"，随后把注入事件发向一个根本没在监听的进程。修复后无权限时返回 `Err`，CLI 以非零码退出（现行为与 `README.md:236` 的承诺一致）。教训：**TCC 预检必须走错误路径，"打印了错误"和"返回了错误"是两回事**。
+同一个初版里，权限预检失败走的是 `eprintln!` + `return Ok(())`：错误信息打出来了，进程退出码却是 0。用 vdev 做远控链路时，上游脚本判断"listen 成功启动"，随后把注入事件发向一个根本没在监听的进程。修复后无权限时返回 `Err`，CLI 以非零码退出（现行为与 `README.md:37` 的承诺一致）。教训：**TCC 预检必须走错误路径，"打印了错误"和"返回了错误"是两回事**。
 
 ### 坑 3：键码表对照方法论——别从 ASCII 推，拿 Events.h 对
 
