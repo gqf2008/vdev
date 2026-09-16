@@ -13,19 +13,27 @@
 
 `macos-hid-type-verify.sh` + `macos-hid-type-probe.swift` 验证 `vdev hid type` 是否逐字到达：
 
-- 探针开一个 AppKit 窗口：既统计窗口实际收到的 keyDown 文本，也用全局 EventTap 统计系统级 keyDown；
-- **只有探针窗口拿到 `active=true key=true` 才注入**；拿不到前台焦点就 SKIP，绝不把合成键打进用户当前窗口；
-- 判定：`tap_delta >= 字符数`（系统级没丢事件）且窗口 `TYPED == 输入`（应用层完整收到）；
-- 假绿边界：`swiftc` 编译失败 → exit 2；所有用例都拿不到焦点/没执行（`executed=0`）→ exit 2，不把"没验证"报成通过；注入期间焦点被抢走（`SUMMARY` 里 `active/key` 不再为真）→ 该用例按 SKIP 处理并打印原因；
-- 仍存在毫秒级的"READY 检查 → 注入"窗口，跑之前确认没有别人正在用这台机器；
-- 阳性对照：修复前 `cgevents::type_string` 背靠背发 down/up，`hello from vdev` 在 EventTap 上只到 **2/15**；修复后 **15/15**。
+- 探针不再用裸二进制（macOS 26 上拿不到前台焦点），而是在临时目录组装最小
+  `VdevHidProbe.app`，用 `open -W -n --args <out> 3` 启动；探针把
+  `READY/SUMMARY/TYPED` 写进 out 文件。先跑一个 throwaway 实例预热 LaunchServices。
+- **只有探针窗口拿到 `active=true key=true` 才注入**；拿不到前台焦点就 SKIP，绝不把合成键打进用户当前窗口。
+- 判定：窗口 `TYPED == 输入` **且**（`tap_ok=false` 或 `tap_delta >= 字符数`）→ PASS。
+  `.app` 身份通常拿不到辅助功能权限（`tap_ok=false`），此时以窗口逐字一致为准；
+  `tap_ok=true` 时 EventTap 计数作为交叉校验。
+- 假绿边界：`swiftc`/`open` 失败、探针未就绪、`tap_ok` 字段非法 → FAIL（exit 2 的启动失败路径）；
+  所有用例都 SKIP / 没执行（`executed=0`）→ `NOT_RUN` exit 2；`TYPED` 不匹配且结束焦点已丢失
+  → 该用例按 SKIP 处理（`TYPED` 完全匹配时焦点在 SUMMARY 时刻的变化不影响 PASS，因为注入已完成）。
+- 注入窗口 3s，覆盖当前 ≤19 字符的用例（每字符约 2×12ms）；CASES 加长用例时需同步加大窗口。
+- 阳性对照：修复前窗口只收到 **2/17**（EventTap 2/15）；修复后 8/8 PASS，
+  15/17/19/9/4/4/16/10 字符逐字一致。对照 fake `vdev`（什么都不注入）→ 7 FAIL + 1 SKIP，
+  `HID_TYPE_RESULT=FAIL`，无假绿。
 
 ```bash
 cargo build -p vdev-host --release
 ./scripts/acceptance/macos-hid-type-verify.sh target/release/vdev
 ```
 
-> 该脚本会在前台弹一个探针窗口数秒；跑之前确认没有别人正在用这台机器。
+> 该脚本会**抢走前台焦点**并弹一个探针窗口，整轮约 40–60s；跑之前确认没有别人正在用这台机器。
 
 ## 前置条件
 

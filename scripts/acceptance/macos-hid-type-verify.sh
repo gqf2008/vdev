@@ -31,7 +31,11 @@ fi
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 RUN_DIR=$(mktemp -d -t vdev-hid-type.XXXXXX)
-cleanup() { rm -rf "${RUN_DIR}"; }
+# 看门狗：open -W 只等启动器，app 若卡死需按精确进程名收口（禁用 pkill -f）。
+cleanup() {
+  pkill -x VdevHidProbe 2>/dev/null || true
+  rm -rf "${RUN_DIR}"
+}
 trap cleanup EXIT
 
 PROBE_BIN="${RUN_DIR}/probe"
@@ -73,11 +77,17 @@ CASES=(
 )
 total=${#CASES[@]}
 
+# 有界停止：pkill 精确名杀掉卡死的 app，让 open -W 返回后再 wait。
+stop_probe() {
+  pkill -x VdevHidProbe 2>/dev/null || true
+  wait "${open_pid}" 2>/dev/null || true
+}
+
 fails=0
 skipped=0
 executed=0
 # 预热一次：首次 open 一个有 bundle 身份的 App 常有激活竞态，先跑一个
-# 1s 的 throwaway 实例，避免第一个真实用例因首发竞态拿不到焦点。
+# throwaway 实例（激活等待 4s + 注入窗口 1s ≈ 5s），避免首个真实用例首发竞态。
 warm_out="${RUN_DIR}/warmup.out"
 : > "${warm_out}"
 open -W -n "${PROBE_APP}" --args "${warm_out}" 1 >/dev/null 2>&1 || true
@@ -101,19 +111,25 @@ for text in "${CASES[@]}"; do
   if [ -z "${ready}" ]; then
     echo "FAIL '${text}'（探针未就绪/启动失败，open_log: ${open_log}）"
     cat "${open_log}" 2>/dev/null | tail -3
-    wait "${open_pid}" 2>/dev/null || true
+    stop_probe
     fails=$((fails + 1))
     continue
   fi
   if ! echo "${ready}" | grep -q 'active=true key=true'; then
     echo "SKIP '${text}'（探针窗口未取得前台焦点：${ready}）"
-    wait "${open_pid}" 2>/dev/null || true
+    stop_probe
     skipped=$((skipped + 1))
     continue
   fi
 
   tap_before=$(echo "${ready}" | sed -nE 's/.*tap=([0-9]+).*/\1/p')
   tap_ok=$(echo "${ready}" | sed -nE 's/.*tap_ok=(true|false).*/\1/p')
+  if [ "${tap_ok}" != "true" ] && [ "${tap_ok}" != "false" ]; then
+    echo "FAIL '${text}'（READY 缺少合法 tap_ok：${ready}）"
+    stop_probe
+    fails=$((fails + 1))
+    continue
+  fi
   "${VDEV}" hid type "${text}" >/dev/null 2>&1
   wait "${open_pid}"
 
