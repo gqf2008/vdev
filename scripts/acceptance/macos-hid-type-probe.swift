@@ -68,7 +68,7 @@ print("READY active=\(app.isActive) key=\(window.isKeyWindow) tap=\(tapCount)")
 fflush(stdout)
 
 DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-    print("SUMMARY keys=\(window.keys) tap=\(tapCount)")
+    print("SUMMARY keys=\(window.keys) tap=\(tapCount) active=\(app.isActive) key=\(window.isKeyWindow)")
     print("TYPED=\(window.typed)")
     fflush(stdout)
     app.terminate(nil)

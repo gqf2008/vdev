@@ -16,6 +16,8 @@
 - 探针开一个 AppKit 窗口：既统计窗口实际收到的 keyDown 文本，也用全局 EventTap 统计系统级 keyDown；
 - **只有探针窗口拿到 `active=true key=true` 才注入**；拿不到前台焦点就 SKIP，绝不把合成键打进用户当前窗口；
 - 判定：`tap_delta >= 字符数`（系统级没丢事件）且窗口 `TYPED == 输入`（应用层完整收到）；
+- 假绿边界：`swiftc` 编译失败 → exit 2；所有用例都拿不到焦点/没执行（`executed=0`）→ exit 2，不把"没验证"报成通过；注入期间焦点被抢走（`SUMMARY` 里 `active/key` 不再为真）→ 该用例按 SKIP 处理并打印原因；
+- 仍存在毫秒级的"READY 检查 → 注入"窗口，跑之前确认没有别人正在用这台机器；
 - 阳性对照：修复前 `cgevents::type_string` 背靠背发 down/up，`hello from vdev` 在 EventTap 上只到 **2/15**；修复后 **15/15**。
 
 ```bash
