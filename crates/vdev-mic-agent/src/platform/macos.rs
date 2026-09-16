@@ -573,6 +573,10 @@ fn describe(dev: AudioDeviceID) -> DeviceInfo {
 const RECORD_SECONDS: usize = 120;
 const RECORD_SAMPLES: usize = 48_000 * RECORD_SECONDS;
 
+/// 本 crate 的统一信号标度：RNNoise / AdaptiveMixer / wavio / metrics 均按
+/// int16 标度（±32768）工作；Core 入口从 [-1,1] 放大，出口缩回再上环。
+const INT16_SCALE: f32 = 32_768.0;
+
 struct Core {
     adaptive: bool,
     mix: f32,
@@ -586,6 +590,10 @@ struct Core {
     frame: Vec<f32>,
     /// Dry frame, delayed in place before blending.
     dry_frame: Vec<f32>,
+    /// [-1,1] 输入放大到 int16 标度的每帧暂存。
+    in_scaled: Vec<f32>,
+    /// int16 标度的 `frame` 缩回 [-1,1] 的每帧暂存（上环前）。
+    out_float: Vec<f32>,
 
     rec_in: Vec<f32>,
     rec_out: Vec<f32>,
@@ -628,6 +636,8 @@ impl Core {
             out_ring,
             frame: vec![0.0; engine.frame_size],
             dry_frame: vec![0.0; engine.frame_size],
+            in_scaled: vec![0.0; engine.frame_size],
+            out_float: vec![0.0; engine.frame_size],
             rec_in,
             rec_out,
             timing: Vec::with_capacity(60 * 1000), // 60 s of 10 ms frames
@@ -641,27 +651,42 @@ impl Core {
 
     /// One 480-sample frame: model, blend, ship. Mirrors `agent::process`'s
     /// inner loop exactly, so the offline numbers stay valid.
+    ///
+    /// 输入放大到 int16 标度（模型、延迟线、混音、A/B 录音全在该标度），
+    /// 出口再缩回 [-1,1] 上环（与 Windows 后端的审查 M-g 修复同构）。
     #[inline]
     fn on_frame(&mut self, input: &[f32]) {
-        // 1) raw capture, for the A/B file
+        // 防二次标度：本函数入口契约是 [-1,1] float；若有人把 int16 标度
+        // 数据直接喂进来（典型错误是入口/出口缩放写反），debug/测试构建立即炸。
+        debug_assert!(
+            input.iter().all(|v| v.abs() <= 2.0),
+            "Core::on_frame expects [-1,1] float input"
+        );
+
+        // 0) [-1,1] -> int16 标度（input 恒为 FRAME 长，见 den.process 的既有假设）
+        for (d, &s) in self.in_scaled.iter_mut().zip(input) {
+            *d = s * INT16_SCALE;
+        }
+
+        // 1) raw capture, for the A/B file（int16 标度，与 wavio::write 的约定一致）
         if self.rec_in.len() + FRAME <= RECORD_SAMPLES {
-            self.rec_in.extend_from_slice(input);
+            self.rec_in.extend_from_slice(&self.in_scaled);
         }
 
         let t0 = Instant::now();
-        let (vad, wet_frame) = self.den.process(input);
+        let (vad, wet_frame) = self.den.process(&self.in_scaled);
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if self.timing.len() < self.timing.capacity() {
             self.timing.push(dt_ms);
         }
 
         // 2) dry path, delayed to the model's lookahead (see frames::DelayLine)
-        self.dry_frame.copy_from_slice(input);
+        self.dry_frame.copy_from_slice(&self.in_scaled);
         self.dry.process(&mut self.dry_frame);
 
-        // 3) blend
+        // 3) blend（mixer 拿到 int16 标度输入，noise_floor_dbfs 才是真实 dBFS）
         let w = if self.adaptive {
-            self.mixer.update(input, vad)
+            self.mixer.update(&self.in_scaled, vad)
         } else {
             self.mix as f64
         };
@@ -684,7 +709,11 @@ impl Core {
 
         // 4) ship it. Dropping on a full ring is the right failure mode: the
         // render side is starving, and stale audio would be worse than a gap.
-        self.out_ring.push_or_drop(&self.frame);
+        // 上环前缩回 [-1,1]——渲染侧按 float [-1,1] 写出。
+        for (d, &s) in self.out_float.iter_mut().zip(&self.frame) {
+            *d = s / INT16_SCALE;
+        }
+        self.out_ring.push_or_drop(&self.out_float);
 
         self.frames += 1;
         self.vad_sum += vad as f64;
@@ -720,51 +749,89 @@ fn note_cb_panic(cb: &'static str) {
 /// instead. `AssertUnwindSafe` is honest here — the closure only touches the
 /// raw pointers CoreAudio handed us for this one call, plus state (`Core`,
 /// `ASM`) that is deliberately process-lifetime and single-thread.
-unsafe extern "C" fn capture_input_cb(
-    in_ref_con: *mut c_void,
-    _io_action_flags: *mut u32,
-    _in_time_stamp: *const AudioTimeStamp,
-    _in_bus_number: u32,
-    in_number_frames: u32,
-    io_data: *mut AudioBufferList,
+/// 采集侧状态：硬件格式 + 预分配的重采样缓冲 + `Core` 指针。
+struct CaptureCtx {
+    core: *mut Core,
+    src_rate: f64,
+    /// 16k→48k 的 3x 线性插值输出；RT 路径只写不扩容。
+    resample: Vec<f32>,
+}
+
+/// 3x 线性插值（16k→48k），返回写入 `dst` 的样本数（= src.len()*3）。
+/// 调用方保证 `dst.len() >= src.len()*3`；最后一点用自身重复。
+fn resample_16k_to_48k(src: &[f32], dst: &mut [f32]) -> usize {
+    let n = src.len();
+    for i in 0..n {
+        let a = src[i];
+        let b = if i + 1 < n { src[i + 1] } else { a };
+        let d = b - a;
+        dst[i * 3] = a;
+        dst[i * 3 + 1] = a + d / 3.0;
+        dst[i * 3 + 2] = a + 2.0 * d / 3.0;
+    }
+    n * 3
+}
+
+/// 采集设备的 IOProc：硬件 buffer -> （可选 16k→48k）-> FrameAssembler -> Core。
+///
+/// macOS 26 实测 HALOutput AudioUnit 的 input callback 只给 0-buffer
+/// （同一设备/格式，`AudioDeviceIOProc` 能拿到 512 帧数据），因此采集侧
+/// 与 injection 侧统一走 `AudioDeviceIOProc`。
+unsafe extern "C" fn capture_ioproc(
+    _device: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    in_input_data: *const AudioBufferList,
+    _in_input_time: *const AudioTimeStamp,
+    _out_output_data: *mut AudioBufferList,
+    _in_output_time: *const AudioTimeStamp,
+    client_data: *mut c_void,
 ) -> OSStatus {
     let caught = catch_unwind(AssertUnwindSafe(|| -> OSStatus {
-        if in_ref_con.is_null() || io_data.is_null() {
+        if client_data.is_null() || in_input_data.is_null() {
             return 0;
         }
-        // SAFETY: non-null `in_ref_con` is the `core_ptr` we registered with
-        // the AU (Box::into_raw, process lifetime); the HAL runs exactly one
-        // callback at a time on its own thread.
-        let ctx = unsafe { &mut *(in_ref_con as *mut Core) };
-        // SAFETY: `io_data` is the HAL-owned buffer list, valid for this call.
-        let abl = unsafe { &*io_data };
+        // SAFETY: client_data 是 build_capture_ioproc 注册的 CaptureCtx 裸指针，
+        // 与进程同生命周期；同一设备的 IOProc 串行回调。
+        let ctx = unsafe { &mut *(client_data as *mut CaptureCtx) };
+        let core = ctx.core;
+        // SAFETY: in_input_data 是 HAL 本次回调拥有的 buffer list。
+        let abl = unsafe { &*in_input_data };
         if abl.m_number_buffers == 0 {
             return 0;
         }
         let buf = &abl.m_buffers[0];
-        if buf.m_data.is_null() || in_number_frames == 0 {
+        if buf.m_data.is_null() || buf.m_data_byte_size < 4 {
             return 0;
         }
-        // Client format was declared mono, non-interleaved, f32 (see
-        // `build_capture_unit`), so this buffer is exactly nframes f32 values.
-        let n = in_number_frames as usize;
-        // SAFETY: `buf.m_data` is non-null and holds `n` f32 samples per the
-        // declared client format above.
-        let mono = unsafe { std::slice::from_raw_parts(buf.m_data as *const f32, n) };
+        let frames = (buf.m_data_byte_size / 4) as usize;
+        // SAFETY: build_capture_ioproc 已校验设备格式为线性 PCM f32 mono；
+        // buffer 在本回调期间有效。
+        let src = unsafe { std::slice::from_raw_parts(buf.m_data as *const f32, frames) };
 
-        // (--record-in capture happens in `Core::on_frame`, on clean 480-sample
-        // frame boundaries; writing here too would double the WAV.)
-
-        // SAFETY: `ASM` is touched by exactly this one audio thread, and the
-        // call is synchronous (see `AsmHolder`).
+        // SAFETY: `ASM` 只被采集 IOProc 这一个音频线程触碰；`core` 是
+        // process-lifetime 的泄露 Box。
         let asm = unsafe { &mut *ASM.get() };
-        asm.push(mono, |frame| ctx.on_frame(frame));
+        if ctx.src_rate == 48_000.0 {
+            asm.push(src, |frame| unsafe { (*core).on_frame(frame) });
+        } else {
+            // build 时已校验 src_rate == 16000。
+            let out_len = frames * 3;
+            if ctx.resample.capacity() < out_len {
+                // 预分配不足时丢弃本块，绝不在 RT 线程扩容。
+                return 0;
+            }
+            ctx.resample.resize(out_len, 0.0);
+            let n = resample_16k_to_48k(src, &mut ctx.resample);
+            asm.push(&ctx.resample[..n], |frame| unsafe {
+                (*core).on_frame(frame)
+            });
+        }
         0
     }));
     match caught {
         Ok(rc) => rc,
         Err(_) => {
-            note_cb_panic("capture_input");
+            note_cb_panic("capture_ioproc");
             CB_PANIC
         }
     }
@@ -774,7 +841,7 @@ unsafe extern "C" fn capture_input_cb(
 /// pointer is the honest expression of that; it is never shared.
 struct AsmHolder(std::cell::UnsafeCell<FrameAssembler>);
 // SAFETY: `AsmHolder` is only ever reached from the single HAL audio thread
-// (see the `ASM.get()` call in `capture_input_cb`); no other thread touches it.
+// (see the `ASM.get()` call in `capture_ioproc`); no other thread touches it.
 unsafe impl Sync for AsmHolder {}
 
 impl AsmHolder {
@@ -823,7 +890,7 @@ const SEARCH_CAP: usize = 48_000; // 1 s: covers a 300 ms marker cadence with ro
 /// IOProc on the vdev virtual device: render (ring → device) and, in probe
 /// mode, marker detection in the same call.
 ///
-/// Wrapped in [`catch_unwind`] like [`capture_input_cb`]: a panic must not
+/// Wrapped in [`catch_unwind`] like [`capture_ioproc`]: a panic must not
 /// unwind into CoreAudio, so we report `'!pnc'` instead. `AssertUnwindSafe`
 /// covers only the pointers CoreAudio hands us plus the process-lifetime
 /// `InjectCtx` — see the leak note at its creation in `run`.
@@ -1054,7 +1121,7 @@ impl SpeakerCtx {
 
 /// AU render callback for the physical speaker (acoustic probe marker source).
 ///
-/// Wrapped in [`catch_unwind`] like [`capture_input_cb`]: a panic must not
+/// Wrapped in [`catch_unwind`] like [`capture_ioproc`]: a panic must not
 /// unwind into CoreAudio, so we report `'!pnc'` instead. `AssertUnwindSafe`
 /// covers only the pointers CoreAudio hands us plus the process-lifetime
 /// `SpeakerCtx` (leaked at creation in `run`).
@@ -1216,86 +1283,93 @@ fn au_set<T>(
     Ok(())
 }
 
-/// Capture AU: hardware input of `device` -> our callback, mono f32 @ 48 kHz.
-fn build_capture_unit(device: AudioDeviceID, core: *mut Core) -> Result<AudioUnit> {
-    let unit = new_hal_unit()?;
-    let one: u32 = 1;
-    let zero: u32 = 0;
-
-    // input element (bus 1) on, output element (bus 0) off
-    au_set(
-        unit,
-        AU_PROP_ENABLE_IO,
-        AU_SCOPE_INPUT,
-        1,
-        &one,
-        "EnableIO(input)",
-    )?;
-    au_set(
-        unit,
-        AU_PROP_ENABLE_IO,
-        AU_SCOPE_OUTPUT,
-        0,
-        &zero,
-        "EnableIO(output)",
-    )?;
-    au_set(
-        unit,
-        AU_PROP_CURRENT_DEVICE,
-        AU_SCOPE_GLOBAL,
-        0,
-        &device,
-        "CurrentDevice",
-    )?;
-
-    // Client side of the input element: mono, f32, non-interleaved. The HAL
-    // converts from whatever the hardware actually runs at, which is why we use
-    // an AudioUnit here and a raw IOProc on the injection side.
-    let fmt = asbd(48_000.0, 1, true);
-    au_set(
-        unit,
-        AU_PROP_STREAM_FORMAT,
-        AU_SCOPE_OUTPUT,
-        1,
-        &fmt,
-        "StreamFormat(input client)",
-    )?;
-
-    // Buffer the biggest slice we are prepared to handle; the device can go
-    // down to 32 frames and we must not care.
-    let max_frames: u32 = 4096;
-    au_set(
-        unit,
-        AU_PROP_MAX_FRAMES_PER_SLICE,
-        AU_SCOPE_GLOBAL,
-        0,
-        &max_frames,
-        "MaximumFramesPerSlice",
-    )?;
-
-    let cb = AURenderCallbackStruct {
-        input_proc: Some(capture_input_cb),
-        input_proc_ref_con: core as *mut c_void,
+/// 读取设备输入 scope 的当前硬件 stream format。
+fn device_input_format(device: AudioDeviceID) -> Result<AudioStreamBasicDescription> {
+    let mut fmt = AudioStreamBasicDescription {
+        m_sample_rate: 0.0,
+        m_format_id: 0,
+        m_format_flags: 0,
+        m_bytes_per_packet: 0,
+        m_frames_per_packet: 0,
+        m_bytes_per_frame: 0,
+        m_channels_per_frame: 0,
+        m_bits_per_channel: 0,
+        m_reserved: 0,
     };
-    au_set(
-        unit,
-        AU_PROP_SET_INPUT_CALLBACK,
-        AU_SCOPE_GLOBAL,
-        0,
-        &cb,
-        "SetInputCallback",
-    )?;
-
-    // SAFETY: `unit` is a live HAL-output AudioUnit from `new_hal_unit`, and
-    // all its properties have been set; Initialize is its one-time start.
-    let rc = unsafe { AudioUnitInitialize(unit) };
+    let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+    let a = addr(STREAM_VIRTUAL_FORMAT, SCOPE_INPUT);
+    // SAFETY: a/fmt/size 都是本函数持有的有效对象；只读查询设备格式。
+    let rc = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &raw const a,
+            0,
+            std::ptr::null(),
+            &raw mut size,
+            (&raw mut fmt).cast::<c_void>(),
+        )
+    };
     if rc != 0 {
         bail!(
-            "AudioUnitInitialize(capture) failed (OSStatus {})",
+            "读取采集设备 {device} 输入格式失败（OSStatus {}）",
             os_status(rc)
         );
     }
-    Ok(unit)
+    Ok(fmt)
+}
+
+/// 校验采集格式并返回采样率：只支持线性 PCM f32 mono 48k/16k。
+fn validate_capture_format(fmt: &AudioStreamBasicDescription) -> Result<f64> {
+    if fmt.m_format_id != FORMAT_LINEAR_PCM
+        || fmt.m_bits_per_channel != 32
+        || fmt.m_format_flags & FLAG_IS_FLOAT == 0
+        || fmt.m_channels_per_frame != 1
+    {
+        bail!(
+            "采集格式不支持：需要线性 PCM f32 mono（实际 id={:#x} flags={:#x} ch={} bits={}）",
+            fmt.m_format_id,
+            fmt.m_format_flags,
+            fmt.m_channels_per_frame,
+            fmt.m_bits_per_channel
+        );
+    }
+    let rate = fmt.m_sample_rate;
+    if rate != 48_000.0 && rate != 16_000.0 {
+        bail!("采集采样率 {rate} 不支持（需要 48k 或 16k）");
+    }
+    Ok(rate)
+}
+
+/// 采集 IOProc：设备输入 -> FrameAssembler。要求线性 PCM f32 mono 48k/16k。
+fn build_capture_ioproc(
+    device: AudioDeviceID,
+    core: *mut Core,
+) -> Result<(AudioDeviceIOProcID, Box<CaptureCtx>)> {
+    let fmt = device_input_format(device)?;
+    let rate = validate_capture_format(&fmt)?;
+    let mut ctx = Box::new(CaptureCtx {
+        core,
+        src_rate: rate,
+        resample: Vec::with_capacity(4096 * 3),
+    });
+    let mut ioproc_id: AudioDeviceIOProcID = std::ptr::null_mut();
+    // SAFETY: capture_ioproc 是 AudioDeviceIOProc；ctx 为 Box 持有的
+    // process-lifetime 状态，在 DestroyIOProcID 前一直有效。
+    let rc = unsafe {
+        AudioDeviceCreateIOProcID(
+            device,
+            capture_ioproc,
+            (&raw mut *ctx).cast::<c_void>(),
+            &raw mut ioproc_id,
+        )
+    };
+    if rc != 0 {
+        bail!(
+            "AudioDeviceCreateIOProcID(capture {device}) failed (OSStatus {})",
+            os_status(rc)
+        );
+    }
+    Ok((ioproc_id, ctx))
 }
 
 /// Speaker AU (acoustic probe only): play the marker on the *physical* output.
@@ -1562,12 +1636,12 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     }
 
     // ---- capture side (live denoise + acoustic probe) ---------------------
-    let capture_unit = match (&engine, capture_dev) {
+    let capture_io = match (&engine, capture_dev) {
         (Some(e), Some(d)) if probe_mode != Some(ProbeMode::Digital) => {
             let core = Box::new(Core::new(e, &cfg, Arc::clone(&out_ring))?);
             let core_ptr = Box::into_raw(core); // kept alive for the process lifetime
-            let unit = build_capture_unit(d, core_ptr)?;
-            Some((unit, core_ptr))
+            let (ioproc_id, ctx) = build_capture_ioproc(d, core_ptr)?;
+            Some((d, ioproc_id, core_ptr, ctx))
         }
         _ => None,
     };
@@ -1597,12 +1671,12 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     };
 
     // ---- start everything -------------------------------------------------
-    if let Some((unit, _)) = &capture_unit {
-        // SAFETY: `unit` is an initialized AudioUnit (see build_capture_unit).
-        let rc = unsafe { AudioOutputUnitStart(*unit) };
+    if let Some((dev, id, _, _)) = &capture_io {
+        // SAFETY: `(dev, id)` is the live device/IOProc pair created above.
+        let rc = unsafe { AudioDeviceStart(*dev, *id) };
         if rc != 0 {
             bail!(
-                "AudioOutputUnitStart(capture) failed (OSStatus {})",
+                "AudioDeviceStart(capture {dev}) failed (OSStatus {})",
                 os_status(rc)
             );
         }
@@ -1640,7 +1714,7 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
             // SAFETY: `p` is the leaked `core_ptr` (process lifetime); the
             // audio thread may be writing it concurrently, but we only read a
             // u64 counter, which is torn-free on this platform.
-            let core = capture_unit.as_ref().map(|(_, p)| unsafe { &**p });
+            let core = capture_io.as_ref().map(|(_, _, p, _)| unsafe { &**p });
             if let Some(c) = core {
                 println!(
                     "  {:.0}s  frames: {}",
@@ -1654,13 +1728,12 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     let cpu = (cpu_seconds() - cpu0).max(0.0);
 
     // ---- stop -------------------------------------------------------------
-    if let Some((unit, _)) = &capture_unit {
-        // SAFETY: `unit` is our live capture AU; Stop/Uninitialize/Dispose is
-        // its documented teardown order. Errors are ignored on this exit path.
+    if let Some((dev, id, _, _)) = &capture_io {
+        // SAFETY: `(dev, id)` is our live capture pair; Stop quiesces callbacks,
+        // then Destroy removes the IOProc. Errors are ignored on this exit path.
         unsafe {
-            AudioOutputUnitStop(*unit);
-            AudioUnitUninitialize(*unit);
-            AudioComponentInstanceDispose(*unit);
+            AudioDeviceStop(*dev, *id);
+            AudioDeviceDestroyIOProcID(*dev, *id);
         }
     }
     // SAFETY: `vdev`/`ioproc_id` are the live pair created above; Stop first
@@ -1679,9 +1752,9 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
     }
 
     // ---- report -----------------------------------------------------------
-    // SAFETY: `p` is the leaked `core_ptr` (process lifetime); the capture AU
-    // was stopped above, so no thread is writing it anymore.
-    let core = capture_unit.as_ref().map(|(_, p)| unsafe { &**p });
+    // SAFETY: `p` is the leaked `core_ptr` (process lifetime); the capture
+    // IOProc was stopped above, so no thread is writing it anymore.
+    let core = capture_io.as_ref().map(|(_, _, p, _)| unsafe { &**p });
     let mut timing = core.map(|c| c.timing.clone()).unwrap_or_default();
     timing.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1922,5 +1995,76 @@ mod speaker_schedule_tests {
             tail.iter().all(|&v| v == 0.0),
             "tail must stay silent (no immediate replay)"
         );
+    }
+}
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    fn fmt(rate: f64, ch: u32, flags: u32, bits: u32) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            m_sample_rate: rate,
+            m_format_id: FORMAT_LINEAR_PCM,
+            m_format_flags: flags,
+            m_bytes_per_packet: 4 * ch,
+            m_frames_per_packet: 1,
+            m_bytes_per_frame: 4 * ch,
+            m_channels_per_frame: ch,
+            m_bits_per_channel: bits,
+            m_reserved: 0,
+        }
+    }
+
+    #[test]
+    fn resample_16k_to_48k_length_and_linear_interpolation() {
+        let src = [1.0f32, 2.0, 4.0];
+        let mut dst = [0.0f32; 9];
+        let n = resample_16k_to_48k(&src, &mut dst);
+        assert_eq!(n, 9);
+        assert!((dst[0] - 1.0).abs() < 1e-6);
+        assert!((dst[1] - (1.0 + 1.0 / 3.0)).abs() < 1e-6);
+        assert!((dst[2] - (1.0 + 2.0 / 3.0)).abs() < 1e-6);
+        assert!((dst[3] - 2.0).abs() < 1e-6);
+        assert!((dst[8] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resample_constant_stays_constant() {
+        let src = [0.5f32; 480];
+        let mut dst = vec![0.0f32; 1440];
+        let n = resample_16k_to_48k(&src, &mut dst);
+        assert_eq!(n, 1440);
+        assert!(dst.iter().all(|&v| (v - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn capture_format_accepts_48k_and_16k_mono_float() {
+        let f = FLAG_IS_FLOAT | FLAG_IS_PACKED;
+        assert_eq!(
+            validate_capture_format(&fmt(48_000.0, 1, f, 32)).unwrap(),
+            48_000.0
+        );
+        assert_eq!(
+            validate_capture_format(&fmt(16_000.0, 1, f, 32)).unwrap(),
+            16_000.0
+        );
+    }
+
+    #[test]
+    fn int16_scale_roundtrip_is_exact_enough() {
+        for v in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let scaled = v * INT16_SCALE;
+            assert!((scaled / INT16_SCALE - v).abs() < 1e-7);
+        }
+        assert_eq!(1.0f32 * INT16_SCALE, 32_768.0);
+    }
+
+    #[test]
+    fn capture_format_rejects_unsupported_rate_channels_bits() {
+        let f = FLAG_IS_FLOAT | FLAG_IS_PACKED;
+        assert!(validate_capture_format(&fmt(44_100.0, 1, f, 32)).is_err());
+        assert!(validate_capture_format(&fmt(48_000.0, 2, f, 32)).is_err());
+        assert!(validate_capture_format(&fmt(48_000.0, 1, f, 16)).is_err());
+        assert!(validate_capture_format(&fmt(48_000.0, 1, FLAG_IS_PACKED, 32)).is_err());
     }
 }
