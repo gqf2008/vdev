@@ -62,8 +62,8 @@ struct RunArgs {
     /// Path to librnnoise-0.dll / librnnoise.dylib.
     #[arg(long)]
     dll: Option<PathBuf>,
-    /// Fixed dry/wet ratio.
-    #[arg(long, default_value_t = 1.0)]
+    /// Fixed dry/wet ratio (0 = pure bypass, 1 = model only).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_mix)]
     mix: f32,
     /// Derive the dry/wet ratio per frame from the local noise floor.
     #[arg(long)]
@@ -117,8 +117,8 @@ struct LiveArgs {
     /// Path to librnnoise.dylib; defaults to the loader's own search path.
     #[arg(long)]
     dll: Option<PathBuf>,
-    /// Fixed dry/wet ratio (ignored when --adaptive).
-    #[arg(long, default_value_t = 1.0)]
+    /// Fixed dry/wet ratio (0 = pure bypass, 1 = model only; ignored when --adaptive).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_mix)]
     mix: f32,
     /// Derive the dry/wet ratio per frame from the local noise floor.
     #[arg(long)]
@@ -148,10 +148,27 @@ struct LiveArgs {
     report: Option<PathBuf>,
 }
 
+/// `--mix` is a dry/wet ratio, so it has to be a real number in `0..=1`.
+///
+/// Out-of-range values do not fail loudly anywhere downstream: `mix = 1.5`
+/// silently means "pure wet", `-0.5` means "pure dry", and `NaN` falls through
+/// every comparison and produces a **silent** stream. Rejecting them here keeps
+/// the CLI honest about what it accepted.
+fn parse_mix(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("不是合法数字：{value}"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err(format!("dry/wet 比例必须在 0..=1 之间（收到 {value}）"));
+    }
+    Ok(parsed)
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ProbeArg {
     /// Inject -> HAL plugin ring -> virtual-mic capture. No microphone, no
-    /// room; safe to run unattended. Add the model lookahead for the total.
+    /// room; safe to run unattended. The model adds frame fill (0-block, 5 ms on
+    /// average at 10 ms frames) plus its two-frame lookahead on top of this.
     Digital,
     /// Physical speaker -> room -> physical microphone -> virtual microphone.
     /// This is the number the user actually feels.
@@ -558,4 +575,43 @@ fn cmd_diff(a: DiffArgs) -> Result<()> {
     println!("mean |diff|  : {:.6} LSB", sum_abs / n);
     println!("max  |diff|  : {:.1} LSB", worst);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_mix;
+    use crate::Cli;
+
+    /// `parse_mix` 本身对不代表接线还在：把两处 `#[arg]` 上的 value_parser 接线
+    /// 拿掉，函数与校验行都还在、`mix_accepts_...` 也照绿，但 `--mix 1.5` 又会静默
+    /// 塌成纯 wet。所以这里从 **CLI 解析层**断言（审查 round 2 的 B 号阳性对照）。
+    #[test]
+    fn cli_wires_the_mix_validator() {
+        use clap::Parser;
+        for args in [
+            vec!["vdev-mic-agent", "run", "x.wav", "--mix", "0.5"],
+            vec!["vdev-mic-agent", "live", "--mix", "0"],
+            vec!["vdev-mic-agent", "live", "--mix", "1"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?} 应当可解析");
+        }
+        for bad in ["1.5", "-0.1", "nan"] {
+            let args = vec!["vdev-mic-agent", "run", "x.wav", "--mix", bad];
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} 应当被 CLI 拒掉"
+            );
+        }
+    }
+
+    #[test]
+    fn mix_accepts_the_ratio_range_and_rejects_the_rest() {
+        for ok in ["0", "0.25", "1", "1.0"] {
+            assert!(parse_mix(ok).is_ok(), "{ok} 应当被接受");
+        }
+        // 越界值下游会静默塌成纯 dry/纯 wet，NaN 更会让整条流变成静音
+        for bad in ["nan", "inf", "-0.1", "1.5", "", "half"] {
+            assert!(parse_mix(bad).is_err(), "{bad} 应当被拒绝");
+        }
+    }
 }

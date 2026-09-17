@@ -466,6 +466,7 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
         engine_state_bytes: engine.as_ref().map(|e| e.state_bytes),
         adaptive: core.as_ref().map(|c| c.adaptive).unwrap_or(false),
         mix: mix_used,
+        dry_delay_samples: core.as_ref().map(|c| c.dry.delay()).unwrap_or(0),
         vdev: EndpointOut {
             id: vdev.info.id.clone(),
             name: vdev.info.name.clone(),
@@ -530,10 +531,9 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
                 interpretation: match cfg.probe {
                     Some(ProbeMode::Digital) => format!(
                         "inject -> driver loopback -> virtual-mic capture (includes the \
-                         ~{:.0} ms render queue). Add the model lookahead ({:.0} ms) for \
-                         the model's total.",
+                         ~{:.0} ms render queue). {}",
                         STREAM_BUFFER_HNS as f64 / 10_000.0,
-                        frame_ms * 2.0
+                        super::digital_model_cost_note(frame_ms)
                     ),
                     _ => "physical speaker -> room -> physical mic -> denoise -> virtual \
                           mic. End to end; already includes the model's delay line."
@@ -1115,8 +1115,10 @@ struct Core {
 impl Core {
     fn new(engine: &Engine, cfg: &LiveConfig, out_ring: Arc<SpscRing>) -> Result<Self> {
         let den = engine.denoiser()?;
-        let lag = engine.frame_size * 2; // RNNoise lookahead: 2 frames = 20 ms
         let adaptive = cfg.adaptive && cfg.probe.is_none();
+        // RNNoise's lookahead is 2 frames = 20 ms; `delay_line_len` decides
+        // whether this run owes it (pure bypass does not, the acoustic probe does).
+        let lag = super::delay_line_len(cfg, engine.frame_size);
         let mix = if cfg.probe == Some(ProbeMode::Acoustic) {
             // The acoustic probe puts a chirp through the whole chain; the model
             // would treat it as noise and gate it away. Bypassing the dry path
@@ -1607,6 +1609,9 @@ fn mix_out(fmt: &MixFormat) -> MixOut {
 #[derive(Debug, Serialize)]
 struct WinReport {
     mode: String,
+    /// Same meaning as the macOS report: 960 when the dry path is aligned to
+    /// the model's lookahead, 0 for a pure bypass (`--mix 0`).
+    dry_delay_samples: usize,
     seconds_requested: f64,
     sample_rate: u32,
     frame_samples: usize,
@@ -1656,7 +1661,8 @@ struct LatencyStatsOut {
     p95_ms: f64,
     max_ms: f64,
     stdev_ms: f64,
-    /// `digital`: add the model lookahead (20 ms) to get the model total.
+    /// `digital`: add the model's frame fill (0-10 ms) and its 20 ms lookahead
+    /// to get the model total.
     /// `acoustic`: already end to end, including the model's delay line.
     interpretation: String,
 }
@@ -1680,6 +1686,20 @@ fn print_report(r: &WinReport) {
             c.name, m.sample_rate, m.channels
         );
     }
+    let dry_delay_note = if r.frames == 0 {
+        // digital probe: no Core at all, so there is no dry path to talk about
+        "  -- n/a (this probe runs no model and no dry path)".to_string()
+    } else if r.dry_delay_samples == 0 {
+        "  -- no dry path to align (pure bypass or pure wet)".to_string()
+    } else {
+        "  -- dry path aligned to the model's lookahead".to_string()
+    };
+    println!(
+        "dry delay   : {} samples ({:.1} ms){}",
+        r.dry_delay_samples,
+        r.dry_delay_samples as f64 / 48.0,
+        dry_delay_note
+    );
     println!(
         "frames      : {}  ({:.3} s of audio)",
         r.frames, r.audio_seconds

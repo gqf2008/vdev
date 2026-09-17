@@ -276,9 +276,18 @@ comb filter. Measured on the +30 dB case:
 | 50/50 blend, **without** delay compensation | **−7.7 dB** |
 | model only, delay-compensated bypass path | 26.29 dB |
 
-So whenever `mix < 1` or the adaptive gate can back off, the dry path is delayed
-by the model lookahead first (`--lookahead-samples`, default 960). The real
-agent has to do the same on the injected stream.
+So whenever the dry signal can actually reach the blend (`0 < mix < 1`, or the adaptive
+gate, which can back off at any time), the dry path is delayed by the model lookahead
+first (`--lookahead-samples`, default 960). A **pure bypass (`--mix 0`) is not delayed**
+at all -- there is nothing to align it with. The real agent does the same on the
+injected stream, and reports the value it used as `dry_delay_samples` in the
+`live` JSON report (the human-readable report prints a `dry delay : N samples`
+line), so "is my bypass actually zero-latency?" is observable without a
+microphone.
+
+`--mix` is a ratio and is validated as one: values outside `0..=1`, and `NaN`
+(which used to fall through every comparison and produce a **silent** stream),
+are rejected by the CLI instead of being quietly reinterpreted as pure dry/wet.
 
 ### 2. The adaptive gate is what makes a clean mic *stay* clean
 
@@ -356,8 +365,9 @@ Four things a file-based harness could not answer, and where they live:
   `--probe digital` (inject → plugin ring → capture, no microphone and no room,
   safe to run in CI) and `--probe acoustic` (speaker → room → microphone →
   virtual mic, which is the number a participant feels). The difference between
-  the two is the capture chain, and the model's 20 ms is added to the digital
-  number, not to the acoustic one.
+  the two is the capture chain. The model's own cost (frame fill 0-10 ms, 5 ms on
+  average, plus 20 ms of lookahead) is added to the digital number, not to the
+  acoustic one -- which already runs through the delay line.
 
 **Status: both live paths are available.** The Windows backend (WASAPI polling +
 kernel loopback) was measured on a real Windows machine on 2026-09-14

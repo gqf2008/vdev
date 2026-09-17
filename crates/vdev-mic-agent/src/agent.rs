@@ -12,10 +12,11 @@
 //! RNNoise is causal but not zero-latency: its output is 2 frames (20 ms) behind
 //! its input. Blending the model output with the *undelayed* dry signal creates
 //! a comb filter -- measured SI-SDR collapses to -7.7 dB, i.e. far worse than
-//! either signal alone. So whenever `mix < 1` (or the adaptive mixer can back
-//! off) the dry path is delayed by exactly the model's lookahead before the
-//! blend. In the real agent the same thing has to happen on the injected
-//! stream.
+//! either signal alone. So whenever the dry signal can reach the blend
+//! (`0 < mix < 1`, or the adaptive mixer, which can back off at any time) the
+//! dry path is delayed by exactly the model's lookahead before the blend. A
+//! pure bypass (`mix == 0`) is never delayed -- there is nothing to align it
+//! with. In the real agent the same thing has to happen on the injected stream.
 
 use crate::mixer::AdaptiveMixer;
 use crate::proctime::cpu_seconds;
@@ -67,6 +68,18 @@ pub struct RunReport {
     pub timing: TimingStats,
 }
 
+/// Does the dry path have to be delayed to the model's lookahead?
+///
+/// Only when the dry signal can actually reach the blend: the adaptive mixer, or
+/// a genuine partial mix. A pure bypass (`mix == 0`) and a pure wet mix
+/// (`mix >= 1`) never blend, so delaying them by the model's 20 ms would charge
+/// latency for an alignment that never happens. This is the single source of
+/// truth for that rule -- the live paths (`platform/`) call it too, so the
+/// offline and live accounts cannot drift apart.
+pub fn needs_aligned_dry(mix: f32, adaptive: bool) -> bool {
+    adaptive || (mix > 0.0 && mix < 1.0)
+}
+
 pub struct RunOutcome {
     pub samples: Vec<f32>,
     pub report: RunReport,
@@ -83,7 +96,7 @@ pub fn process(input: &[f32], engine: &Engine, cfg: &RunConfig) -> Result<RunOut
     }
 
     // ---- dry path, delayed by the model lookahead ------------------------
-    let delay = if cfg.mix < 1.0 || cfg.adaptive {
+    let delay = if needs_aligned_dry(cfg.mix, cfg.adaptive) {
         cfg.lookahead_samples.min(input.len())
     } else {
         0
@@ -157,4 +170,22 @@ pub fn process(input: &[f32], engine: &Engine, cfg: &RunConfig) -> Result<RunOut
             timing: timing.finish(fs as f64 / crate::wavio::SR as f64 * 1000.0, wall, cpu),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_aligned_dry;
+
+    /// The dry path only needs the model's lookahead when it can actually be
+    /// blended; `--mix 0` used to pay 20 ms for nothing (see
+    /// `platform::tests::delay_line_is_only_paid_when_the_dry_path_can_reach_the_blend`).
+    #[test]
+    fn dry_alignment_is_only_owed_when_blending() {
+        assert!(!needs_aligned_dry(0.0, false), "pure bypass");
+        assert!(!needs_aligned_dry(1.0, false), "wet only");
+        assert!(!needs_aligned_dry(1.5, false), "wet only, clamped mix");
+        assert!(needs_aligned_dry(0.5, false), "partial mix");
+        assert!(needs_aligned_dry(0.0, true), "adaptive gate can reopen");
+        assert!(needs_aligned_dry(1.0, true), "adaptive gate");
+    }
 }

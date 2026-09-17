@@ -9,7 +9,7 @@
 //!   the wild, and it can change while running). RNNoise only accepts exactly
 //!   480 samples. So the boundary has to be crossed without losing, duplicating
 //!   or reordering a single sample -- `FrameAssembler`.
-//! * **The dry path needs a delay *line*, not a shifted copy.** `mix < 1` and
+//! * **The dry path needs a delay *line*, not a shifted copy.** A partial mix and
 //!   the adaptive gate both need the dry signal aligned to the model's 20 ms
 //!   lookahead; in a streaming pipeline that is 960 samples of history, which
 //!   has to be kept across callback boundaries -- `DelayLine`.
