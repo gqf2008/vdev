@@ -280,7 +280,14 @@ So whenever the dry signal can actually reach the blend (`0 < mix < 1`, or the a
 gate, which can back off at any time), the dry path is delayed by the model lookahead
 first (`--lookahead-samples`, default 960). A **pure bypass (`--mix 0`) is not delayed**
 at all -- there is nothing to align it with. The real agent does the same on the
-injected stream.
+injected stream, and reports the value it used as `dry_delay_samples` in the
+`live` JSON report (the human-readable report prints a `dry delay : N samples`
+line), so "is my bypass actually zero-latency?" is observable without a
+microphone.
+
+`--mix` is a ratio and is validated as one: values outside `0..=1`, and `NaN`
+(which used to fall through every comparison and produce a **silent** stream),
+are rejected by the CLI instead of being quietly reinterpreted as pure dry/wet.
 
 ### 2. The adaptive gate is what makes a clean mic *stay* clean
 
