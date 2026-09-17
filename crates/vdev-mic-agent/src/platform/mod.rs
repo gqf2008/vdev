@@ -57,6 +57,12 @@ pub struct LiveConfig {
     pub seconds: f64,
     /// `Some` switches the run into a latency probe instead of a live denoise.
     pub probe: Option<ProbeMode>,
+    /// Target IO buffer size in frames. The HAL owns
+    /// `kAudioDevicePropertyBufferFrameSize` for AudioServerPlugIn devices (the
+    /// plugin's own copy of that property is not consulted — measured), so a
+    /// client that wants low latency must set it here before starting IO.
+    /// 128 frames @48k = 2.67 ms per hop.
+    pub buffer_frames: u32,
     /// Marker cadence, in milliseconds.
     pub probe_interval_ms: u64,
     /// Also write what we injected, and what we captured, as WAVs.
@@ -76,6 +82,7 @@ impl Default for LiveConfig {
             input: None,
             seconds: 20.0,
             probe: None,
+            buffer_frames: 128,
             probe_interval_ms: 300,
             record_in: None,
             record_out: None,
