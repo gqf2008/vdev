@@ -72,6 +72,11 @@ require_grep 'needs: [windows-drivers, windows-tools, macos-tools]' .github/work
 require_grep '860d319b2e45e68c66b0d3eed680dd8c7a0887d4e1854c734202a20083ee56b7' .github/workflows/release.yml 'Windows 侧 librnnoise-0.dll 必须钉 DLL 哈希（包升级要红而不是静默换后端）'
 require_grep 'vdev-mic-agent.exe run probe.wav --mix 1' .github/workflows/release.yml 'Windows 侧必须用真二进制跑一次加载冒烟（staging 目录就是打包目录）'
 require_grep 'if ($stats.run.frames -le 0)' .github/workflows/release.yml 'Windows 侧加载冒烟必须断言真的处理了帧（不能只看退出码）'
+require_grep 'licenses/rnnoise-COPYING.txt' scripts/release/package-macos.sh 'BSD-3 要求二进制分发随附许可证：macOS 打包必须带上 rnnoise COPYING'
+require_grep 'librnnoise-LICENSE.txt' .github/workflows/release.yml 'Windows 包也必须随附 rnnoise LICENSE'
+require_grep 'find . -type f ! -name SHA256SUMS.txt' scripts/release/package-macos.sh 'macOS 包内要有一份逐文件 SHA256SUMS'
+require_grep 'BUILD_STAGE=$(mktemp -d' scripts/release/package-macos.sh '打包先在临时目录组装，失败不留半个包'
+require_grep 'librnnoise-LICENSE.txt' crates/vdev-mic-agent/THIRD_PARTY.md 'THIRD_PARTY 必须写明两个平台的许可证随包位置'
 
 # 数字探针的结论文案：模型成本 = 攒帧 + lookahead，两平台必须说同一件事，
 # 且必须走共享的 digital_model_cost_note（曾经的旧文案只提 20 ms lookahead，漏了攒帧）。

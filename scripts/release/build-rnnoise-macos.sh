@@ -57,7 +57,8 @@ GOT_TAG=$(cat model_version)
 }
 MODEL="rnnoise_data-${MODEL_TAG}.tar.gz"
 echo "== 下载模型（56 MiB，全量 sha256 校验）"
-curl -fsSL --retry 3 -o "${MODEL}" "https://media.xiph.org/rnnoise/models/${MODEL}"
+# --retry-all-errors + -C -：56 MiB 在弱网/镜像上会断，续传 + 重试一起上
+curl -fsSL --retry 5 --retry-all-errors -C - -o "${MODEL}" "https://media.xiph.org/rnnoise/models/${MODEL}"
 ACTUAL=$(shasum -a 256 "${MODEL}" | awk '{print $1}')
 [ "${ACTUAL}" = "${MODEL_SHA256}" ] || {
   echo "模型校验失败：期望 ${MODEL_SHA256}，实际 ${ACTUAL}" >&2
@@ -75,8 +76,10 @@ make -j"$(sysctl -n hw.ncpu)" >/dev/null
 mkdir -p "$(dirname "${OUT}")"
 cp -f .libs/librnnoise.0.dylib "${OUT}"
 chmod 755 "${OUT}"
+# BSD-3-Clause 第 2 条：二进制再分发必须随附版权声明与许可证原文，所以把上游 COPYING 一并带出
+cp -f COPYING "${OUT}.COPYING"
 
-echo "== 产物：${OUT}"
+echo "== 产物：${OUT}（附带 ${OUT}.COPYING）"
 shasum -a 256 "${OUT}"
 file "${OUT}"
 # 导出符号是 mic-agent 的硬依赖，缺一个就会在运行时才炸，所以这里直接断言

@@ -16,6 +16,11 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 cd "${REPO_ROOT}"
 
 [ -f "${DYNAMIC_LIB}" ] || { echo "找不到 dylib: ${DYNAMIC_LIB}" >&2; exit 1; }
+# 许可证是硬要求：BSD-3-Clause 要求二进制再分发随附版权声明，缺了就出不了包
+[ -f "${DYNAMIC_LIB}.COPYING" ] || {
+  echo "缺少 ${DYNAMIC_LIB}.COPYING（由 build-rnnoise-macos.sh 带出）——BSD-3 要求随包分发许可证原文" >&2
+  exit 1
+}
 TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 
 echo "== 构建 Rust 产物"
@@ -25,8 +30,11 @@ make -C crates/vdev-audio build
 
 echo "== 组装"
 STAGE="${OUT_DIR}/vdev-macos-${TAG}"
-if [ -d "${STAGE}" ]; then mv "${STAGE}" "/tmp/vdev-macos.stage.old.$$(date +%s)"; fi
-mkdir -p "${STAGE}/bin"
+mkdir -p "${OUT_DIR}"
+# 先在临时目录组装：中途失败时不会在 dist 里留下半个包
+BUILD_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vdev-macos-stage.XXXXXX")
+STAGE="${BUILD_STAGE}/vdev-macos-${TAG}"
+mkdir -p "${STAGE}/bin" "${STAGE}/licenses"
 cp "${TARGET_DIR}/release/vdev-mic-agent" "${STAGE}/bin/"
 cp "${TARGET_DIR}/release/vdev" "${STAGE}/bin/"
 cp "${TARGET_DIR}/release/vdev-audio-ctl" "${STAGE}/bin/"
@@ -35,6 +43,8 @@ cp "${DYNAMIC_LIB}" "${STAGE}/bin/librnnoise.dylib"
 chmod 755 "${STAGE}/bin/"*
 cp -R crates/vdev-audio/build/vdev-audio.driver "${STAGE}/"
 cp scripts/release/macos-README.md "${STAGE}/README.md"
+cp crates/vdev-mic-agent/THIRD_PARTY.md "${STAGE}/THIRD_PARTY.md"
+cp "${DYNAMIC_LIB}.COPYING" "${STAGE}/licenses/rnnoise-COPYING.txt"
 
 echo "== 冒烟 1：adhoc 签名要能自证"
 codesign --verify --strict "${STAGE}/vdev-audio.driver" || {
@@ -60,7 +70,16 @@ assert run["frames"] > 0, "mic-agent 没处理任何帧"
 print(f"   mic-agent 处理 {run['frames']} 帧，帧长 {run['frame_ms']} ms（dylib 从包内自动加载）")
 PY
 
+echo "== 包内校验和（zip 是运输层，包内这些文件的哈希也留一份）"
+( cd "${STAGE}" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS.txt )
+wc -l < "${STAGE}/SHA256SUMS.txt" | xargs echo "   包内 SHA256SUMS.txt 条目数:"
+
 echo "== 打包（COPYFILE_DISABLE 避免 ._ 资源叉）"
+# 组装成功才把 stage 落到 dist（失败 = 一行都不留）
+FINAL_STAGE="${OUT_DIR}/vdev-macos-${TAG}"
+if [ -d "${FINAL_STAGE}" ]; then mv "${FINAL_STAGE}" "/tmp/vdev-macos.stage.old.$$(date +%s)"; fi
+mv "${STAGE}" "${FINAL_STAGE}"
+STAGE="${FINAL_STAGE}"
 ZIP="${OUT_DIR}/vdev-macos-${TAG}.zip"
 [ -f "${ZIP}" ] && mv "${ZIP}" "/tmp/vdev-macos.zip.old.$$(date +%s)"
 ( cd "${OUT_DIR}" && COPYFILE_DISABLE=1 zip -qry "vdev-macos-${TAG}.zip" "vdev-macos-${TAG}" )

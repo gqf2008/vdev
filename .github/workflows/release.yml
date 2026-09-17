@@ -182,17 +182,37 @@ jobs:
           curl.exe -fsSL --retry 3 -o $pkg $pkgUrl
           $gotPkg = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
           if ($gotPkg -ne $pkgSha) { throw "MSYS2 包哈希不匹配：期望 $pkgSha，实际 $gotPkg" }
-          # MSYS2 自带 bsdtar（支持 zstd），不需要装 7-Zip/pacman
-          & C:\msys64\usr\bin\bsdtar.exe -xf $pkg -C $work
+          # 解包：MSYS2 把 bsdtar 拆成独立包（基础镜像不一定有），所以先试 bsdtar，
+          # 再退到镜像里存在的 zstd + Windows 自带 tar.exe。两条都失败就报清楚是哪一步缺工具。
+          $bsdtar = "C:\msys64\usr\bin\bsdtar.exe"
+          $unpacked = $false
+          if (Test-Path $bsdtar) {
+            & $bsdtar -xf $pkg -C $work
+            $unpacked = ($LASTEXITCODE -eq 0)
+          }
+          if (-not $unpacked) {
+            $zstd = (Get-Command zstd.exe -ErrorAction SilentlyContinue).Source
+            if (-not $zstd) { $zstd = "C:\ProgramData\chocolatey\bin\zstd.exe" }
+            if (-not (Test-Path $zstd)) { throw "既没有 $bsdtar 也没有 zstd：无法解开 MSYS2 包" }
+            $tarFile = Join-Path $work "rnnoise.pkg.tar"
+            & $zstd -d -f -q -o $tarFile $pkg
+            tar.exe -xf $tarFile -C $work
+            if ($LASTEXITCODE -ne 0) { throw "tar.exe 解包失败" }
+          }
           $dll = Join-Path $work "ucrt64/bin/librnnoise-0.dll"
           if (-not (Test-Path $dll)) { throw "包里没有 ucrt64/bin/librnnoise-0.dll" }
           $gotDll = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
           if ($gotDll -ne $dllSha) { throw "librnnoise-0.dll 哈希不匹配：期望 $dllSha，实际 $gotDll" }
+          # BSD-3-Clause：二进制再分发必须随附许可证原文
+          $lic = Join-Path $work "ucrt64/share/licenses/rnnoise/LICENSE"
+          if (-not (Test-Path $lic)) { throw "MSYS2 包里没有 share/licenses/rnnoise/LICENSE（许可证必须随包分发）" }
           $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item $dll (Join-Path $out "librnnoise-0.dll")
+          Copy-Item $lic (Join-Path $out "librnnoise-LICENSE.txt")
+          Copy-Item crates/vdev-mic-agent/THIRD_PARTY.md $out
           Copy-Item target/x86_64-pc-windows-msvc/release/vdev-mic-agent.exe $out
-          Write-Host "RNNoise 0.2-2 就绪：dll sha256=$gotDll"
+          Write-Host "RNNoise 0.2-2 就绪：dll sha256=$gotDll（含 LICENSE）"
       - name: mic-agent 加载冒烟（真跑二进制，不是探针）
         shell: pwsh
         run: |
@@ -300,11 +320,13 @@ jobs:
           - `vdev-display-win-*.zip` — IddCx UMDF 虚拟显示器驱动 + CLI
           - `vdev-tools-win-*.zip` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI、**AI 虚拟麦克风
             `vdev-mic-agent.exe` 及其降噪后端 `librnnoise-0.dll`**）
-          - `vdev-macos-*.zip` — macOS 命令行工具：**AI 虚拟麦克风 `vdev-mic-agent` + `librnnoise.dylib`**、
+          - `vdev-macos-*.zip` — macOS（**Apple Silicon / arm64**）命令行工具：**AI 虚拟麦克风 `vdev-mic-agent` + `librnnoise.dylib`**、
             CoreAudio HAL 虚拟声卡插件 `vdev-audio.driver`（含 `vdev-audio-ctl`）、宿主 CLI `vdev`
             （虚拟键鼠/虚拟屏/摄像头滤镜）。不含 `VDCamera.app`（需要 Apple 证书与 provisioning profile）。
 
           每个 Windows 包内若含 `vdev-test-signing.cer`，表示该包为**自签/测试签名**产物。
+          macOS 包内另有 `SHA256SUMS.txt`（逐文件哈希，比 Release 里那份只哈希 zip 的更细）；
+          本文件与各 zip 的哈希见下面 `SHA256SUMS.txt`。
           macOS 包内的 HAL 插件是 **adhoc 签名**（CI 没有 Developer ID）：macOS 26 的 coreaudiod 可能拒绝加载，
           请按包内 `README.md` 用你自己的证书重签后再安装。
 
@@ -314,6 +336,9 @@ jobs:
           |---|---|---|
           | macOS | xiph/rnnoise 源码构建，commit `70f1d256acd4b34a572f999a05c87bf00b67730d`（tag v0.2 在 arm64 编不过）；模型按 `model_version` 校验 | 模型 `0a8755f8e2d834eff6a54714ecc7d75f9932e845df35f8b59bc52a7cfe6e8b37` |
           | Windows | MSYS2 `mingw-w64-ucrt-x86_64-rnnoise-0.2-2-any.pkg.tar.zst`（上游 v0.2；只依赖 UCRT，无额外 DLL） | 包 `6892ed69c436e9d5f006df8b3fcf7efb2f57d556338db545eb8e2d6e55a820cf`，DLL `860d319b2e45e68c66b0d3eed680dd8c7a0887d4e1854c734202a20083ee56b7` |
+
+          许可证：RNNoise 为 **BSD-3-Clause**，两个平台的包都随附原文
+          （macOS `licenses/rnnoise-COPYING.txt` + `THIRD_PARTY.md`；Windows `librnnoise-LICENSE.txt` + `THIRD_PARTY.md`）。
 
           两平台版本不同源（macOS 跟的是已经跑过全部延迟/质量实测的那个 master commit，Windows 沿用 MSYS2 的 0.2），
           mic-agent 只用 `rnnoise_{get_frame_size,get_size,create,process_frame,destroy}` 这套稳定 C API，两侧都经过加载冒烟。

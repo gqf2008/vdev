@@ -30,9 +30,15 @@ read -r -p "install driver to /Library/Audio/Plug-Ins/HAL? [y/N] " y
 
 `librnnoise.dylib` 就在 `bin/` 里，mic-agent 会自己找到它（显式指定用 `--dll`）。
 
-## ⚠️ 签名：本包的 HAL 插件是 **adhoc 签名**
+## 架构
 
-CI 里没有 Developer ID 证书，所以 `vdev-audio.driver` 是 `codesign --sign -` 的 adhoc 产物。
+本包是 **Apple Silicon（arm64）** 构建，macOS 26+。Intel 机器请自行从源码构建。
+
+## ⚠️ 签名：CI 出的包是 **adhoc 签名**
+
+CI 里没有 Developer ID 证书，所以 `vdev-audio.driver` 是 `codesign --sign -` 的 adhoc 产物
+（**如果这包是你自己在带 Developer ID 的机器上跑 `scripts/release/package-macos.sh` 生成的，
+那它就是 Developer ID 签名，可以忽略下面这段**）。
 **macOS 26 的 coreaudiod 可能拒绝加载 adhoc 签名的 HAL 插件**（本仓库 Makefile 里也写了这条警告）。
 如果你有自己的证书，重签一次即可：
 
@@ -49,8 +55,9 @@ codesign --verify --strict --verbose=2 vdev-audio.driver
 ## 版本与来源
 
 - HAL 插件 / `vdev` / `vdev-mic-agent`：本仓库 tag 对应源码构建；
-- `librnnoise.dylib`：xiph/rnnoise 源码构建（包的 `SHA256SUMS.txt` 里有该 dylib 的哈希；
-  具体 commit 与模型哈希写在 Release 说明里）。
+- `librnnoise.dylib`：xiph/rnnoise 源码构建，commit 与模型哈希写在 `THIRD_PARTY.md` 与 Release 说明里；
+  它的 sha256 同时出现在**包内** `SHA256SUMS.txt` 与 Release 的 `SHA256SUMS.txt`（后者是各 zip 的）；
+- 许可证：RNNoise 为 BSD-3-Clause，原文见 `licenses/rnnoise-COPYING.txt`。
 
 已知限制：虚拟摄像头（`VDCamera.app`）不在本包；
 `vdev hid type` 的注入器 app 需要在有「辅助功能」权限的会话里首次准备。
