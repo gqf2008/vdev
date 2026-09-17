@@ -100,6 +100,25 @@ ZIP="${OUT_DIR}/vdev-macos-${TAG}.zip"
 if unzip -l "${ZIP}" | grep -q "__MACOSX\|/\._"; then
   echo "zip 里混进了 macOS 元数据（__MACOSX/._）" >&2; exit 1
 fi
+echo "== 冒烟 3：解包后的 zip 仍然能用（权限位/结构回归）"
+# 用户拿到的是 zip，不是 stage 目录：macOS 的 unzip / 归档工具会恢复 Unix 权限位，
+# 但只要哪天换成不认权限位的打包方式，这里必须红。
+# 注意：不能用 python zipfile 解包来验——它不还原权限位，会给出假的"不可执行"。
+VERIFY=$(mktemp -d "${TMPDIR:-/tmp}/vdev-macos-verify.XXXXXX")
+unzip -q "${ZIP}" -d "${VERIFY}"
+EXTRACTED="${VERIFY}/vdev-macos-${TAG}"
+for b in bin/vdev-mic-agent bin/vdev bin/vdev-audio-ctl; do
+  [ -x "${EXTRACTED}/${b}" ] || { echo "解包后 ${b} 不可执行（zip 丢了权限位）" >&2; exit 1; }
+done
+"${EXTRACTED}/bin/vdev-mic-agent" run "${TMP}/probe.wav" --mix 1 --out "${VERIFY}/out.wav" --stats "${VERIFY}/stats.json" >/dev/null
+python3 - "${VERIFY}/stats.json" <<'PY'
+import json, sys
+frames = json.load(open(sys.argv[1]))["run"]["frames"]
+assert frames > 0, "解包后的 mic-agent 没能处理音频"
+print(f"   解包后 mic-agent 仍可执行并处理 {frames} 帧")
+PY
+rm -rf "${VERIFY}"
+
 echo "== 产物：${ZIP}"
 unzip -l "${ZIP}" | tail -20
 shasum -a 256 "${ZIP}"

@@ -77,6 +77,7 @@ require_grep 'librnnoise-LICENSE.txt' .github/workflows/release.yml 'Windows 包
 require_grep 'find . -type f ! -name SHA256SUMS.txt' scripts/release/package-macos.sh 'macOS 包内要有一份逐文件 SHA256SUMS'
 require_grep 'BUILD_STAGE=$(mktemp -d' scripts/release/package-macos.sh '打包先在临时目录组装，失败不留半个包'
 require_grep 'librnnoise-LICENSE.txt' crates/vdev-mic-agent/THIRD_PARTY.md 'THIRD_PARTY 必须写明两个平台的许可证随包位置'
+require_grep '冒烟 3：解包后的 zip 仍然能用' scripts/release/package-macos.sh '打包后必须验证解包产物仍可执行（zip 权限位回归）'
 
 # 数字探针的结论文案：模型成本 = 攒帧 + lookahead，两平台必须说同一件事，
 # 且必须走共享的 digital_model_cost_note（曾经的旧文案只提 20 ms lookahead，漏了攒帧）。
