@@ -13,7 +13,7 @@
 //!   microphone's output stream, then watch the same device's *input* stream
 //!   (which the HAL plugin loops back) for that marker. This measures
 //!   `inject -> playback buffer -> plugin ring -> capture buffer -> consumer`:
-//!   the buffering the model's 20 ms lookahead has to be added to. It needs no
+//!   the buffering the model's frame fill + 20 ms lookahead have to be added to. It needs no
 //!   microphone and no quiet room, so it is the number CI can check.
 //! * **Acoustic probe** (`--probe acoustic`). Play a click out of the physical
 //!   speaker, let the physical microphone hear it, and watch for the marker in
