@@ -129,6 +129,11 @@ struct LiveArgs {
     /// Measure latency instead of denoising live.
     #[arg(long, value_enum)]
     probe: Option<ProbeArg>,
+    /// Target IO buffer size in frames, set on the vdev + capture device before
+    /// starting IO (the HAL owns this property for plug-in devices; the
+    /// plugin's own copy is never consulted). 128 @48k = 2.67 ms per hop.
+    #[arg(long, default_value_t = 128)]
+    buffer_frames: u32,
     /// Marker cadence for the probe, in milliseconds.
     #[arg(long, default_value_t = 300)]
     probe_interval_ms: u64,
@@ -251,6 +256,7 @@ fn cmd_live(a: LiveArgs) -> Result<()> {
         input: a.input,
         seconds: a.seconds,
         probe,
+        buffer_frames: a.buffer_frames,
         probe_interval_ms: a.probe_interval_ms,
         record_in: a.record_in,
         record_out: a.record_out,

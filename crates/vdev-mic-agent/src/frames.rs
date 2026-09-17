@@ -182,6 +182,21 @@ mod tests {
         assert_eq!(a.frames_out(), 10);
     }
 
+    /// `--buffer-frames 128` 之后设备按 128 帧回调，模型仍吃 480 帧：这条把
+    /// "128 帧设备块也不会丢/重/错序" 钉住（512 那条只覆盖历史默认值）。
+    #[test]
+    fn assembler_reblocks_128_frame_device_callback() {
+        let input = ramp(4800 + 77);
+        let mut a = FrameAssembler::new();
+        let mut got = Vec::new();
+        for chunk in input.chunks(128) {
+            a.push(chunk, |f| got.extend_from_slice(f));
+        }
+        assert_eq!(got, input[..4800].to_vec(), "128 帧块也必须是原样重排");
+        assert_eq!(a.pending(), 77);
+        assert_eq!(a.frames_out(), 10);
+    }
+
     /// Odd chunk sizes (1, 479, 481, 1000) must not lose or duplicate samples.
     #[test]
     fn assembler_survives_awkward_chunk_sizes() {

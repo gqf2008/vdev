@@ -92,6 +92,14 @@ mod ffi {
     pub const DEV_UID: u32 = 0x7569_6420; // 'uid '
     pub const DEV_NOMINAL_SR: u32 = 0x6e73_7274; // 'nsrt'
     pub const DEV_BUFFER_FRAMES: u32 = 0x6673_697a; // 'fsiz'
+    pub const DEV_BUFFER_FRAMES_RANGE: u32 = 0x6673_7a23; // 'fsz#'
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct AudioValueRange {
+        pub m_minimum: f64,
+        pub m_maximum: f64,
+    }
     pub const DEV_LATENCY: u32 = 0x6c74_6e63; // 'ltnc'
     pub const DEV_SAFETY_OFFSET: u32 = 0x7361_6674; // 'saft'
     pub const DEV_TRANSPORT: u32 = 0x7472_616e; // 'tran'
@@ -533,6 +541,44 @@ pub struct DeviceInfo {
     /// Sum of the device's own reported latency, in ms -- the datasheet number,
     /// useful only to compare against what the probe actually measures.
     pub reported_latency_ms: f64,
+}
+
+/// 在 `AudioDeviceStart` **之前**把设备的 IO 块长设成目标值，返回 (改前, 改后)。
+///
+/// 为什么必须由客户端设：HAL 对 AudioServerPlugIn 设备自己管
+/// `kAudioDevicePropertyBufferFrameSize`——插件侧那份属性在同名查询里**不算数**
+/// （实测宿主直接把设备设成 4096，读回来就是 4096，说明这一层由 HAL 维护）。
+/// 端到端延迟 ≈ 每段一个 IO 周期：vdev 设备默认 512 帧 @48k = 10.67ms/段，
+/// 「注入 → 插件 ring → 虚拟麦克风采集」3 段约 32ms（macOS 实测 p50 32.49ms），
+/// 而 AI 虚拟麦克风的验收线是 macOS < 20ms。设成 128 帧后每段 2.67ms。
+///
+/// 目标值会按设备自报的 range 夹紧；失败返回 None（保持设备原值，不猜）。
+fn set_buffer_frames(dev: AudioDeviceID, target: u32) -> Option<(u32, u32)> {
+    let before: u32 = get_prop(dev, &addr(DEV_BUFFER_FRAMES, SCOPE_GLOBAL))?;
+    let range: AudioValueRange = get_prop(dev, &addr(DEV_BUFFER_FRAMES_RANGE, SCOPE_GLOBAL))?;
+    let want = (f64::from(target)).clamp(range.m_minimum, range.m_maximum);
+    // range 是宿主给的浮点区间，落回 u32 是取整；极小值（<1 帧）无意义，兜到 1
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let want = if want < 1.0 { 1 } else { want as u32 };
+    if want == before {
+        return Some((before, before));
+    }
+    let a = addr(DEV_BUFFER_FRAMES, SCOPE_GLOBAL);
+    let rc = unsafe {
+        AudioObjectSetPropertyData(
+            dev,
+            &a,
+            0,
+            std::ptr::null(),
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::from_ref(&want).cast::<c_void>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let after: u32 = get_prop(dev, &addr(DEV_BUFFER_FRAMES, SCOPE_GLOBAL))?;
+    Some((before, after))
 }
 
 fn describe(dev: AudioDeviceID) -> DeviceInfo {
@@ -1793,6 +1839,27 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
         }
         _ => None,
     };
+
+    // ---- 低延迟：必须在 AudioDeviceStart 之前把块长设小 ---------------------
+    // 见 `set_buffer_frames`：HAL 自己管这个属性，客户端不设就按设备默认跑
+    // （vdev 设备 512 帧 = 10.67ms/段 ⇒ 三段端到端 ~32ms > 验收线 20ms）。
+    if let Some((before, after)) = set_buffer_frames(vdev, cfg.buffer_frames) {
+        if before != after {
+            println!(
+                "vdev 设备块长: {before} → {after} 帧（目标 {}）",
+                cfg.buffer_frames
+            );
+        } else {
+            println!("vdev 设备块长: {after} 帧（已是目标值或被 range 夹紧）");
+        }
+    }
+    if let Some((dev, _, _, _)) = &capture_io {
+        if let Some((before, after)) = set_buffer_frames(*dev, cfg.buffer_frames) {
+            if before != after {
+                println!("采集设备块长: {before} → {after} 帧");
+            }
+        }
+    }
 
     // ---- start everything -------------------------------------------------
     if let Some((dev, id, _, _)) = &capture_io {

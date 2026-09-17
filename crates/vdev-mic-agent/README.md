@@ -59,9 +59,30 @@ below). On any other host it prints why and exits, rather than pretending to run
 
 | platform | `run` / `bench` / `diff` | `live` + probes | status |
 |---|---|---|---|
-| macOS | ✅ | ✅ CoreAudio callbacks | live available |
+| macOS | ✅ | ✅ CoreAudio callbacks | **已真机实测（2026-09-17，macOS 26.5.2 / Apple Silicon）** |
 | Windows | ✅ | ✅ WASAPI polling + kernel loopback | **已真机实测（2026-09-14，Win10 19045 x64）** |
 | other | ✅ | ❌ prints why and exits | — |
+
+### macOS live 实测数字（2026-09-17，macOS 26.5.2 / Apple Silicon）
+
+`live --probe digital`（注入 → 插件 ring → 虚拟麦克风采集，不经麦克风/房间）：
+
+| 配置 | 结果 |
+|---|---|
+| 默认（设备块长 512，历史行为） | 67 次往返、0 rejected、ring 0 dropped / 0 starved；**latency min 21.54 / mean 30.89 / p50 32.49 / p95 32.65 / max 32.67 ms** |
+| `--buffer-frames 128`（本版新增） | 66 次往返、0 rejected、ring 0/0；**latency min 13.47 / mean 14.97 / p50 13.78 / p95 16.38 / max 16.45 ms** |
+
+**关键事实（踩过的坑）**：`kAudioDevicePropertyBufferFrameSize` 对 AudioServerPlugIn
+设备是 **HAL 自己维护**的——插件侧同名属性在这条查询路径上**不参与**（实测：宿主把设备设成
+4096，读回来就是 4096；改插件属性既不影响客户端可见值、也不影响实际 IO 周期）。所以低延迟
+只能由**客户端在 `AudioDeviceStart` 之前**显式设置，这正是 `--buffer-frames` 做的事
+（同时设在 vdev 设备与采集设备上，目标值按设备自报的 range 夹紧）。
+
+**延迟口径**：上表是**传输层**（探针绕开模型）。模型的算法 lookahead 是
+`AgentConfig::lookahead_samples = 960`（@48k = **20 ms**，见 `agent.rs`），所以
+**含模型的端到端总量 ≈ 13.78 + 20 ≈ 34 ms**，仍未达「macOS < 20ms」的验收线——
+下一步要么把 lookahead 降到 480 样本（≈24ms，仍差一点），要么换低 lookahead 模型
+（DFN2/GTCRN），或把验收口径明确为「传输层 < 20ms + 模型 lookahead 单列」。
 
 ### Windows live 实测数字（2026-09-14，Win10 19045 x64 + vdev-audio-win 0.3.9.0）
 
