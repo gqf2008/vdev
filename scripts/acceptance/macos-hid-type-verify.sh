@@ -19,7 +19,8 @@
 #   TYPED == 输入为准；tap_ok=true 时额外要求 tap_delta >= 字符数。
 set -u
 
-VDEV=${1:-target/release/vdev}
+# 默认产物路径跟着 CARGO_TARGET_DIR 走（本机把 target 重定向到仓库外时同样适用）
+VDEV=${1:-${CARGO_TARGET_DIR:-target}/release/vdev}
 if [ ! -x "${VDEV}" ]; then
   echo "FAIL: vdev 二进制不可执行：${VDEV}（先 cargo build -p vdev-host --release）"
   exit 2

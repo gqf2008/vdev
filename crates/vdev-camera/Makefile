@@ -10,8 +10,11 @@ all: install-rust
 
 # ============ 全 Rust 构建（推荐）：宿主 + 扩展都是 Rust，无 xcodebuild ============
 # 扩展：crates/vdev-camera-ext（手写 CMIOExtension objc2 绑定 + FrameChannel + 帧管线）
-RUST_APP_BIN := $(REPO_ROOT)/target/release/vdev-app
-RUST_EXT_BIN := $(REPO_ROOT)/target/release/vdev-camera-ext
+# 编译产物目录：优先用 CARGO_TARGET_DIR（本机把中间文件重定向到 /Volumes/DataExt/tmp 等
+# 仓库外目录时，这里必须跟着走，否则装机脚本会去仓库里找不存在的产物）
+TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(REPO_ROOT)/target)
+RUST_APP_BIN := $(TARGET_DIR)/release/vdev-app
+RUST_EXT_BIN := $(TARGET_DIR)/release/vdev-camera-ext
 ASSEMBLE := $(BUILD)/VDCamera.app
 EXT_IN_APP := $(ASSEMBLE)/Contents/Library/SystemExtensions/com.vdev.camera.host.extension.systemextension
 SIGN_APP_IDENTITY := "Apple Development: qingfeng gao (7L8FV63FAP)"
@@ -67,7 +70,7 @@ test: build-rust
 	@echo "== UI 接线（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --ui-selftest 2>&1 | grep ui-selftest
 	@echo "== 屏幕推流（安装版）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-screen --dur 3 2>&1 | tail -1
 	@echo "== 视频推流（dev 二进制；VDEV_TEST_VIDEO 指定视频）=="; \
-		$(REPO_ROOT)/target/release/vdev-app --selftest-video --file "$${VDEV_TEST_VIDEO:-/tmp/nonexistent.mp4}" --dur 3 2>&1 | tail -1
+		$(TARGET_DIR)/release/vdev-app --selftest-video --file "$${VDEV_TEST_VIDEO:-/tmp/nonexistent.mp4}" --dur 3 2>&1 | tail -1
 	@echo "== sysext（安装版，须在 /Applications）=="; /Applications/VDCamera.app/Contents/MacOS/vdev-camera --selftest-sysext 2>&1 | tail -1
 	@echo "测试完成（视频 0 帧 = 没设 VDEV_TEST_VIDEO 或路径不在沙盒可读范围，UI 走 NSOpenPanel 不受限）"
 
