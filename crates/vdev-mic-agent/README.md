@@ -276,9 +276,11 @@ comb filter. Measured on the +30 dB case:
 | 50/50 blend, **without** delay compensation | **−7.7 dB** |
 | model only, delay-compensated bypass path | 26.29 dB |
 
-So whenever `mix < 1` or the adaptive gate can back off, the dry path is delayed
-by the model lookahead first (`--lookahead-samples`, default 960). The real
-agent has to do the same on the injected stream.
+So whenever the dry signal can actually reach the blend (`0 < mix < 1`, or the adaptive
+gate, which can back off at any time), the dry path is delayed by the model lookahead
+first (`--lookahead-samples`, default 960). A **pure bypass (`--mix 0`) is not delayed**
+at all -- there is nothing to align it with. The real agent does the same on the
+injected stream.
 
 ### 2. The adaptive gate is what makes a clean mic *stay* clean
 

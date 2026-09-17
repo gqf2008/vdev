@@ -12,10 +12,11 @@
 //! RNNoise is causal but not zero-latency: its output is 2 frames (20 ms) behind
 //! its input. Blending the model output with the *undelayed* dry signal creates
 //! a comb filter -- measured SI-SDR collapses to -7.7 dB, i.e. far worse than
-//! either signal alone. So whenever `mix < 1` (or the adaptive mixer can back
-//! off) the dry path is delayed by exactly the model's lookahead before the
-//! blend. In the real agent the same thing has to happen on the injected
-//! stream.
+//! either signal alone. So whenever the dry signal can reach the blend
+//! (`0 < mix < 1`, or the adaptive mixer, which can back off at any time) the
+//! dry path is delayed by exactly the model's lookahead before the blend. A
+//! pure bypass (`mix == 0`) is never delayed -- there is nothing to align it
+//! with. In the real agent the same thing has to happen on the injected stream.
 
 use crate::mixer::AdaptiveMixer;
 use crate::proctime::cpu_seconds;
