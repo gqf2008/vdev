@@ -23,7 +23,8 @@ set -u
 # `--self-test` 可前置：它只跑"准备注入器 app"的行为自测，不需要 vdev / 探针 / 前台焦点
 SELF_TEST=0
 if [ "${1:-}" = "--self-test" ]; then SELF_TEST=1; shift; fi
-VDEV=${1:-target/release/vdev}
+# 默认产物路径跟着 CARGO_TARGET_DIR 走（本机把 target 重定向到仓库外时同样适用）
+VDEV=${1:-${CARGO_TARGET_DIR:-target}/release/vdev}
 if [ "${SELF_TEST}" = "0" ] && [ ! -x "${VDEV}" ]; then
   echo "FAIL: vdev 二进制不可执行：${VDEV}（先 cargo build -p vdev-host --release）"
   exit 2

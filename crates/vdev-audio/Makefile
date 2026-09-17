@@ -20,7 +20,7 @@ build:
 	cd $(REPO_ROOT) && cargo build -p vdev-audio --bin vdev-audio-ctl --release
 	@if [ -d $(BUILD) ]; then mv $(BUILD) /tmp/vdev-audio.build.old.$$(date +%s); fi
 	mkdir -p $(DRIVER)/Contents/MacOS
-	cp $(REPO_ROOT)/target/release/libvdev_audio.dylib $(BIN)
+	cp $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(REPO_ROOT)/target)/release/libvdev_audio.dylib $(BIN)
 	cp Info.plist $(DRIVER)/Contents/Info.plist
 	chmod 755 $(BIN)
 	@if security find-identity -v -p codesigning | grep -q 'Developer ID Application'; then \
@@ -28,7 +28,7 @@ build:
 	else \
 		codesign --force --sign - --identifier com.vdev.audio.driver $(DRIVER) && echo "WARN: 无 Developer ID，adhoc 签名（macOS 26 coreaudiod 可能拒绝加载）"; \
 	fi
-	@echo "built: $(DRIVER) + target/release/vdev-audio-ctl"
+	@echo "built: $(DRIVER) + $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(REPO_ROOT)/target)/release/vdev-audio-ctl"
 
 # ============ 安装：/Library/Audio/Plug-Ins/HAL + 重启 coreaudiod ============
 install: build
