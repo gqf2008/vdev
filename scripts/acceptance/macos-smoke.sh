@@ -74,4 +74,13 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 python3 scripts/check-docs.py
 
+# 行为级守卫：audio-denoise-metrics.py 现在是"降噪模型延迟"的唯一标尺，
+# 它自己算错（索引/归一化/边界）会让所有延迟结论一起错，所以标尺必须自带自测：
+# 造一个已知延迟的信号，回读必须等于它；峰值贴边界 / 相关太低 / 素材过短都要被拦下。
+if ! python3 scripts/acceptance/audio-denoise-metrics.py --self-test >/tmp/vdev-denoise-metrics-selftest.log 2>&1; then
+  echo "FAIL: 降噪延迟标尺自测未通过（lag 测量或可疑读数守卫回归）" >&2
+  cat /tmp/vdev-denoise-metrics-selftest.log >&2
+  exit 1
+fi
+
 echo "macos acceptance smoke: PASS"
