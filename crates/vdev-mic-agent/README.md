@@ -160,7 +160,7 @@ package (the archive's `third_party/FETCH.md` has the exact steps).
 | `FrameAssembler` 攒满一帧 | **0–10 ms，均值 5 ms** | `frames.rs`：模型只吃整帧（480 样本），而回调块是 128 样本 |
 | 模型算法延迟 | **20.00 ms**（RNNoise） | 下节：实测 + 源码 |
 
-**含模型总量 ≈ 13.78 + 5 + 20 ≈ 39 ms（均值）**，最差 ≈ 44 ms。
+**含模型总量 ≈ 13.78 + 5 + 20 ≈ 39 ms（均值）**。把攒帧按最差 10 ms 算是 ≈ 44 ms——注意这仍是**p50 传输层**；传输层本身取 p95（16.38 ms）还要再高约 2.6 ms。
 
 ### RNNoise 的 20 ms 在库内部，不是可调参数
 
@@ -205,9 +205,10 @@ package (the archive's `third_party/FETCH.md` has the exact steps).
 * **算力：口径不同，只能按数量级读**。这台机器是共享的（跑测期间 load 23–76），同一模型的 p50 在不同
   负载窗口里能漂 10 倍（DFN2 同一二进制 0.60 → 7.38 ms/hop），所以上表按各轨原口径列出、只做同窗口自比：
   RNNoise ≈0.4 ms/10 ms（load 76）；GTCRN 2.05 ms/16 ms（用 `process_time`，不受抢占影响）；
-  DFN2 家族 0.60–2.66 ms/10 ms。结论：**RNNoise 最省，GTCRN 与 DFN2_ll 同量级**（单核几个到十几个
-  百分点），都不是这条路线的瓶颈——要留预算的是 DFN2 在重负载下 p90 会越过 10 ms 块（需要 jitter buffer），
-  RNNoise / GTCRN 离块预算都还远。
+  DFN2 家族 0.60–2.66 ms/10 ms。结论：**RNNoise 最省，GTCRN 与 DFN2_ll 同量级**（单核几个到十几个百分点），
+  都远低于各自的块预算。
+  **预算比较一律只用 p50 / CPU 口径**：p90 在这台机器上是被抢占污染的量（RNNoise p95 14.5–22.4 ms、
+  GTCRN wall p90 66–80 ms 同样超块），拿它比模型成本只会得出"三个都不能用"的错误结论。
 * **DTLN 没进候选池**：512 样本窗 @16 kHz = 32 ms，比 RNNoise 还长，先验排除。
 
 ### 结论
