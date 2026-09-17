@@ -110,6 +110,28 @@ powershell -ExecutionPolicy Bypass -File scripts\acceptance\audio-ks-probe.ps1 -
 | mic-agent：完整降噪 20 s 实时 | 帧时 p50 **26.8 µs**、CPU **0.156 %**（单核） |
 | 直通 vs 降噪 A/B | **−5.8 → −34.1 dBFS** |
 
+## 降噪模型：算法延迟 / 质量 / 残余（macOS + Windows 通用）
+
+`audio-denoise-metrics.py` 是「模型到底给端到端加了多久」的唯一标尺——纯 WAV 工具，两个平台都能跑，需要 `numpy`：
+
+| 子命令 | 作用 |
+|---|---|
+| `lag <in.wav> <out.wav> [max_ms]` | 输入→输出延迟：在 `in` 最响的 2 s 上做**原始波形**归一化互相关。不用能量包络——包络被音节率抹平，只能给到 ±10 ms；原始波形的峰是尖的（偏移 5 ms 掉约 0.5 相关），能分辨单帧 |
+| `sisnr <clean.wav> <test.wav> [undo_lag_ms]` | SI-SDR（尺度不变，不会让「把音量调小」冒充降噪） |
+| `rms <wav> [start_s] [end_s]` | 分段 RMS（dBFS） |
+| `report <clean> <noisy> <denoised>` | 一次出齐：lag + SI-SDR 前后 + 残余电平 |
+
+```bash
+# RNNoise 基线：960 样本 = 20.00 ms（peak corr 0.99+）
+cargo build -p vdev-mic-agent --release
+target/release/vdev-mic-agent run clean48.wav --dll /path/to/librnnoise.dylib --mix 1 --out out.wav
+python3 scripts/acceptance/audio-denoise-metrics.py lag clean48.wav out.wav 200
+```
+
+**必须用流式（逐帧、带状态）实现测**：整段 `model(waveform)` 得到的是质量上限，不是这条链路的延迟。
+`--mix 1` 时 dry 完全不参与混音（`dry_delay_samples = 0`），测出来的 lag 就是模型自身的算法延迟；
+`--mix 0 --lookahead-samples 0` 是零延迟对照，用来证明测量链自己不加延迟（实测 lag 0 / corr 1.0000）。
+
 ## 文档体检
 
 ```powershell
