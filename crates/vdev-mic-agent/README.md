@@ -71,18 +71,29 @@ below). On any other host it prints why and exits, rather than pretending to run
 |---|---|
 | 默认（设备块长 512，历史行为） | 67 次往返、0 rejected、ring 0 dropped / 0 starved；**latency min 21.54 / mean 30.89 / p50 32.49 / p95 32.65 / max 32.67 ms** |
 | `--buffer-frames 128`（本版新增） | 66 次往返、0 rejected、ring 0/0；**latency min 13.47 / mean 14.97 / p50 13.78 / p95 16.38 / max 16.45 ms** |
+| `--buffer-frames 64`（2026-09-17 补测） | 66 次往返、0 rejected、ring 0/0；**latency min 12.21 / mean 12.34 / p50 12.32 / p95 12.41 / max 13.90 ms（sd 0.20）** |
+| `--buffer-frames 32`（同日，边界档） | 66 次往返、0 rejected、ring 0/0；**latency min 10.50 / mean 10.98 / p50 10.98 / p95 11.08 / max 11.09 ms（sd 0.07）** |
+
+**块长继续往下压的收益已经很小**：512 → 128 砍掉 18.7 ms，而 128 → 64 → 32 只再各砍 1.5 / 1.3 ms，
+说明这条路径上有一段**约 10.5 ms 的固定成本**（插件 ring + HAL 调度），不是块长决定的。
+32 帧（0.67 ms 一次回调）只是把边界量出来，默认仍用 128：再往下回调密度翻倍，
+换来的 2.8 ms 不值那个丢帧风险。
 
 **关键事实（踩过的坑）**：`kAudioDevicePropertyBufferFrameSize` 对 AudioServerPlugIn
 设备是 **HAL 自己维护**的——插件侧同名属性在这条查询路径上**不参与**（实测：宿主把设备设成
 4096，读回来就是 4096；改插件属性既不影响客户端可见值、也不影响实际 IO 周期）。所以低延迟
 只能由**客户端在 `AudioDeviceStart` 之前**显式设置，这正是 `--buffer-frames` 做的事
-（同时设在 vdev 设备与采集设备上，目标值按设备自报的 range 夹紧）。
+（同时设在 vdev 设备与采集设备上，目标值按客户端查到的 range 夹紧）。
 
-**延迟口径**：上表是**传输层**（探针绕开模型）。模型的算法 lookahead 是
-`AgentConfig::lookahead_samples = 960`（@48k = **20 ms**，见 `agent.rs`），所以
-**含模型的端到端总量 ≈ 13.78 + 20 ≈ 34 ms**，仍未达「macOS < 20ms」的验收线——
-下一步要么把 lookahead 降到 480 样本（≈24ms，仍差一点），要么换低 lookahead 模型
-（DFN2/GTCRN），或把验收口径明确为「传输层 < 20ms + 模型 lookahead 单列」。
+> 顺带一个反直觉的实测：插件自己实现的 `kAudioDevicePropertyBufferFrameSizeRange`
+> 回的是 `{512, 512}`（`crates/vdev-audio/src/props.rs`），但客户端经 coreaudiod 设
+> 32 / 64 / 128 **都能生效并原值读回**（见下表）——即夹紧用的是 HAL 侧报的区间，
+> 不是插件那对常量。别拿插件里那行 `{512,512}` 当"最低只能 512"的依据。
+
+**延迟口径**：上表是**传输层**（`--probe digital` 连模型引擎都不加载，见 `platform/macos.rs`
+的 `engine = None` 分支）。真实通话链路还要加两段，见下节的
+[模型给端到端加了多少](#模型给端到端加了多少实测口径)：攒帧 0–10 ms（均值 5 ms）
++ 模型算法延迟 20 ms，所以**含模型的端到端 ≈ 39 ms（均值）**，不是 34 ms。
 
 ### Windows live 实测数字（2026-09-14，Win10 19045 x64 + vdev-audio-win 0.3.9.0）
 
@@ -138,6 +149,82 @@ So `crates/vdev-mic-agent/third_party/native/` works from a workspace build, and
 the sibling tree works from the demo checkout. It is git-ignored: build it from
 [xiph/rnnoise](https://github.com/xiph/rnnoise) or take the MSYS2 `ucrt64`
 package (the archive's `third_party/FETCH.md` has the exact steps).
+
+## 模型给端到端加了多少（实测口径）
+
+端到端延迟有三个来源，只算一个就会得出乐观结论：
+
+| 段 | 值 | 依据 |
+|---|---|---|
+| 传输层：注入 → 插件 ring → 渲染 → 采集 | p50 **13.78 ms** | `live --probe digital`（上面那张表；该路径**不加载模型**，见 `platform/macos.rs` 的 `engine = None` 分支） |
+| `FrameAssembler` 攒满一帧 | **0–10 ms，均值 5 ms** | `frames.rs`：模型只吃整帧（480 样本），而回调块是 128 样本 |
+| 模型算法延迟 | **20.00 ms**（RNNoise） | 下节：实测 + 源码 |
+
+**含模型总量 ≈ 13.78 + 5 + 20 ≈ 39 ms（均值）**，最差 ≈ 44 ms。
+
+### RNNoise 的 20 ms 在库内部，不是可调参数
+
+实测（`scripts/acceptance/audio-denoise-metrics.py lag`，原始波形归一化互相关）：
+
+| 配置 | 实测 lag | 说明 |
+|---|---|---|
+| `--mix 1`（只要模型，dry 不参与混音） | **959–960 样本 = 20.00 ms**，peak corr 0.988 | 就是模型自身的算法延迟 |
+| `--mix 0 --lookahead-samples 0` | **0 样本**，corr 1.0000 | 对照：测量链本身零延迟 |
+
+源码同源（`xiph/rnnoise` `src/denoise.c`）：`rnn_analysis` 用 `analysis_mem` 做 **2 帧 50% 重叠**分析（占 1 帧），
+`rnn_process_frame` 又把增益作用在 `st->delayed_X`（**上一帧**的频谱）上（再 1 帧）——恒定 2 帧 = 20 ms。
+
+### 选型实测（同一段素材、同一把尺）
+
+素材：7.686 s TTS 语音 + 固定种子噪声（白噪声 / 粉噪声 / 50 Hz 及其谐波），混到 +10 / +5 / 0 dB SNR；
+纯噪声段单独量残余。指标全部出自 `scripts/acceptance/audio-denoise-metrics.py`，
+候选一律用**流式**（逐帧、带模型状态）实现跑——整段 `model(waveform)` 量的是质量上限，不是这条链路的延迟。
+
+「算法对齐延迟」只指**输入/输出样本的偏移**，别把它当成模型给端到端加的全部：
+真实实现还要先攒满一块（`0~块长`），两笔加起来才能和传输层相加。下表最后一列是能直接和 13.78 ms 相加的数：
+
+| 模型 | 算法对齐延迟 | 攒帧（0~块长） | 端到端均值 | SI-SDR 改善 @ +10/+5/0 dB | 纯噪声残余 | p50 单块（口径见注） | 采样率 / 依赖 |
+|---|---|---|---|---|---|---|---|
+| RNNoise（现役） | 960 样本 = **20.00 ms** | 0–10 ms（均值 5） | **≈ 38.8 ms** | +3.32 / +8.10 / +11.47 dB | −68.45 dBFS（**抑制 51.5 dB**） | 0.39 ms / 10 ms (wall, load 76) | 48 kHz / `librnnoise`（90 KB 模型，运行时 `dlopen`） |
+| GTCRN | **0 样本 = 0.00 ms** | 0–16 ms（均值 8） | **≈ 21.8 ms** | +7.60 / +9.56 / +11.56 dB | −51.04 dBFS（抑制 34.0 dB） | 2.05 ms / 16 ms (CPU time) | 16 kHz（需 48↔16 往返）/ onnxruntime |
+| DeepFilterNet2（论文默认） | 2400 样本 = **50.00 ms** | 0–10 ms（均值 5） | ≈ 68.8 ms | +6.70 / +9.09 / +11.66 dB | −62.36 dBFS（抑制 45.4 dB） | 0.60–2.66 ms / 10 ms (wall) | 48 kHz / Rust `tract-onnx` |
+| **DeepFilterNet2_ll**（低延迟变体） | 480 样本 = **10.00 ms** | 0–10 ms（均值 5） | **≈ 28.8 ms** | **+9.92 / +11.80 / +14.00 dB** | −61.68 dBFS（抑制 44.7 dB） | 0.86–2.08 ms / 10 ms (wall) | 48 kHz / Rust `tract-onnx` |
+| （附，非候选）DeepFilterNet3 | 1440 样本 = 30.00 ms | 0–10 ms（均值 5） | ≈ 48.8 ms | +10.76 / +12.82 / +15.02 dB | −62.85 dBFS（抑制 45.9 dB） | 2.5–4.6 ms / 10 ms (wall) | 48 kHz / Rust `tract-onnx` |
+
+几条影响结论的事实：
+
+* **`--mix 1` 的 lag 是模型自己的账**：GTCRN 实测 0（冲激/burst 探针峰值落在原位置、只喂一个 FFT 窗的
+  前缀仍然 lag 0、无模型的 stft→istft 自检 corr = 1.00000000）；DFN2_ll 实测 480 样本（= 20 ms 窗 / 50 %
+  重叠的**结构下限**：lookahead 归零后仍剩 1 跳），DFN2 默认 2400 样本（上游 v0.3.1 里 conv 2 帧与 df 2 帧
+  是**相加**，还有 `df_lookahead += 1` 的系数偏移补偿）；论文宣称 40 ms，运行时实测 50 ms，差的就是这一跳。
+* **外采样不是问题**：GTCRN 只吃 16 kHz，链路是 48 kHz，需要 48↔16 往返；实测
+  `ffmpeg -af aresample=16000,aresample=48000` 往返 **lag = 0 样本**（corr 0.9985）——重采样器把自己的
+  群延迟吸收了，不额外贡献对齐延迟（只留极小的 priming）。DFN2 家族本身就是 48 kHz，不需要重采样。
+* **GTCRN 不吃干净语音**：`clean16` 直通 SI-SDR **+41.46 dB**；RNNoise 连干净语音都要削一刀
+  （见下面"设计注记 2"：329 → 14.7 dB，听感发金属色）。
+* **算力：口径不同，只能按数量级读**。这台机器是共享的（跑测期间 load 23–76），同一模型的 p50 在不同
+  负载窗口里能漂 10 倍（DFN2 同一二进制 0.60 → 7.38 ms/hop），所以上表按各轨原口径列出、只做同窗口自比：
+  RNNoise ≈0.4 ms/10 ms（load 76）；GTCRN 2.05 ms/16 ms（用 `process_time`，不受抢占影响）；
+  DFN2 家族 0.60–2.66 ms/10 ms。结论：**RNNoise 最省，GTCRN 与 DFN2_ll 同量级**（单核几个到十几个
+  百分点），都不是这条路线的瓶颈——要留预算的是 DFN2 在重负载下 p90 会越过 10 ms 块（需要 jitter buffer），
+  RNNoise / GTCRN 离块预算都还远。
+* **DTLN 没进候选池**：512 样本窗 @16 kHz = 32 ms，比 RNNoise 还长，先验排除。
+
+### 结论
+
+1. **「端到端 < 20 ms」在这一类模型上做不到**，不是模型没选对：传输层固定约 10.5–13.8 ms，
+   再加攒帧均值 5–8 ms，已经吃掉 15–22 ms；而帧式/STFT 模型的**算法对齐延迟最小是 0**
+   （GTCRN），其余是 10 / 20 / 30 / 50 ms。就算对齐延迟为 0，均值也只有 21.8 ms。
+2. 建议口径（**待拍板**，walgit `ai-virtual-mic-10` / `low-latency-model-1`）：
+   **传输层 ≤ 20 ms（已达标：128 帧 13.78 ms，32 帧 10.98 ms）+ 模型延迟单列**，
+   端到端预算写 **≤ 40 ms（均值）**——三个候选里除了 DFN2 默认档（68.8 ms）都满足。
+3. 真要换模型，取舍是三条不同的路（都不解决"进不了 20 ms"）：
+   * **维持 RNNoise**：依赖最小（90 KB + `dlopen`）、CPU 最低（3.9 %）、末端抑制最强、全带宽 48 kHz；
+     代价是质量最弱（+10 dB SNR 只改善 3.32 dB）、端到端最慢（38.8 ms）。
+   * **换 GTCRN**：端到端最快（21.8 ms）、质量反超 RNNoise；代价是带宽降到 16 kHz、引入 onnxruntime
+     （Windows/MinGW 侧打包要单独评估）、多一级重采样。
+   * **换 DFN2_ll**：质量最好（+9.92 dB）、全带宽、无重采样；代价是 CPU 与 GTCRN 同量级但重负载下 p90 会超 10 ms 块预算（要配 jitter buffer）、
+     上游已把 DFN2 标 deprecated（要锁 v0.3.1 或自己维护）、`tract-onnx` 依赖树远大于 vendored librnnoise。
 
 ## Layout
 
