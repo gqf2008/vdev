@@ -1623,6 +1623,10 @@ fn build_speaker_unit(
 #[derive(Debug, Serialize)]
 struct RunReport {
     mode: String,
+    /// Dry-path delay in samples: 960 whenever the dry signal can reach the
+    /// blend, **0 for a pure bypass** (`--mix 0`) -- what the
+    /// `mic-agent-bypass-latency-1` fix made observable.
+    dry_delay_samples: usize,
     seconds_requested: f64,
     sample_rate: u32,
     frame_samples: usize,
@@ -1670,7 +1674,8 @@ struct LatencyStatsOut {
     p95_ms: f64,
     max_ms: f64,
     stdev_ms: f64,
-    /// `digital`: add the model lookahead (20 ms) to get the model total.
+    /// `digital`: add the model's frame fill (0-10 ms) and its 20 ms lookahead
+    /// to get the model total.
     /// `acoustic`: already end to end, including the model's delay line.
     interpretation: String,
 }
@@ -1980,6 +1985,7 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
         engine_state_bytes: engine.as_ref().map(|e| e.state_bytes),
         adaptive: core.map(|c| c.adaptive).unwrap_or(false),
         mix: core.map(|c| c.mix).unwrap_or(cfg.mix),
+        dry_delay_samples: core.map(|c| c.dry.delay()).unwrap_or(0),
         vdev: describe(vdev),
         capture: capture_dev.map(describe),
         speaker: speaker_dev.map(describe),
@@ -2025,12 +2031,8 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
                 stdev_ms: s.stdev_ms,
                 interpretation: match probe_mode {
                     Some(ProbeMode::Digital) => format!(
-                        "inject -> plugin ring -> virtual-mic capture. The model adds its \
-                         frame fill (0-{:.0} ms, {:.0} ms on average) plus {:.0} ms of \
-                         lookahead on top of this.",
-                        frame_ms,
-                        frame_ms / 2.0,
-                        frame_ms * 2.0
+                        "inject -> plugin ring -> virtual-mic capture. {}",
+                        super::digital_model_cost_note(frame_ms)
                     ),
                     _ => "physical speaker -> room -> physical mic -> denoise -> virtual mic. End to end; already includes the model's lookahead delay line.".into(),
                 },
@@ -2084,6 +2086,16 @@ fn print_report(r: &RunReport) {
         println!("              {}", l.interpretation);
     }
     if r.frames > 0 {
+        println!(
+            "dry delay   : {} samples ({:.1} ms){}",
+            r.dry_delay_samples,
+            r.dry_delay_samples as f64 / 48.0,
+            if r.dry_delay_samples == 0 {
+                "  -- pure bypass, nothing to align it with"
+            } else {
+                "  -- dry path aligned to the model's lookahead"
+            }
+        );
         println!(
             "frames      : {}  ({:.2} s of audio in {:.2} s wall)",
             r.frames, r.audio_seconds, r.wall_seconds

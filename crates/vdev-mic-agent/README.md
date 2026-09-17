@@ -358,8 +358,9 @@ Four things a file-based harness could not answer, and where they live:
   `--probe digital` (inject → plugin ring → capture, no microphone and no room,
   safe to run in CI) and `--probe acoustic` (speaker → room → microphone →
   virtual mic, which is the number a participant feels). The difference between
-  the two is the capture chain, and the model's 20 ms is added to the digital
-  number, not to the acoustic one.
+  the two is the capture chain. The model's own cost (frame fill 0-10 ms, 5 ms on
+  average, plus 20 ms of lookahead) is added to the digital number, not to the
+  acoustic one -- which already runs through the delay line.
 
 **Status: both live paths are available.** The Windows backend (WASAPI polling +
 kernel loopback) was measured on a real Windows machine on 2026-09-14

@@ -62,8 +62,8 @@ struct RunArgs {
     /// Path to librnnoise-0.dll / librnnoise.dylib.
     #[arg(long)]
     dll: Option<PathBuf>,
-    /// Fixed dry/wet ratio.
-    #[arg(long, default_value_t = 1.0)]
+    /// Fixed dry/wet ratio (0 = pure bypass, 1 = model only).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_mix)]
     mix: f32,
     /// Derive the dry/wet ratio per frame from the local noise floor.
     #[arg(long)]
@@ -117,8 +117,8 @@ struct LiveArgs {
     /// Path to librnnoise.dylib; defaults to the loader's own search path.
     #[arg(long)]
     dll: Option<PathBuf>,
-    /// Fixed dry/wet ratio (ignored when --adaptive).
-    #[arg(long, default_value_t = 1.0)]
+    /// Fixed dry/wet ratio (0 = pure bypass, 1 = model only; ignored when --adaptive).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_mix)]
     mix: f32,
     /// Derive the dry/wet ratio per frame from the local noise floor.
     #[arg(long)]
@@ -146,6 +146,22 @@ struct LiveArgs {
     /// Write the run report (device info + latency + per-frame timing) as JSON.
     #[arg(long)]
     report: Option<PathBuf>,
+}
+
+/// `--mix` is a dry/wet ratio, so it has to be a real number in `0..=1`.
+///
+/// Out-of-range values do not fail loudly anywhere downstream: `mix = 1.5`
+/// silently means "pure wet", `-0.5` means "pure dry", and `NaN` falls through
+/// every comparison and produces a **silent** stream. Rejecting them here keeps
+/// the CLI honest about what it accepted.
+fn parse_mix(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("不是合法数字：{value}"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err(format!("dry/wet 比例必须在 0..=1 之间（收到 {value}）"));
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -558,4 +574,20 @@ fn cmd_diff(a: DiffArgs) -> Result<()> {
     println!("mean |diff|  : {:.6} LSB", sum_abs / n);
     println!("max  |diff|  : {:.1} LSB", worst);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_mix;
+
+    #[test]
+    fn mix_accepts_the_ratio_range_and_rejects_the_rest() {
+        for ok in ["0", "0.25", "1", "1.0"] {
+            assert!(parse_mix(ok).is_ok(), "{ok} 应当被接受");
+        }
+        // 越界值下游会静默塌成纯 dry/纯 wet，NaN 更会让整条流变成静音
+        for bad in ["nan", "inf", "-0.1", "1.5", "", "half"] {
+            assert!(parse_mix(bad).is_err(), "{bad} 应当被拒绝");
+        }
+    }
 }

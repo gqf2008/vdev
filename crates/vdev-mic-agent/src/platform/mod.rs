@@ -73,6 +73,22 @@ pub struct LiveConfig {
     pub report: Option<PathBuf>,
 }
 
+/// The conclusion line a digital probe prints about the model's cost.
+///
+/// One function so macOS and Windows cannot drift, and so a unit test can pin
+/// the wording: the model adds **frame fill** (it needs a whole frame before it
+/// can emit anything) *plus* its lookahead -- not the lookahead alone. Leaving
+/// the fill out made users add 20 ms to the probe number when the real figure
+/// is ~25 ms on average.
+pub(crate) fn digital_model_cost_note(frame_ms: f64) -> String {
+    format!(
+        "The model adds its frame fill (0-{:.0} ms, {:.0} ms on average) plus {:.0} ms of lookahead on top of this.",
+        frame_ms,
+        frame_ms / 2.0,
+        frame_ms * 2.0
+    )
+}
+
 /// Length of the dry-path delay line for this run, in samples.
 ///
 /// The model's lookahead (RNNoise: 2 frames = 20 ms) only has to be paid when
@@ -136,6 +152,18 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The digital probe's conclusion line must keep saying "frame fill **plus**
+    /// lookahead": dropping the fill (the old wording) made the model look 5 ms
+    /// cheaper than it is.
+    #[test]
+    fn digital_note_counts_frame_fill_and_lookahead() {
+        let note = digital_model_cost_note(10.0);
+        assert!(note.contains("frame fill"), "{note}");
+        assert!(note.contains("0-10 ms"), "{note}");
+        assert!(note.contains("5 ms on average"), "{note}");
+        assert!(note.contains("20 ms of lookahead"), "{note}");
+    }
 
     fn cfg(mix: f32, adaptive: bool, probe: Option<ProbeMode>) -> LiveConfig {
         LiveConfig {
