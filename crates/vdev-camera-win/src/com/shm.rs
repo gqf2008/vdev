@@ -364,7 +364,7 @@ mod tests {
     /// 不得先回绕出一个"合法"字节数
     #[test]
     fn checked_frame_len_rejects_oversize_before_multiply() {
-        use super::{BPP, MAX_HEIGHT, MAX_WIDTH, checked_frame_len};
+        use super::{checked_frame_len, BPP, MAX_HEIGHT, MAX_WIDTH};
         // 合法上限帧
         assert_eq!(
             checked_frame_len(MAX_WIDTH, MAX_HEIGHT),
