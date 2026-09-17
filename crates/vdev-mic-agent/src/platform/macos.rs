@@ -2091,7 +2091,7 @@ fn print_report(r: &RunReport) {
             r.dry_delay_samples,
             r.dry_delay_samples as f64 / 48.0,
             if r.dry_delay_samples == 0 {
-                "  -- pure bypass, nothing to align it with"
+                "  -- no dry path to align (pure bypass or pure wet)"
             } else {
                 "  -- dry path aligned to the model's lookahead"
             }
