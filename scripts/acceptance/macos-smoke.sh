@@ -59,6 +59,20 @@ require_grep 'secure_input' crates/vdev-hid/src/lib.rs '注入路径必须报出
 require_grep 'let Some(pb) = acquire_pixel_buffer(w, h) else {' crates/vdev-camera-ext/src/main.rs 'send_bgra 必须走 acquire_pixel_buffer（像素池复用）'
 require_grep 'fn acquire_buffer_with<FP, FB, FD>' crates/vdev-camera-ext/src/main.rs '像素池必须有可注入的决策内核（复用/回落两条路径要能被单测钉住）'
 
+# 发布链路的守卫：这两个脚本只在发版时跑，坏了要等到打 tag 才发现——所以语法与关键钉子在这里钉住。
+bash -n scripts/release/build-rnnoise-macos.sh
+bash -n scripts/release/package-macos.sh
+require_grep 'MODEL_SHA256="0a8755f8e2d834eff6a54714ecc7d75f9932e845df35f8b59bc52a7cfe6e8b37"' scripts/release/build-rnnoise-macos.sh 'RNNoise 模型哈希必须钉死（上游 v0.2 的脚本不校验，我们自钉）'
+require_grep 'REF="${RNNOISE_REF:-70f1d256acd4b34a572f999a05c87bf00b67730d}"' scripts/release/build-rnnoise-macos.sh 'RNNoise 必须钉全量 commit（短 sha fetch 不到，且 master 与实测同源）'
+require_grep 'cp "${DYNAMIC_LIB}" "${STAGE}/bin/librnnoise.dylib"' scripts/release/package-macos.sh 'dylib 必须与 mic-agent 同目录（加载器只在可执行文件旁边找）'
+require_grep 'codesign --verify --strict "${STAGE}/vdev-audio.driver"' scripts/release/package-macos.sh 'HAL 插件出包前必须自证签名'
+require_grep 'if unzip -l "${ZIP}" | grep -q "__MACOSX\|/\._"' scripts/release/package-macos.sh 'zip 里不能混进 __MACOSX/._ 资源叉'
+require_grep 'macos-tools' .github/workflows/release.yml 'release.yml 必须把 macOS 产物并进发布 job'
+require_grep 'needs: [windows-drivers, windows-tools, macos-tools]' .github/workflows/release.yml 'publish 必须等 macOS job（否则资产会缺）'
+require_grep '860d319b2e45e68c66b0d3eed680dd8c7a0887d4e1854c734202a20083ee56b7' .github/workflows/release.yml 'Windows 侧 librnnoise-0.dll 必须钉 DLL 哈希（包升级要红而不是静默换后端）'
+require_grep 'vdev-mic-agent.exe run probe.wav --mix 1' .github/workflows/release.yml 'Windows 侧必须用真二进制跑一次加载冒烟（staging 目录就是打包目录）'
+require_grep 'if ($stats.run.frames -le 0)' .github/workflows/release.yml 'Windows 侧加载冒烟必须断言真的处理了帧（不能只看退出码）'
+
 # 数字探针的结论文案：模型成本 = 攒帧 + lookahead，两平台必须说同一件事，
 # 且必须走共享的 digital_model_cost_note（曾经的旧文案只提 20 ms lookahead，漏了攒帧）。
 require_grep 'super::digital_model_cost_note(frame_ms)' crates/vdev-mic-agent/src/platform/macos.rs '数字探针结论文案必须走共享的 digital_model_cost_note（攒帧 0-10ms + lookahead 20ms 都要说）'
