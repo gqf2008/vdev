@@ -253,6 +253,10 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
           Copy-Item crates/vdev-camera-win/target/x86_64-pc-windows-msvc/release/vdev-camera-win.exe $out
           Copy-Item crates/vdev-app-win/target/x86_64-pc-windows-msvc/release/vdev-app-win.exe $out
+          # 出包前的行为断言（不靠 grep）：许可证与降噪后端必须在 staging 里
+          foreach ($f in @("vdev-mic-agent.exe", "librnnoise-0.dll", "librnnoise-LICENSE.txt", "THIRD_PARTY.md")) {
+            if (-not (Test-Path (Join-Path $out $f))) { throw "出包前断言失败：$out 缺 $f" }
+          }
           Get-ChildItem $out | Select-Object Name, Length | Format-Table | Out-Host
           $tag = if ("${{ github.event.inputs.tag }}") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
           $zip = Join-Path $env:RUNNER_TEMP "vdev-tools-win-$tag.zip"
@@ -325,8 +329,8 @@ jobs:
             （虚拟键鼠/虚拟屏/摄像头滤镜）。不含 `VDCamera.app`（需要 Apple 证书与 provisioning profile）。
 
           每个 Windows 包内若含 `vdev-test-signing.cer`，表示该包为**自签/测试签名**产物。
-          macOS 包内另有 `SHA256SUMS.txt`（逐文件哈希，比 Release 里那份只哈希 zip 的更细）；
-          本文件与各 zip 的哈希见下面 `SHA256SUMS.txt`。
+          macOS 包内另有 `SHA256SUMS.txt`（逐文件哈希，比 Release 附件里那份只哈希 zip 的更细）；
+          各 zip 自身的 sha256 见 Release 附件 `SHA256SUMS.txt`。
           macOS 包内的 HAL 插件是 **adhoc 签名**（CI 没有 Developer ID）：macOS 26 的 coreaudiod 可能拒绝加载，
           请按包内 `README.md` 用你自己的证书重签后再安装。
 

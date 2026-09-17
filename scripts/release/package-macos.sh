@@ -31,8 +31,11 @@ make -C crates/vdev-audio build
 echo "== 组装"
 STAGE="${OUT_DIR}/vdev-macos-${TAG}"
 mkdir -p "${OUT_DIR}"
-# 先在临时目录组装：中途失败时不会在 dist 里留下半个包
+# 先在临时目录组装：中途失败时不会在 dist 里留下半个包；失败时把临时目录一起收走
 BUILD_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vdev-macos-stage.XXXXXX")
+SMOKE_TMP=""
+cleanup() { [ -n "${SMOKE_TMP}" ] && rm -rf "${SMOKE_TMP}"; rm -rf "${BUILD_STAGE}"; }
+trap cleanup EXIT
 STAGE="${BUILD_STAGE}/vdev-macos-${TAG}"
 mkdir -p "${STAGE}/bin" "${STAGE}/licenses"
 cp "${TARGET_DIR}/release/vdev-mic-agent" "${STAGE}/bin/"
@@ -46,13 +49,24 @@ cp scripts/release/macos-README.md "${STAGE}/README.md"
 cp crates/vdev-mic-agent/THIRD_PARTY.md "${STAGE}/THIRD_PARTY.md"
 cp "${DYNAMIC_LIB}.COPYING" "${STAGE}/licenses/rnnoise-COPYING.txt"
 
+# 合规与布局在**出包前**做行为断言（不靠 grep）：BSD-3 的许可证、第三方说明、
+# 以及"dylib 必须与 mic-agent 同目录"这三件事任一缺失都不许出包。
+for required in \
+  "${STAGE}/licenses/rnnoise-COPYING.txt" \
+  "${STAGE}/THIRD_PARTY.md" \
+  "${STAGE}/bin/librnnoise.dylib" \
+  "${STAGE}/bin/vdev-mic-agent" \
+  "${STAGE}/vdev-audio.driver/Contents/MacOS/vdev-audio"; do
+  [ -f "${required}" ] || { echo "出包前断言失败：缺 ${required}" >&2; exit 1; }
+done
+
 echo "== 冒烟 1：adhoc 签名要能自证"
 codesign --verify --strict "${STAGE}/vdev-audio.driver" || {
   echo "vdev-audio.driver 签名校验失败" >&2; exit 1; }
 
 echo "== 冒烟 2：包里的 mic-agent 要能找到包里的 dylib 并真的跑起来"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/vdev-macos-smoke.XXXXXX")
-trap 'rm -rf "${TMP}"' EXIT
+SMOKE_TMP="${TMP}"
 python3 - "${TMP}/probe.wav" <<'PY'
 import math, struct, sys, wave
 sr, secs = 48000, 1.0
