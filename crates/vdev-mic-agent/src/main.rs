@@ -167,7 +167,8 @@ fn parse_mix(value: &str) -> Result<f32, String> {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ProbeArg {
     /// Inject -> HAL plugin ring -> virtual-mic capture. No microphone, no
-    /// room; safe to run unattended. Add the model lookahead for the total.
+    /// room; safe to run unattended. The model adds frame fill (0-block, 5 ms on
+    /// average at 10 ms frames) plus its two-frame lookahead on top of this.
     Digital,
     /// Physical speaker -> room -> physical microphone -> virtual microphone.
     /// This is the number the user actually feels.
@@ -579,6 +580,29 @@ fn cmd_diff(a: DiffArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::parse_mix;
+    use crate::Cli;
+
+    /// `parse_mix` 本身对不代表接线还在：把两处 `#[arg]` 上的 value_parser 接线
+    /// 拿掉，函数与校验行都还在、`mix_accepts_...` 也照绿，但 `--mix 1.5` 又会静默
+    /// 塌成纯 wet。所以这里从 **CLI 解析层**断言（审查 round 2 的 B 号阳性对照）。
+    #[test]
+    fn cli_wires_the_mix_validator() {
+        use clap::Parser;
+        for args in [
+            vec!["vdev-mic-agent", "run", "x.wav", "--mix", "0.5"],
+            vec!["vdev-mic-agent", "live", "--mix", "0"],
+            vec!["vdev-mic-agent", "live", "--mix", "1"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?} 应当可解析");
+        }
+        for bad in ["1.5", "-0.1", "nan"] {
+            let args = vec!["vdev-mic-agent", "run", "x.wav", "--mix", bad];
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} 应当被 CLI 拒掉"
+            );
+        }
+    }
 
     #[test]
     fn mix_accepts_the_ratio_range_and_rejects_the_rest() {

@@ -1686,15 +1686,19 @@ fn print_report(r: &WinReport) {
             c.name, m.sample_rate, m.channels
         );
     }
+    let dry_delay_note = if r.frames == 0 {
+        // digital probe: no Core at all, so there is no dry path to talk about
+        "  -- n/a (this probe runs no model and no dry path)".to_string()
+    } else if r.dry_delay_samples == 0 {
+        "  -- no dry path to align (pure bypass or pure wet)".to_string()
+    } else {
+        "  -- dry path aligned to the model's lookahead".to_string()
+    };
     println!(
         "dry delay   : {} samples ({:.1} ms){}",
         r.dry_delay_samples,
         r.dry_delay_samples as f64 / 48.0,
-        if r.dry_delay_samples == 0 {
-            "  -- no dry path to align (pure bypass or pure wet)"
-        } else {
-            "  -- dry path aligned to the model's lookahead"
-        }
+        dry_delay_note
     );
     println!(
         "frames      : {}  ({:.3} s of audio)",

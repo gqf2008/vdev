@@ -64,6 +64,8 @@ require_grep 'fn acquire_buffer_with<FP, FB, FD>' crates/vdev-camera-ext/src/mai
 require_grep 'super::digital_model_cost_note(frame_ms)' crates/vdev-mic-agent/src/platform/macos.rs '数字探针结论文案必须走共享的 digital_model_cost_note（攒帧 0-10ms + lookahead 20ms 都要说）'
 require_grep 'super::digital_model_cost_note(frame_ms)' crates/vdev-mic-agent/src/platform/windows.rs '数字探针结论文案必须走共享的 digital_model_cost_note（Windows 同口径）'
 require_grep 'if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed)' crates/vdev-mic-agent/src/main.rs '--mix 必须校验 0..=1 且拒绝 NaN（下游会静默塌成纯 dry/纯 wet 或静音）'
+require_grep '#[arg(long, default_value_t = 1.0, value_parser = parse_mix)]' crates/vdev-mic-agent/src/main.rs '--mix 的校验函数必须真的接在 clap 参数上（只留函数体等于没校验；串要含 #[arg(...)] 全属性，否则注释里提一句就能骗过守卫）'
+require_grep 'plus its two-frame lookahead on top of this' crates/vdev-mic-agent/src/main.rs 'live --help 的 digital 说明必须同时提攒帧与 lookahead（用户可见的旧口径）'
 
 # 行为级守卫：#58 的修复是一段"有条件重写"的状态机，纯 grep 挡不住语义摘除
 # （把签名换成 --sign -、删掉复用条件、删掉写戳……）。用隔离临时目录直接跑它的

@@ -91,6 +91,12 @@ pub(crate) fn digital_model_cost_note(frame_ms: f64) -> String {
 
 /// Length of the dry-path delay line for this run, in samples.
 ///
+/// Note the two places "20 ms" lives: the live graph hardcodes the model's two
+/// frames here (`frame_size * 2`, because `Engine` owns the real frame size),
+/// while the offline harness exposes the same number as
+/// `--lookahead-samples` (default 960). Changing one without the other makes the
+/// live and measured accounts disagree.
+///
 /// The model's lookahead (RNNoise: 2 frames = 20 ms) only has to be paid when
 /// the dry signal can reach the blend -- see [`crate::agent::needs_aligned_dry`].
 /// The acoustic probe is the deliberate exception: it runs dry *with* the delay
