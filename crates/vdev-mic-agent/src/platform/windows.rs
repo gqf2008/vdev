@@ -530,9 +530,12 @@ pub fn run(cfg: LiveConfig) -> Result<()> {
                 interpretation: match cfg.probe {
                     Some(ProbeMode::Digital) => format!(
                         "inject -> driver loopback -> virtual-mic capture (includes the \
-                         ~{:.0} ms render queue). Add the model lookahead ({:.0} ms) for \
-                         the model's total.",
+                         ~{:.0} ms render queue). The model adds its frame fill \
+                         (0-{:.0} ms, {:.0} ms on average) plus {:.0} ms of lookahead on \
+                         top of this.",
                         STREAM_BUFFER_HNS as f64 / 10_000.0,
+                        frame_ms,
+                        frame_ms / 2.0,
                         frame_ms * 2.0
                     ),
                     _ => "physical speaker -> room -> physical mic -> denoise -> virtual \
@@ -1115,8 +1118,10 @@ struct Core {
 impl Core {
     fn new(engine: &Engine, cfg: &LiveConfig, out_ring: Arc<SpscRing>) -> Result<Self> {
         let den = engine.denoiser()?;
-        let lag = engine.frame_size * 2; // RNNoise lookahead: 2 frames = 20 ms
         let adaptive = cfg.adaptive && cfg.probe.is_none();
+        // RNNoise's lookahead is 2 frames = 20 ms; `delay_line_len` decides
+        // whether this run owes it (pure bypass does not, the acoustic probe does).
+        let lag = super::delay_line_len(cfg, engine.frame_size);
         let mix = if cfg.probe == Some(ProbeMode::Acoustic) {
             // The acoustic probe puts a chirp through the whole chain; the model
             // would treat it as noise and gate it away. Bypassing the dry path

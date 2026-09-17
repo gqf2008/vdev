@@ -32,7 +32,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeMode {
     /// Inject -> virtual-mic loopback -> capture. No microphone, no acoustics;
-    /// safe to run on CI. Add the model lookahead (20 ms) for the model total.
+    /// safe to run on CI. Add the model's frame fill (0-10 ms, 5 ms on average)
+    /// and its 20 ms lookahead for the model total.
     Digital,
     /// Physical speaker -> room -> physical microphone -> pipeline -> virtual
     /// microphone. This is the number the user feels.
@@ -70,6 +71,22 @@ pub struct LiveConfig {
     pub record_out: Option<PathBuf>,
     /// JSON report (device info + latency stats + per-frame timings).
     pub report: Option<PathBuf>,
+}
+
+/// Length of the dry-path delay line for this run, in samples.
+///
+/// The model's lookahead (RNNoise: 2 frames = 20 ms) only has to be paid when
+/// the dry signal can reach the blend -- see [`crate::agent::needs_aligned_dry`].
+/// The acoustic probe is the deliberate exception: it runs dry *with* the delay
+/// so its timing matches the real chain it is measuring.
+pub(crate) fn delay_line_len(cfg: &LiveConfig, frame_size: usize) -> usize {
+    let adaptive = cfg.adaptive && cfg.probe.is_none();
+    if crate::agent::needs_aligned_dry(cfg.mix, adaptive) || cfg.probe == Some(ProbeMode::Acoustic)
+    {
+        frame_size * 2
+    } else {
+        0
+    }
 }
 
 impl Default for LiveConfig {
@@ -113,5 +130,52 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
              (make -C crates/vdev-audio install) or on Windows with vdev-audio-win installed,\n\
              then re-run `live` / `probe` there."
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(mix: f32, adaptive: bool, probe: Option<ProbeMode>) -> LiveConfig {
+        LiveConfig {
+            mix,
+            adaptive,
+            probe,
+            ..Default::default()
+        }
+    }
+
+    /// `--mix 0` is documented as a pure bypass: it must not pay the model's
+    /// 20 ms for an alignment that never happens (vdev issue
+    /// `mic-agent-bypass-latency-1`). Everything that really blends keeps it.
+    #[test]
+    fn delay_line_is_only_paid_when_the_dry_path_can_reach_the_blend() {
+        assert_eq!(delay_line_len(&cfg(1.0, false, None), 480), 0, "wet only");
+        assert_eq!(
+            delay_line_len(&cfg(0.0, false, None), 480),
+            0,
+            "pure bypass"
+        );
+        assert_eq!(
+            delay_line_len(&cfg(0.5, false, None), 480),
+            960,
+            "partial mix"
+        );
+        assert_eq!(
+            delay_line_len(&cfg(0.0, true, None), 480),
+            960,
+            "adaptive gate"
+        );
+        // the acoustic probe keeps the delay on purpose: the marker has to travel
+        // the same timing the real chain has
+        assert_eq!(
+            delay_line_len(&cfg(0.0, false, Some(ProbeMode::Acoustic)), 480),
+            960
+        );
+        assert_eq!(
+            delay_line_len(&cfg(1.0, true, Some(ProbeMode::Acoustic)), 480),
+            960
+        );
     }
 }
