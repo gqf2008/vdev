@@ -166,14 +166,98 @@ jobs:
           Push-Location crates/vdev-app-win
           cargo build --release --target x86_64-pc-windows-msvc
           Pop-Location
+          # mic-agent 在根 workspace 里，Windows 上可直接构建（见 ci.yml 的 windows-user 矩阵）
+          cargo build --release --target x86_64-pc-windows-msvc -p vdev-mic-agent
+      - name: 取 RNNoise DLL（mic-agent 的降噪后端）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 钉死 MSYS2 包与包内 DLL 两个哈希：包升级 → 这里立刻红，而不是静默换掉降噪后端
+          $pkgUrl = "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-rnnoise-0.2-2-any.pkg.tar.zst"
+          $pkgSha = "6892ed69c436e9d5f006df8b3fcf7efb2f57d556338db545eb8e2d6e55a820cf"
+          $dllSha = "860d319b2e45e68c66b0d3eed680dd8c7a0887d4e1854c734202a20083ee56b7"
+          $work = Join-Path $env:RUNNER_TEMP "rnnoise"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $pkg = Join-Path $work "rnnoise.pkg.tar.zst"
+          curl.exe -fsSL --retry 3 -o $pkg $pkgUrl
+          $gotPkg = (Get-FileHash $pkg -Algorithm SHA256).Hash.ToLower()
+          if ($gotPkg -ne $pkgSha) { throw "MSYS2 包哈希不匹配：期望 $pkgSha，实际 $gotPkg" }
+          # 解包：MSYS2 把 bsdtar 拆成独立包（基础镜像不一定有），所以先试 bsdtar，
+          # 再退到镜像里存在的 zstd + Windows 自带 tar.exe。两条都失败就报清楚是哪一步缺工具。
+          $bsdtar = "C:\msys64\usr\bin\bsdtar.exe"
+          $unpacked = $false
+          if (Test-Path $bsdtar) {
+            & $bsdtar -xf $pkg -C $work
+            $unpacked = ($LASTEXITCODE -eq 0)
+          }
+          if (-not $unpacked) {
+            $zstd = (Get-Command zstd.exe -ErrorAction SilentlyContinue).Source
+            if (-not $zstd) { $zstd = "C:\ProgramData\chocolatey\bin\zstd.exe" }
+            if (-not (Test-Path $zstd)) { throw "既没有 $bsdtar 也没有 zstd：无法解开 MSYS2 包" }
+            $tarFile = Join-Path $work "rnnoise.pkg.tar"
+            & $zstd -d -f -q -o $tarFile $pkg
+            tar.exe -xf $tarFile -C $work
+            if ($LASTEXITCODE -ne 0) { throw "tar.exe 解包失败" }
+          }
+          $dll = Join-Path $work "ucrt64/bin/librnnoise-0.dll"
+          if (-not (Test-Path $dll)) { throw "包里没有 ucrt64/bin/librnnoise-0.dll" }
+          $gotDll = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          if ($gotDll -ne $dllSha) { throw "librnnoise-0.dll 哈希不匹配：期望 $dllSha，实际 $gotDll" }
+          # BSD-3-Clause：二进制再分发必须随附许可证原文
+          $lic = Join-Path $work "ucrt64/share/licenses/rnnoise/LICENSE"
+          if (-not (Test-Path $lic)) { throw "MSYS2 包里没有 share/licenses/rnnoise/LICENSE（许可证必须随包分发）" }
+          $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item $dll (Join-Path $out "librnnoise-0.dll")
+          Copy-Item $lic (Join-Path $out "librnnoise-LICENSE.txt")
+          Copy-Item crates/vdev-mic-agent/THIRD_PARTY.md $out
+          Copy-Item target/x86_64-pc-windows-msvc/release/vdev-mic-agent.exe $out
+          Write-Host "RNNoise 0.2-2 就绪：dll sha256=$gotDll（含 LICENSE）"
+      - name: mic-agent 加载冒烟（真跑二进制，不是探针）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 用真二进制 + 真 dylib/dll 跑一次降噪：mic-agent 运行时 dlopen "librnnoise-0.dll"，
+          # 而它只在"可执行文件旁边"找——staging 目录就是最终 zip 的内容，所以这步过了，
+          # "包里有 DLL 但用户跑不起来"这类问题就不可能出现。
+          $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
+          $sr = 48000; $secs = 1; $n = $sr * $secs
+          $pcm = New-Object byte[] ($n * 2)
+          for ($i = 0; $i -lt $n; $i++) {
+            $v = [int16](12000 * [Math]::Sin(2 * [Math]::PI * 220 * $i / $sr))
+            $pcm[2 * $i] = [byte]($v -band 0xFF)
+            $pcm[2 * $i + 1] = [byte](($v -shr 8) -band 0xFF)
+          }
+          $ms = New-Object System.IO.MemoryStream
+          $bw = New-Object System.IO.BinaryWriter($ms)
+          $bw.Write([char[]]"RIFF"); $bw.Write([int](36 + $pcm.Length)); $bw.Write([char[]]"WAVE")
+          $bw.Write([char[]]"fmt "); $bw.Write([int]16); $bw.Write([int16]1); $bw.Write([int16]1)
+          $bw.Write([int]$sr); $bw.Write([int]($sr * 2)); $bw.Write([int16]2); $bw.Write([int16]16)
+          $bw.Write([char[]]"data"); $bw.Write([int]$pcm.Length); $bw.Write($pcm); $bw.Flush()
+          [IO.File]::WriteAllBytes((Join-Path $out "probe.wav"), $ms.ToArray())
+          $bw.Dispose(); $ms.Dispose()
+          Push-Location $out
+          try {
+            .\vdev-mic-agent.exe run probe.wav --mix 1 --out out.wav --stats stats.json | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "mic-agent run 退出码 $LASTEXITCODE" }
+          } finally { Pop-Location }
+          $stats = Get-Content (Join-Path $out "stats.json") -Raw | ConvertFrom-Json
+          if ($stats.run.frames -le 0) { throw "mic-agent 没处理任何帧（dll 没被加载？）" }
+          Write-Host "mic-agent 处理 $($stats.run.frames) 帧，帧长 $($stats.run.frame_ms) ms（dll 从 exe 旁边自动加载）"
+          Remove-Item (Join-Path $out "probe.wav"), (Join-Path $out "out.wav"), (Join-Path $out "stats.json")
       - name: 组装 zip
         id: pack
         shell: pwsh
         run: |
+          # staging 目录已经在上面两步里放好 dll + mic-agent.exe（并冒烟过），这里只补其余工具
           $out = Join-Path $env:RUNNER_TEMP "vdev-tools-win"
-          New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item crates/vdev-camera-win/target/x86_64-pc-windows-msvc/release/vdev-camera-win.exe $out
           Copy-Item crates/vdev-app-win/target/x86_64-pc-windows-msvc/release/vdev-app-win.exe $out
+          # 出包前的行为断言（不靠 grep）：许可证与降噪后端必须在 staging 里
+          foreach ($f in @("vdev-mic-agent.exe", "librnnoise-0.dll", "librnnoise-LICENSE.txt", "THIRD_PARTY.md")) {
+            if (-not (Test-Path (Join-Path $out $f))) { throw "出包前断言失败：$out 缺 $f" }
+          }
+          Get-ChildItem $out | Select-Object Name, Length | Format-Table | Out-Host
           $tag = if ("${{ github.event.inputs.tag }}") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
           $zip = Join-Path $env:RUNNER_TEMP "vdev-tools-win-$tag.zip"
           Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip -Force
@@ -184,10 +268,36 @@ jobs:
           path: ${{ steps.pack.outputs.zip }}
           if-no-files-found: error
 
+  # ---------- macOS 用户态工具（免签名；HAL 插件只能 adhoc） ----------
+  macos-tools:
+    name: macOS 用户态工具
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: 构建 RNNoise（mic-agent 的降噪后端）
+        run: |
+          # 上游 tag v0.2 在 arm64 上编不过（vec_neon.h include 了不存在的 os_support.h），
+          # 所以钉 master 的 commit；模型哈希由脚本自己校验
+          brew list autoconf >/dev/null 2>&1 || brew install autoconf automake libtool
+          bash scripts/release/build-rnnoise-macos.sh "$RUNNER_TEMP/librnnoise.dylib"
+      - name: 组装 + 冒烟 + 打包
+        run: |
+          TAG="${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}"
+          bash scripts/release/package-macos.sh "$TAG" "$RUNNER_TEMP/librnnoise.dylib" "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdev-macos
+          path: ${{ runner.temp }}/dist/*.zip
+          if-no-files-found: error
+
   # ---------- 发布 ----------
   publish:
     name: 发布 Release
-    needs: [windows-drivers, windows-tools]
+    needs: [windows-drivers, windows-tools, macos-tools]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -212,9 +322,30 @@ jobs:
           - `vdev-hid-win-*.zip` — VHF 虚拟键鼠驱动（sys + INF + CAT）+ CLI
           - `vdev-audio-win-*.zip` — PortCls/WaveRT 虚拟声卡驱动 + CLI（inject/capture）
           - `vdev-display-win-*.zip` — IddCx UMDF 虚拟显示器驱动 + CLI
-          - `vdev-tools-win-*.zip` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI）
+          - `vdev-tools-win-*.zip` — 用户态工具（DirectShow 虚拟摄像头 CLI、宿主 GUI、**AI 虚拟麦克风
+            `vdev-mic-agent.exe` 及其降噪后端 `librnnoise-0.dll`**）
+          - `vdev-macos-*.zip` — macOS（**Apple Silicon / arm64**）命令行工具：**AI 虚拟麦克风 `vdev-mic-agent` + `librnnoise.dylib`**、
+            CoreAudio HAL 虚拟声卡插件 `vdev-audio.driver`（含 `vdev-audio-ctl`）、宿主 CLI `vdev`
+            （虚拟键鼠/虚拟屏/摄像头滤镜）。不含 `VDCamera.app`（需要 Apple 证书与 provisioning profile）。
 
-          每个包内若含 `vdev-test-signing.cer`，表示该包为**自签/测试签名**产物。
+          每个 Windows 包内若含 `vdev-test-signing.cer`，表示该包为**自签/测试签名**产物。
+          macOS 包内另有 `SHA256SUMS.txt`（逐文件哈希，比 Release 附件里那份只哈希 zip 的更细）；
+          各 zip 自身的 sha256 见 Release 附件 `SHA256SUMS.txt`。
+          macOS 包内的 HAL 插件是 **adhoc 签名**（CI 没有 Developer ID）：macOS 26 的 coreaudiod 可能拒绝加载，
+          请按包内 `README.md` 用你自己的证书重签后再安装。
+
+          ## 降噪后端（RNNoise）版本与来源
+
+          | 平台 | 来源 | 固定哈希 |
+          |---|---|---|
+          | macOS | xiph/rnnoise 源码构建，commit `70f1d256acd4b34a572f999a05c87bf00b67730d`（tag v0.2 在 arm64 编不过）；模型按 `model_version` 校验 | 模型 `0a8755f8e2d834eff6a54714ecc7d75f9932e845df35f8b59bc52a7cfe6e8b37` |
+          | Windows | MSYS2 `mingw-w64-ucrt-x86_64-rnnoise-0.2-2-any.pkg.tar.zst`（上游 v0.2；只依赖 UCRT，无额外 DLL） | 包 `6892ed69c436e9d5f006df8b3fcf7efb2f57d556338db545eb8e2d6e55a820cf`，DLL `860d319b2e45e68c66b0d3eed680dd8c7a0887d4e1854c734202a20083ee56b7` |
+
+          许可证：RNNoise 为 **BSD-3-Clause**，两个平台的包都随附原文
+          （macOS `licenses/rnnoise-COPYING.txt` + `THIRD_PARTY.md`；Windows `librnnoise-LICENSE.txt` + `THIRD_PARTY.md`）。
+
+          两平台版本不同源（macOS 跟的是已经跑过全部延迟/质量实测的那个 master commit，Windows 沿用 MSYS2 的 0.2），
+          mic-agent 只用 `rnnoise_{get_frame_size,get_size,create,process_frame,destroy}` 这套稳定 C API，两侧都经过加载冒烟。
 
           安装（测试签名模式，管理员 PowerShell）：
 

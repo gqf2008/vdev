@@ -199,7 +199,16 @@ git tag v0.3.9.0 && git push origin v0.3.9.0     # 触发 release.yml
 ```
 
 发布包（每个 zip 内含已签名的驱动 + INF + CAT + 对应 CLI，可能含 `vdev-test-signing.cer`）：
-`vdev-hid-win-*.zip`、`vdev-audio-win-*.zip`、`vdev-display-win-*.zip`、`vdev-tools-win-*.zip`。
+`vdev-hid-win-*.zip`、`vdev-audio-win-*.zip`、`vdev-display-win-*.zip`、`vdev-tools-win-*.zip`
+（tools 包里含 `vdev-mic-agent.exe` + 它的降噪后端 `librnnoise-0.dll`）。
+
+**macOS 包**：`vdev-macos-*.zip` —— `vdev-mic-agent`（+ 包内 `librnnoise.dylib`）、`vdev` 宿主 CLI、
+`vdev-audio-ctl`、以及 CoreAudio HAL 虚拟声卡插件 `vdev-audio.driver`。
+CI 里没有 Developer ID 证书，所以插件是 **adhoc 签名**，macOS 26 的 coreaudiod 可能拒绝加载；
+包内 `README.md` 写了用你自己的证书重签的命令。`VDCamera.app`（虚拟摄像头）**不在发布包里**：
+它需要 Apple Development 证书 + embedded provisioning profile（见 walgit 线程 `release-macos-camera-1`）。
+
+降噪后端 RNNoise 的来源与固定哈希写在每个 Release 的说明里（macOS 源码构建 / Windows 用 MSYS2 预编译包）。
 
 **两种签名模式**（同一套脚本，见 `scripts/sign-common.ps1`）：
 
@@ -207,6 +216,13 @@ git tag v0.3.9.0 && git push origin v0.3.9.0     # 触发 release.yml
 |---|---|---|
 | 测试签名（默认） | CI 现生成自签证书，公钥导出成包内 `vdev-test-signing.cer` | 目标机需 `certutil -addstore` 信任该证书 **且**开启 `bcdedit /set testsigning on` |
 | 官方签名 | 仓库 secrets `VDEV_SIGN_PFX_BASE64` + `VDEV_SIGN_PFX_PASSWORD`（EV / Azure Trusted Signing 证书） | 任意默认配置的 Windows——需先走微软 attestation/WHQL 提交流程把 `.cat` 交给微软重签 |
+
+**macOS 包本机复现**（与 CI 同一条路径；需要 `brew install autoconf automake libtool`）：
+
+```bash
+bash scripts/release/build-rnnoise-macos.sh /tmp/librnnoise.dylib   # 源码构建降噪后端（钉 commit + 校验模型哈希）
+bash scripts/release/package-macos.sh v0.0.0-dev.1 /tmp/librnnoise.dylib /tmp/dist   # 构建+组装+冒烟+打包
+```
 
 本地等价操作（不依赖 CI，也不依赖某个 worktree——任意检出都能跑）：
 
