@@ -5365,6 +5365,7 @@ dependencies = [
  "slint-build",
  "slint-pixel",
  "vdev-camera-win",
+ "vdev-dsp",
 ]
 
 [[package]]
@@ -5386,6 +5387,10 @@ dependencies = [
  "windows",
  "windows-core",
 ]
+
+[[package]]
+name = "vdev-dsp"
+version = "0.1.0"
 
 [[package]]
 name = "version_check"

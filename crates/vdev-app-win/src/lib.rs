@@ -1,4 +1,4 @@
-//! vdev-app-win 纯逻辑模块（无 Windows / Slint 依赖，可在 macOS 宿主单测）。
+//! vdev-app-win 纯逻辑模块（无 Windows / Slint 依赖，可在任何宿主单测）。
 //!
 //! 单独拆出 lib 目标的原因：bin（main.rs）依赖 vdev-camera-win（windows-rs
 //! API）与 slint，两者均无法在 macOS 宿主编译，宿主 `cargo test` 连 bin 都
@@ -28,6 +28,8 @@ pub fn next_push_action(running: bool) -> PushAction {
         PushAction::Start
     }
 }
+
+pub mod dsp_ui;
 
 #[cfg(test)]
 mod tests {

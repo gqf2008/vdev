@@ -1,7 +1,104 @@
 // vdev (Windows) — vdev 虚拟设备宿主（Rust + Slint + slint-pixel）
-// Tab 0：虚拟摄像头；Tab 1：虚拟显示器；Tab 2：虚拟声卡；Tab 3：虚拟键盘
-import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme } from "@slint_pixel";
+// Tab 0：虚拟摄像头；Tab 1：虚拟显示器；Tab 2：虚拟声卡；Tab 3：虚拟键盘；Tab 4：音频增强（DSP）
+import { PixelButton, PixelPanel, PixelText, PixelTitleBar, PixelTheme, PixelSwitch, PixelTextInput } from "@slint_pixel";
 import { ScrollView } from "std-widgets.slint";
+
+// ============ 音频增强：竖向像素推子（-12 .. +12 dB，0 dB 居中） ============
+// 纯 Slint 自绘，配色全部取自 PixelTheme，与 PixelPanel/PixelButton 同风格。
+component EqFader inherits Rectangle {
+    in-out property <float> value: 0.0;
+    in property <float> min: -12.0;
+    in property <float> max: 12.0;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    callback changed(value: float);
+
+    width: 44px;
+    height: 172px;
+
+    property <float> v: Math.max(root.min, Math.min(root.max, root.value));
+    property <float> span: Math.max(root.max - root.min, 0.001);
+    property <float> ratio: (root.v - root.min) / root.span;
+    property <length> track-y: 22px;
+    property <length> track-h: root.height - 48px;
+    property <length> knob-y: root.track-y + (root.track-h - 10px) * (1.0 - root.ratio) - 5px;
+    property <length> fill-h: Math.max(0.0, (root.knob-y + 5px - root.track-y - 2px) / 1px) * 1px;
+
+    // 顶部：当前增益数值
+    Text {
+        x: 0px; y: 0px; width: root.width; height: 20px;
+        text: (root.v > 0.05 ? "+" : "") + Math.round(root.v * 10.0) / 10.0;
+        color: root.enabled ? PixelTheme.text : PixelTheme.dim;
+        font-size: 11px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 轨道
+    Rectangle {
+        x: (root.width - 12px) / 2;
+        y: root.track-y;
+        width: 12px;
+        height: root.track-h;
+        background: PixelTheme.shadow;
+        Rectangle {
+            x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+            background: PixelTheme.panel;
+            border-width: 1px; border-color: PixelTheme.edge;
+        }
+        // 增益填充（自顶端向下到旋钮）
+        Rectangle {
+            x: 2px; y: 2px;
+            width: parent.width - 4px;
+            height: root.fill-h;
+            background: root.enabled ? PixelTheme.accent : PixelTheme.edge;
+        }
+        // 0 dB 中线
+        Rectangle {
+            x: 0px; y: 1px + (parent.height - 2px) * 0.5; width: parent.width; height: 2px;
+            background: PixelTheme.danger;
+        }
+    }
+
+    // 旋钮
+    Rectangle {
+        x: (root.width - 26px) / 2;
+        y: root.knob-y;
+        width: 26px; height: 12px;
+        background: fader-ta.pressed ? PixelTheme.shadow : PixelTheme.accent;
+        border-width: 2px; border-color: PixelTheme.edge;
+    }
+
+    fader-ta := TouchArea {
+        enabled: root.enabled;
+        pointer-event(ev) => {
+            if ev.button != PointerEventButton.left { return; }
+            if ev.kind == PointerEventKind.down {
+                root.set-value-from-y(self.mouse-y);
+            } else if ev.kind == PointerEventKind.move && self.pressed {
+                root.set-value-from-y(self.mouse-y);
+            }
+        }
+        mouse-cursor: pointer;
+    }
+
+    // 底部：频点标签
+    Text {
+        x: 0px; y: root.height - 22px; width: root.width; height: 22px;
+        text: root.label;
+        color: root.enabled ? PixelTheme.dim : PixelTheme.edge;
+        font-size: 10px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    function set-value-from-y(y: length) {
+        let t = Math.max(0.0, Math.min(1.0, (y - root.track-y) / Math.max(root.track-h, 1px)));
+        root.value = Math.max(root.min, Math.min(root.max, root.max - t * root.span));
+        root.changed(root.value);
+    }
+}
 
 export global AppState {
     // 摄像头
@@ -39,6 +136,20 @@ export global AppState {
     in-out property <bool> hid_can_install: true;
     in-out property <bool> hid_can_uninstall: false;
     in-out property <string> hid_key: "a";
+    // 音频增强（DSP）——全部参数都由 Rust 侧读走送进 vdev-dsp
+    in-out property <[float]> eq_gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    in property <[string]> eq_labels: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+    in-out property <bool> eq_bypass: false;
+    in property <string> dsp_curve_path: "";
+    in property <string> dsp_curve_note: "";
+    in-out property <bool> leveling_on: false;
+    in-out property <string> target_lufs: "-14";
+    in-out property <bool> limiter_on: false;
+    in-out property <string> ceiling_db: "-1";
+    in-out property <string> render_input: "";
+    in-out property <string> render_output: "";
+    in-out property <bool> render_busy: false;
+    in-out property <string> render_result: "尚未渲染。输入/选择一个 wav，点「渲染并测量」：整链渲染 → 写出 wav → 显示 RMS / 真峰值 / 伺服增益 / 耗时。";
     // 共享日志
     in-out property <string> log_text: "";
 }
@@ -76,6 +187,15 @@ export component MainWindow inherits Window {
     callback minimize();
     callback toggle-maximize();
     callback close-window();
+    // 音频增强（DSP）
+    callback dsp-eq-changed(int, float);
+    callback dsp-bypass-toggled();
+    callback dsp-zero-all();
+    callback dsp-leveling-toggled();
+    callback dsp-limiter-toggled();
+    callback dsp-pick-wav();
+    callback dsp-make-demo();
+    callback dsp-render();
 
     VerticalLayout {
         padding: 8px;
@@ -111,6 +231,11 @@ export component MainWindow inherits Window {
                 text: "虚拟键盘";
                 background: AppState.current_tab == 3 ? PixelTheme.accent : PixelTheme.bg;
                 clicked => { AppState.current_tab = 3; }
+            }
+            PixelButton {
+                text: "音频增强";
+                background: AppState.current_tab == 4 ? PixelTheme.accent : PixelTheme.bg;
+                clicked => { AppState.current_tab = 4; }
             }
         }
 
@@ -255,6 +380,188 @@ export component MainWindow inherits Window {
             }
         }
 
+        // ============ Tab 4: 音频增强（DSP） ============
+        // 直接驱动 crates/vdev-dsp：图示 EQ + 响度归一化 + 前瞻真峰值限幅。
+        if AppState.current_tab == 4 : ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+                PixelPanel {
+                    title: "图示 EQ · 10 段（-12 .. +12 dB）";
+                    VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: center;
+                            for g[i] in AppState.eq_gains : EqFader {
+                                value: g;
+                                label: i < AppState.eq_labels.length ? AppState.eq_labels[i] : "";
+                                enabled: !AppState.eq_bypass;
+                                changed(v) => { root.dsp-eq-changed(i, v); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelButton {
+                                text: AppState.eq_bypass ? "EQ 旁路：开" : "EQ 旁路：关";
+                                background: AppState.eq_bypass ? PixelTheme.accent : PixelTheme.bg;
+                                clicked => { root.dsp-bypass-toggled(); }
+                            }
+                            PixelButton {
+                                text: "全部归零";
+                                enabled: !AppState.eq_bypass;
+                                clicked => { root.dsp-zero-all(); }
+                            }
+                            PixelText {
+                                text: AppState.dsp_curve_note;
+                                font-size: 11px;
+                                color: PixelTheme.dim;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                PixelPanel {
+                    title: "实时频响曲线（vdev-dsp 真实系数）";
+                    VerticalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            width: 560px;
+                            height: 140px;
+                            background: PixelTheme.bg;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            // ±6 dB / 0 dB 参考线
+                            Rectangle { x: 2px; y: 36px; width: parent.width - 4px; height: 1px; background: PixelTheme.dim; }
+                            Rectangle { x: 2px; y: 70px; width: parent.width - 4px; height: 1px; background: PixelTheme.edge; }
+                            Rectangle { x: 2px; y: 104px; width: parent.width - 4px; height: 1px; background: PixelTheme.dim; }
+                            // 10 个频点刻度线（与 EQ 网格一一对应）
+                            for g[i] in AppState.eq_gains : Rectangle {
+                                x: 2px + (parent.width - 4px) * (i + 0.5) / 10.0;
+                                y: 2px;
+                                width: 1px;
+                                height: parent.height - 4px;
+                                background: PixelTheme.dim;
+                                opacity: 0.25;
+                            }
+                            Path {
+                                x: 2px;
+                                y: 2px;
+                                width: 556px;
+                                height: 136px;
+                                commands: AppState.dsp_curve_path;
+                                fill: transparent;
+                                stroke: PixelTheme.accent;
+                                stroke-width: 2px;
+                            }
+                        }
+                        PixelText {
+                            text: AppState.dsp_curve_note;
+                            font-size: 11px;
+                            color: PixelTheme.dim;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                PixelPanel {
+                    title: "响度归一化 · 真峰值限幅";
+                    VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelSwitch {
+                                checked <=> AppState.leveling_on;
+                                toggled => { root.dsp-leveling-toggled(); }
+                            }
+                            PixelText { text: "响度归一化（伺服自动增益）"; font-size: 12px; vertical-alignment: center; }
+                            PixelText { text: "目标 LUFS"; font-size: 12px; vertical-alignment: center; }
+                            PixelTextInput {
+                                text <=> AppState.target_lufs;
+                                width: 72px;
+                                placeholder: "-14";
+                            }
+                            PixelText { text: "(-30 .. -8)"; font-size: 11px; color: PixelTheme.dim; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelSwitch {
+                                checked <=> AppState.limiter_on;
+                                toggled => { root.dsp-limiter-toggled(); }
+                            }
+                            PixelText { text: "真峰值限幅（look-ahead）"; font-size: 12px; vertical-alignment: center; }
+                            PixelText { text: "ceiling dBFS"; font-size: 12px; vertical-alignment: center; }
+                            PixelTextInput {
+                                text <=> AppState.ceiling_db;
+                                width: 72px;
+                                placeholder: "-1";
+                            }
+                            PixelText { text: "(-6 .. 0)"; font-size: 11px; color: PixelTheme.dim; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                PixelPanel {
+                    title: "离线渲染（wav → 整链 → wav + 测量）";
+                    VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelText { text: "输入 wav"; font-size: 12px; vertical-alignment: center; }
+                            PixelTextInput {
+                                text <=> AppState.render_input;
+                                horizontal-stretch: 1;
+                                placeholder: "C:/path/to/input.wav";
+                            }
+                            PixelButton { text: "选择…"; clicked => { root.dsp-pick-wav(); } }
+                            PixelButton { text: "生成示例 wav"; enabled: !AppState.render_busy; clicked => { root.dsp-make-demo(); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelText { text: "输出 wav"; font-size: 12px; vertical-alignment: center; }
+                            PixelTextInput {
+                                text <=> AppState.render_output;
+                                horizontal-stretch: 1;
+                                placeholder: "留空 = 输入同目录 <名字>_dsp.wav";
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            PixelButton {
+                                text: AppState.render_busy ? "渲染中…" : "渲染并测量";
+                                enabled: !AppState.render_busy;
+                                clicked => { root.dsp-render(); }
+                            }
+                            PixelText {
+                                text: "改滑块/开关后再渲染，测量数字必须跟着变";
+                                font-size: 11px;
+                                color: PixelTheme.dim;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            height: 104px;
+                            background: PixelTheme.bg;
+                            border-width: 2px;
+                            border-color: PixelTheme.edge;
+                            Text {
+                                x: 6px; y: 4px;
+                                width: parent.width - 12px;
+                                height: parent.height - 8px;
+                                text: AppState.render_result;
+                                font-size: 11px;
+                                color: PixelTheme.text;
+                                wrap: word-wrap;
+                                vertical-alignment: top;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         ScrollView {
             height: 140px;
             Text {
@@ -265,5 +572,3 @@ export component MainWindow inherits Window {
         }
     }
 }
-
-
