@@ -5450,6 +5450,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vdev-dsp"
+version = "0.1.0"
+
+[[package]]
 name = "vdev-filter"
 version = "0.1.0"
 dependencies = [
