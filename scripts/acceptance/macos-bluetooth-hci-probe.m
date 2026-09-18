@@ -171,15 +171,15 @@ int main(int argc, const char *argv[]) {
         // 但**完全不写** out 参数（预置 0xABCD 后原样保留）。也就是说 rc 在这里
         // 不携带任何信息，只看 rc 会无条件打印"通路可用"。
         printf("\n--- 自检 A（反面例子）：BluetoothHCIReadVoiceSetting 只回成功、不写 out ---\n");
-        unsigned short vs = 0xABCD;                       // 投毒
-        int rc = [hc BluetoothHCIReadVoiceSetting:&vs];
+        unsigned short vsPoison = 0xABCD;                 // 投毒（**只用于自检 A**，不得流入命令参数）
+        int rc = [hc BluetoothHCIReadVoiceSetting:&vsPoison];
         printf("返回 %d (%s)   out=0x%04X（投毒值 0xABCD）\n",
-               rc, [describeIOReturn(rc) UTF8String], vs);
-        if (vs == 0xABCD) {
+               rc, [describeIOReturn(rc) UTF8String], vsPoison);
+        if (vsPoison == 0xABCD) {
             printf("→ 确认：out 未被改写。此命令**不能**作为 HCI 通路证明。\n");
         } else {
             printf("→ 本机行为与先前实测不同（out 被改写成 0x%04X），"
-                   "请重新评估下面的自检 B。\n", vs);
+                   "请重新评估下面的自检 B。\n", vsPoison);
         }
 
         // ---------- 探针自检 B（正面例子）：投毒后断言被真实数据覆盖 ----------
@@ -225,6 +225,13 @@ int main(int argc, const char *argv[]) {
         printf("地址字节: %02X %02X %02X %02X %02X %02X\n",
                da.data[0], da.data[1], da.data[2], da.data[3], da.data[4], da.data[5]);
 
+        // 命令参数用的 voice setting：**这是常量，不是从控制器读回来的**
+        // （自检 A 已证明 ReadVoiceSetting 不写 out，读不到真值）。
+        // 取值沿用归档前真实实验用的 0x0000，避免"投毒值混进实验输入"。
+        const unsigned short voiceSetting = 0x0000;
+        printf("命令用 voiceSetting=0x%04X（常量，非读回值）[%s]\n",
+               voiceSetting, [voiceSettingDesc(voiceSetting) UTF8String]);
+
         // ---------- 实验：Setup Synchronous Connection ----------
         for (NSNumber *ptNum in packetTypes) {
             unsigned short pt = (unsigned short)[ptNum unsignedIntValue];
@@ -234,13 +241,13 @@ int main(int argc, const char *argv[]) {
             printf("\n--- BluetoothHCISetupSynchronousConnection (packetType=0x%04X) ---\n", pt);
             printf("参数: handle=0x%04X txBW=8000 rxBW=8000 maxLatency=0xFFFF voiceSetting=0x%04X "
                    "retxEffort=0xFF packetType=0x%04X\n",
-                   handle, vs, pt);
+                   handle, voiceSetting, pt);
 
             rc = [hc BluetoothHCISetupSynchronousConnection:handle
                                          inTransmitBandwidth:8000
                                           inReceiveBandwidth:8000
                                                 inMaxLatency:0xFFFF
-                                              inVoiceSetting:vs
+                                              inVoiceSetting:voiceSetting
                                      inRetransmissionEffort:0xFF
                                                inPacketType:pt
                      outSynchronousConnectionCompleteResults:&res];
@@ -254,11 +261,14 @@ int main(int argc, const char *argv[]) {
                    res.airMode == 2 ? "CVSD" : (res.airMode == 0 ? "µ-law" :
                    (res.airMode == 1 ? "A-law" : "transparent")));
 
-            if (rc == 0 && res.connectionHandle != 0) {
+            if (rc == 0 && res.connectionHandle == 0) {
+                printf("❌ 返回 success 但 out.connectionHandle=0 → **假阳性**：命令没有真的执行"
+                       "（通常是句柄为 0 / 该私有方法未实现）。不能当成功。\n");
+            } else if (rc == 0 && res.connectionHandle != 0) {
                 printf("🎧✅ SCO/eSCO 链路建立成功！handle=0x%04X —— 链路层是通的，"
                        "缺的只是 macOS 的音频桥\n", res.connectionHandle);
             } else if (rc != 0 && (unsigned)rc >= 0xE0000000) {
-                printf("❌ 控制器/驱动层拒绝（%s）\n", [describeIOReturn(rc) UTF8String]);
+            printf("❌ 控制器/驱动层拒绝（%s）\n", [describeIOReturn(rc) UTF8String]);
             } else {
                 printf("❌ 失败，HCI 风格状态 %u (%s)\n", (unsigned)rc, [describeHCIError((uint8_t)rc) UTF8String]);
             }

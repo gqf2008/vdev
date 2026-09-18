@@ -458,11 +458,14 @@ static void dumpDevice(IOBluetoothDevice *d, BOOL verbose) {
             return;
         }
         self.transferAttempts++;
-        [self.hf transferAudioToComputer];
-        LOG(@"   → transferAudioToComputer 第 %d 次（void 无返回值；结果看紧随的 SCO 回调 #%d）"
-            @" | isSCOConnected=%d | audio=in%u/out%u",
-            self.transferAttempts, self.scoCallbackCount + 1, [self.hf isSCOConnected],
+        // 先打"即将发起"，再调用：`transferAudioToComputer` 在本机是**同步**触发
+        // `scoConnectionOpened:` 回调的，所以日志里紧随其后的 `[SCO 回调 #N]`
+        // 就是本次请求的结果。不要用 `回调计数 + 1` 去"预测"编号，那样会差 1。
+        LOG(@"   → 发起 transferAudioToComputer 第 %d 次（void 无返回值，结果见紧随的 [SCO 回调 #N]）"
+            @" | 本次调用前 isSCOConnected=%d | audio=in%u/out%u",
+            self.transferAttempts, [self.hf isSCOConnected],
             (unsigned)[self.dev inputAudioDeviceID], (unsigned)[self.dev outputAudioDeviceID]);
+        [self.hf transferAudioToComputer];
     }];
     [[NSRunLoop currentRunLoop] addTimer:self.transferTimer forMode:NSDefaultRunLoopMode];
 }
