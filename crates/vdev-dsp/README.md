@@ -24,6 +24,7 @@
 | `src/chain.rs` | 固定顺序链路：EQ → 响度归一化（内含限幅），统一的采样率/声道/段数传播与 `reset()` | 固定处理顺序由本 crate 定义 |
 | `src/lib.rs` | 公开 API 汇总、算法来源表、设计取舍表、lint 策略 | — |
 | `examples/offline_report.rs` | 离线对照工具：打印处理前后的近似响度（两种口径）与真峰值 | — |
+| `examples/bench_report.rs` | 性能与质量验收测量：整链/分模块吞吐、热路径零分配、限幅前瞻延迟、f64↔f32 精度差、30 s 白噪声与极端输入（stdout = 表格 + JSON） | — |
 
 ---
 
@@ -45,7 +46,11 @@
 * **旁路是逐位恒等**：全 0 增益走的是真正的单位系数（`b0=1`，其余全 0），
   而不是「近似恒等」；旁路与全 0 增益都断言 `assert_eq!`（严格相等）。
 * **脏数据防御**：任何输入（NaN / ±Inf / 1e30 / 超 Nyquist 的 `f0` / `Q=0`）都不产生
-  NaN/Inf、不 panic、不污染滤波器状态。这是本实现额外加的一层防御。
+  NaN/Inf、不 panic，**输出恒为有限值**。这是本实现额外加的一层防御。
+  **实测限度（如实记录）**：`NaN` 样点会污染图示 EQ 的双二阶状态——之后该链的输出
+  **恒为 0**（声音死掉，但输出仍然安全），必须 `Chain::reset()` 才能恢复；
+  `examples/bench_report.rs` 的「极端输入」段落把「新鲜链 / 脏数据后 / `reset()` 后」
+  三个输出峰值都打了出来。
 
 ---
 
@@ -88,7 +93,20 @@ cargo test    -p vdev-dsp
 cargo build   -p vdev-dsp --release
 ```
 
-四条命令在本机（Windows / rustc 1.97.1）均通过。测试覆盖：
+四条命令在本机（Windows / rustc 1.97.1）均通过（`cargo test` 共 56 个测试全绿：
+37 lib + 5 `chain_end_to_end` + 6 `eq_acceptance` + 7 `leveling_acceptance` + 1 doctest）。
+
+性能 / 质量测量（`examples/bench_report.rs`，零第三方依赖、不需要 nightly）：
+
+```text
+cargo run -p vdev-dsp --release --example bench_report
+```
+
+一条命令打出：整链各块长的吞吐（x realtime 与每样本 ns）、分模块每样本成本（含瓶颈）、
+自定义 `#[global_allocator]` 计数验证的**热路径零分配**、限幅前瞻引入的确定性延迟、
+f64 内部实现与自研 f32 参照的精度差、30 s 白噪声漂移与极端输入；末尾再给一段 JSON。
+计时方法：预热 → 每轮 ≥ 0.25 s、共 9 轮 → 取中位数与最小值（本机为共享桌面、未绑核，
+轮间离散可达 ±30%）。测试覆盖：
 
 * `src/**/tests`：单元级（系数、频响、门控、限幅核、联动、静音）。
 * `tests/eq_acceptance.rs`：旁路逐位恒等、+6 dB@1 kHz 实测约 2×（解析与时域双验证）、
