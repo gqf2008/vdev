@@ -16,9 +16,13 @@
 //   拿不到句柄就无法构造指向具体链路的 SCO 命令；且即便建起来也没有音频桥，
 //   故这条路不再投入。
 //
-// 行为：只发一条只读命令（Read Voice Setting）+ 若干 Setup Synchronous Connection。
+// 行为：只读命令若干（自检 A 的 Read Voice Setting、自检 B 的 Read Local Name）
+//       + 若干 Setup Synchronous Connection。
 //       不做持久改动；若句柄为 0，Setup 会返回 success 却什么都不做（假阳性，
 //       本工具以 out.connectionHandle != 0 作为真正的成功判据）。
+//       **自检 A 本身就是一条假阳性的反面教材**：`Read Voice Setting` 返回 success
+//       却不写 out 参数，只看返回码会无条件"通过"；所以通路证明改用自检 B 的
+//       投毒-断言写法（先往缓冲区填 0xAA，再断言被真实数据覆盖）。
 //
 // 构建：见同目录 macos-bluetooth-role-probe.sh
 //
@@ -35,6 +39,7 @@
 @interface IOBluetoothHostController (PrivateHCI)
 - (unsigned int)classOfDevice;
 - (int)BluetoothHCIReadVoiceSetting:(unsigned short *)arg1;
+- (int)BluetoothHCIReadLocalName:(unsigned char [256])arg1;
 - (int)BluetoothHCIWriteVoiceSetting:(unsigned short)arg1;
 - (int)BluetoothHCISetupSynchronousConnection:(unsigned short)arg1
                            inTransmitBandwidth:(unsigned int)arg2
@@ -161,22 +166,44 @@ int main(int argc, const char *argv[]) {
         printf("控制器 : %s  (%s)\n", [[hc nameAsString] UTF8String], [[hc addressAsString] UTF8String]);
         printf("powerState=%d  classOfDevice=0x%08X\n", [hc powerState], [hc classOfDevice]);
 
-        // ---------- 阳性对照：纯读，证明 HCI 通路可用 ----------
-        printf("\n--- 阳性对照：BluetoothHCIReadVoiceSetting（只读） ---\n");
-        if (![hc respondsToSelector:@selector(BluetoothHCIReadVoiceSetting:)]) {
+        // ---------- 探针自检 A（反面例子）：只看返回码会得到假阳性 ----------
+        // 实测 macOS 26.5.2：`BluetoothHCIReadVoiceSetting:` 返回 kIOReturnSuccess，
+        // 但**完全不写** out 参数（预置 0xABCD 后原样保留）。也就是说 rc 在这里
+        // 不携带任何信息，只看 rc 会无条件打印"通路可用"。
+        printf("\n--- 自检 A（反面例子）：BluetoothHCIReadVoiceSetting 只回成功、不写 out ---\n");
+        unsigned short vs = 0xABCD;                       // 投毒
+        int rc = [hc BluetoothHCIReadVoiceSetting:&vs];
+        printf("返回 %d (%s)   out=0x%04X（投毒值 0xABCD）\n",
+               rc, [describeIOReturn(rc) UTF8String], vs);
+        if (vs == 0xABCD) {
+            printf("→ 确认：out 未被改写。此命令**不能**作为 HCI 通路证明。\n");
+        } else {
+            printf("→ 本机行为与先前实测不同（out 被改写成 0x%04X），"
+                   "请重新评估下面的自检 B。\n", vs);
+        }
+
+        // ---------- 探针自检 B（正面例子）：投毒后断言被真实数据覆盖 ----------
+        printf("\n--- 自检 B（正面例子）：BluetoothHCIReadLocalName 真的写回 ---\n");
+        if (![hc respondsToSelector:@selector(BluetoothHCIReadLocalName:)]) {
             printf("❌ 私有方法不存在，这条路走不通\n");
             return 3;
         }
-        unsigned short vs = 0;
-        int rc = [hc BluetoothHCIReadVoiceSetting:&vs];
-        printf("返回 %d (%s)", rc, [describeIOReturn(rc) UTF8String]);
-        if (rc == 0) {
-            printf("   voiceSetting=0x%04X  [%s]\n", vs, [voiceSettingDesc(vs) UTF8String]);
-            printf("✅ HCI 通路可用（这就是阳性对照；没有它，后面的失败无法解释）\n");
-        } else {
-            printf("\n⚠️ 读都失败了——说明用户态 HCI 通路本身不通，后面无需再试\n");
+        unsigned char nameBuf[256];
+        memset(nameBuf, 0xAA, sizeof(nameBuf));            // 投毒
+        rc = [hc BluetoothHCIReadLocalName:nameBuf];
+        printf("返回 %d (%s)   name=\"%.64s\"\n",
+               rc, [describeIOReturn(rc) UTF8String], (const char *)nameBuf);
+        if (rc != 0) {
+            printf("⚠️ 读失败——说明用户态 HCI 通路本身不通，后面无需再试\n");
             return 4;
         }
+        if (nameBuf[0] == 0xAA) {
+            printf("❌ 返回 success 但缓冲区仍是投毒值：这条命令也没写回，"
+                   "**不能**作为通路证明。\n");
+            return 4;
+        }
+        printf("✅ HCI 通路可用：缓冲区被真实数据覆盖（投毒值 0xAA 已不存在）。"
+               "没有这条对照，后面的失败无法解释。\n");
 
         // ---------- 目标设备 + 连接句柄 ----------
         IOBluetoothDevice *dev = [IOBluetoothDevice deviceWithAddressString:addrStr];

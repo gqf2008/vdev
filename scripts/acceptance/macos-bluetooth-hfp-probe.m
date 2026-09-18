@@ -299,6 +299,7 @@ static void dumpDevice(IOBluetoothDevice *d, BOOL verbose) {
 @property (assign) BOOL didRequestSCO;
 @property (strong) NSTimer *transferTimer; // 通话期间反复尝试把音频转到 Mac
 @property (assign) int transferAttempts;
+@property (assign) int scoCallbackCount;   // SCO 回调计数（证据可复核：与重试序号成对出现）
 @end
 
 @implementation Probe
@@ -412,10 +413,13 @@ static void dumpDevice(IOBluetoothDevice *d, BOOL verbose) {
 }
 - (void)handsFree:(IOBluetoothHandsFree *)device scoConnectionOpened:(NSNumber *)status {
     int s = [status intValue];
+    self.scoCallbackCount++;
     if (s == 0) {
-        LOG(@"🎧 SCO 语音链路已建立（status=0）← 通话音频应开始流向 Mac");
+        LOG(@"🎧 [SCO 回调 #%d] 语音链路已建立（status=0）← 通话音频应开始流向 Mac",
+            self.scoCallbackCount);
     } else {
-        LOG(@"❌ SCO 打开失败：status=%d (%@)", s, describeIOReturn(s));
+        LOG(@"❌ [SCO 回调 #%d] 打开失败：status=%d (%@)",
+            self.scoCallbackCount, s, describeIOReturn(s));
     }
     if (self.verboseAudio) dumpCoreAudioEndpoints(" (SCO 打开后)");
     self.lastState = nil;   // 强制下一拍打印状态
@@ -455,8 +459,9 @@ static void dumpDevice(IOBluetoothDevice *d, BOOL verbose) {
         }
         self.transferAttempts++;
         [self.hf transferAudioToComputer];
-        LOG(@"   transferAudioToComputer 第 %d 次 | isSCOConnected=%d | audio=in%u/out%u",
-            self.transferAttempts, [self.hf isSCOConnected],
+        LOG(@"   → transferAudioToComputer 第 %d 次（void 无返回值；结果看紧随的 SCO 回调 #%d）"
+            @" | isSCOConnected=%d | audio=in%u/out%u",
+            self.transferAttempts, self.scoCallbackCount + 1, [self.hf isSCOConnected],
             (unsigned)[self.dev inputAudioDeviceID], (unsigned)[self.dev outputAudioDeviceID]);
     }];
     [[NSRunLoop currentRunLoop] addTimer:self.transferTimer forMode:NSDefaultRunLoopMode];
@@ -543,11 +548,21 @@ int main(int argc, const char *argv[]) {
 
         if ([mode isEqualToString:@"list"]) {
             NSArray *devs = [IOBluetoothDevice pairedDevices];
-            printf("\n已配对设备 %lu 台：\n", (unsigned long)devs.count);
-            for (IOBluetoothDevice *d in devs) dumpDevice(d, YES);
+            // `pairedDevices` 可能对同一台设备返回多个实例，按地址去重后再逐一探测
+            NSMutableArray *uniq = [NSMutableArray array];
+            NSMutableSet *seen = [NSMutableSet set];
+            for (IOBluetoothDevice *d in devs) {
+                NSString *k = [[d addressString] lowercaseString];
+                if (!k || [seen containsObject:k]) continue;
+                [seen addObject:k];
+                [uniq addObject:d];
+            }
+            printf("\n已配对设备 %lu 台（按地址去重后 %lu 台）：\n",
+                   (unsigned long)devs.count, (unsigned long)uniq.count);
+            for (IOBluetoothDevice *d in uniq) dumpDevice(d, YES);
 
             BOOL foundPhone = NO;
-            for (IOBluetoothDevice *d in devs) {
+            for (IOBluetoothDevice *d in uniq) {
                 if ([d isHandsFreeAudioGateway] || looksLikePhone((uint32_t)[d classOfDevice])) { foundPhone = YES; }
             }
             printf("\n>>> 结论: %s\n", foundPhone

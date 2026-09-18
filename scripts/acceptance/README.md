@@ -51,13 +51,18 @@ cargo build -p vdev-host --release
 ./scripts/acceptance/macos-bluetooth-role-probe.sh hci  --addr <aa:bb:cc:dd:ee:ff>          # 控制器层
 ```
 
-- **行为分级**：`list`/`sdp` 只读不改状态；`hfp` 会真的连手机（可逆，退出即断），
+- **行为分级**：`list` 只读不改状态；`sdp` 只读、不改变持久状态（会向对端发起 SDP 查询
+  并建立 ACL 连接）；`hfp` 会真的连手机（可逆，退出即断），
   叠加 `--dial` 会真的拨号、`--auto-accept` 会真的接听；`hci` 会向控制器发 HCI 命令（不做持久改动）。
 - **产物**：默认编译到 `${TMPDIR:-/tmp}/vdev-bt-probe`（`-OutDir` 覆盖），源文件没变不重编
   （避免每次运行重写二进制导致该路径的身份漂移）。
-- **两个必须记住的坑**：① 判据是"**通话中** SCO 是否 status=0"，无通话时 `connectSCO`
+- **三个必须记住的坑**：① 判据是"**通话中** SCO 是否 status=0"，无通话时 `connectSCO`
   返回 `kIOReturnUnsupported` 属正常，别据此推断"等有通话就好了"；② HCI 那条路上
-  `handle=0` 调用会返回 success 却什么都不做，必须以 `out.connectionHandle != 0` 判成功。
+  `handle=0` 调用会返回 success 却什么都不做，必须以 `out.connectionHandle != 0` 判成功；
+  ③ **阳性对照不能只看返回码**——`BluetoothHCIReadVoiceSetting:` 返回 success 却完全不写
+  out 参数（探针里的"自检 A"就是这条反面教材），通路证明要用"投毒—断言"式的"自检 B"
+  （`ReadLocalName` 把缓冲区覆盖成真值）。另外 `transferAudioToComputer` 是 `- (void)`，
+  失败码来自 `scoConnectionOpened:` 回调而非返回值。
 - **前置条件**：手机需已与该 Mac 配对；若上次会话残留导致 SLC 建不起来，先用 `--reset`
   或把手机蓝牙关→开。
 

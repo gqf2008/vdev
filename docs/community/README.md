@@ -25,4 +25,4 @@
 ## 相关仓库内文档
 
 - `README.md` — 项目总览、构建矩阵与各驱动状态框（**双平台四类设备当前均为 ✅ 已真机实测**）
-- `docs/dev/` — 内部开发笔记：`windows-camera-design.md`、`windows-display-audio-design.md`（Windows 设计/联调）、`macos-route-survey.md`（macOS 路线调研）、`macos-route-ideas.md` / `windows-route-ideas.md`（选题线索）
+- `docs/dev/` — 内部开发笔记：`windows-camera-design.md`、`windows-display-audio-design.md`（Windows 设计/联调）、`macos-route-survey.md`（macOS 路线调研）、`macos-bluetooth-role-survey.md`（macOS 蓝牙角色调研，结论：不可行）、`macos-route-ideas.md` / `windows-route-ideas.md`（选题线索）
