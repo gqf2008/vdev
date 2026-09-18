@@ -36,6 +36,31 @@ cargo build -p vdev-host --release
 
 > 该脚本会**抢走前台焦点**并弹一个探针窗口，整轮约 40–60s；跑之前确认没有别人正在用这台机器。
 
+## macOS 调研探针（蓝牙角色：能不能把 Mac 当手机可识别的耳麦 / 音箱）
+
+`macos-bluetooth-role-probe.sh` + `macos-bluetooth-hfp-probe.m` + `macos-bluetooth-hci-probe.m`
+是 2026-09-18 那轮蓝牙角色调研的产物，**结论与证据链见
+[docs/dev/macos-bluetooth-role-survey.md](../../docs/dev/macos-bluetooth-role-survey.md)**。
+一句话：控制面可用（SLC / 来电显示 / 从 Mac 拨号 / 通话状态），**通话音频拿不到**，
+且 macOS 没有 A2DP Sink —— 「当耳麦」只到"被手机认出来"，「当音箱」完全不可行。
+
+```bash
+./scripts/acceptance/macos-bluetooth-role-probe.sh list                                    # 只读
+./scripts/acceptance/macos-bluetooth-role-probe.sh sdp  "<地址|名字>"                       # 只读
+./scripts/acceptance/macos-bluetooth-role-probe.sh hfp  "<地址|名字>" --audio --seconds 90  # 会连手机
+./scripts/acceptance/macos-bluetooth-role-probe.sh hci  --addr <aa:bb:cc:dd:ee:ff>          # 控制器层
+```
+
+- **行为分级**：`list`/`sdp` 只读不改状态；`hfp` 会真的连手机（可逆，退出即断），
+  叠加 `--dial` 会真的拨号、`--auto-accept` 会真的接听；`hci` 会向控制器发 HCI 命令（不做持久改动）。
+- **产物**：默认编译到 `${TMPDIR:-/tmp}/vdev-bt-probe`（`-OutDir` 覆盖），源文件没变不重编
+  （避免每次运行重写二进制导致该路径的身份漂移）。
+- **两个必须记住的坑**：① 判据是"**通话中** SCO 是否 status=0"，无通话时 `connectSCO`
+  返回 `kIOReturnUnsupported` 属正常，别据此推断"等有通话就好了"；② HCI 那条路上
+  `handle=0` 调用会返回 success 却什么都不做，必须以 `out.connectionHandle != 0` 判成功。
+- **前置条件**：手机需已与该 Mac 配对；若上次会话残留导致 SLC 建不起来，先用 `--reset`
+  或把手机蓝牙关→开。
+
 ## 前置条件
 
 - Windows 10/11 x64；安装自签内核驱动需要 `bcdedit /set testsigning on` + 重启

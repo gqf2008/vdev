@@ -12,6 +12,7 @@ cd "$REPO_ROOT"
 
 bash -n scripts/acceptance/macos-hid-type-verify.sh
 bash -n scripts/acceptance/macos-hid-access-verify.sh
+bash -n scripts/acceptance/macos-bluetooth-role-probe.sh
 bash -n crates/vdev-audio/test_loopback.sh
 
 if ! command -v swiftc >/dev/null 2>&1; then
@@ -19,6 +20,16 @@ if ! command -v swiftc >/dev/null 2>&1; then
   exit 1
 fi
 swiftc -O -typecheck scripts/acceptance/macos-hid-type-probe.swift
+
+# 蓝牙调研探针（issue bt-role-survey-1）是 ObjC 源码，只在这里做类型检查：
+# 它们调用 IOBluetooth 的公开 + 私有方法，头文件/签名写错只有编译期能暴露。
+# 这两个探针是实现的一部分（不是测试桩），语法腐烂必须在这里变红。
+if ! command -v clang >/dev/null 2>&1; then
+  echo "FAIL: 未找到 clang（编译 macos-bluetooth-*-probe.m 需要 Xcode command line tools）" >&2
+  exit 1
+fi
+clang -fsyntax-only -fobjc-arc scripts/acceptance/macos-bluetooth-hfp-probe.m
+clang -fsyntax-only -fobjc-arc scripts/acceptance/macos-bluetooth-hci-probe.m
 
 # 语义守护：每条断言都对应一次真实事故；删掉对应实现时这里必须红。
 require_grep() {

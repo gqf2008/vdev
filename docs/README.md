@@ -39,6 +39,7 @@
 | [windows-route-ideas.md](dev/windows-route-ideas.md) | Windows 侧"值得写"的内容线索（选题阶段） | 选题笔记，非约定 |
 | [windows-camera-design.md](dev/windows-camera-design.md) | Windows 虚拟摄像头（DirectShow）设计与踩坑 | 实现已合入，文中为设计/联调过程 |
 | [windows-display-audio-design.md](dev/windows-display-audio-design.md) | Windows 虚拟显示器 + 虚拟声卡（驱动路线）设计 | 实现已合入并真机验证（2026-09-14）；文中为设计过程 |
+| [macos-bluetooth-role-survey.md](dev/macos-bluetooth-role-survey.md) | macOS 蓝牙角色调研：能否把 Mac 仿真成手机可识别的蓝牙耳麦 / 音箱 | **结论已定**：耳麦只到控制面（音频面被苹果删）、音箱不可行；探针可复现，不再投入 |
 
 > Windows 四类设备（摄像头 / 显示器 / 声卡 / 键鼠）均已在 Win10 19045 x64 上装机验证，
 > 但`dev/` 下的笔记**保持写作时的口径**（反映当时的决策与踩坑），不随验证结论回改；
