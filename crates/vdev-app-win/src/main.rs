@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use slint::Model as _;
+use vdev_app_win::dsp_ui::{self, DspParams};
 use vdev_app_win::{next_push_action, PushAction};
 
 slint::include_modules!();
@@ -54,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     refresh_display_status(&ui, &logs);
     refresh_audio_status(&ui, &logs);
     refresh_hid_status(&ui, &logs);
+    init_dsp_ui(&ui);
 
     ui.run()?;
     // 退出时确保推流线程停止。
@@ -745,6 +748,293 @@ fn refresh_display_status(ui: &MainWindow, logs: &Logs) {
     }
 }
 
+// ---------------------------------------------------------------- 音频增强（DSP）
+//
+// 面板上的每个控件都直接驱动 vdev-dsp：曲线用 GraphicEq::magnitude_response_db
+// 的真实系数逐点求值，离线渲染走 GraphicEq → Leveling → Limiter 三级链路。
+
+/// 曲线画布内层像素尺寸（与 ui/main.slint 里 Path 的 width/height 一致）。
+const DSP_CURVE_W: f32 = 556.0;
+const DSP_CURVE_H: f32 = 136.0;
+/// 曲线纵轴范围（dB）。
+const DSP_CURVE_DB_MIN: f64 = -12.0;
+const DSP_CURVE_DB_MAX: f64 = 12.0;
+/// 频响曲线预览用的采样率（正式离线渲染跟随被渲染文件的采样率）。
+const DSP_PREVIEW_SAMPLE_RATE: f64 = 48_000.0;
+
+/// 频点标签：31 / 62 / 125 / 1k / 2k …
+fn band_label(hz: f64) -> String {
+    if hz >= 1000.0 {
+        let k = hz / 1000.0;
+        if (k - k.round()).abs() < 0.05 {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        format!("{hz:.0}")
+    }
+}
+
+/// 从 UI 读回 10 段增益（dB）。
+fn dsp_gains_from_ui(ui: &MainWindow) -> [f64; dsp_ui::EQ_BANDS] {
+    let model = ui.global::<AppState>().get_eq_gains();
+    let mut out = [0.0_f64; dsp_ui::EQ_BANDS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = f64::from(model.row_data(i).unwrap_or(0.0));
+    }
+    out
+}
+
+/// 把面板上的全部参数收拢成 `DspParams`（越界/手输错的值统一夹到合法范围）。
+fn dsp_params_from_ui(ui: &MainWindow) -> DspParams {
+    let g = ui.global::<AppState>();
+    DspParams {
+        gains_db: dsp_gains_from_ui(ui),
+        eq_bypass: g.get_eq_bypass(),
+        leveling_enabled: g.get_leveling_on(),
+        target_lufs: num_or(&g.get_target_lufs(), -14.0),
+        limiter_enabled: g.get_limiter_on(),
+        ceiling_db: num_or(&g.get_ceiling_db(), -1.0),
+        sample_rate: DSP_PREVIEW_SAMPLE_RATE,
+    }
+    .clamped()
+}
+
+/// 用 vdev-dsp 的真实系数重算频响曲线并推给 UI。
+///
+/// 曲线不是画出来的、也不是写死的数组：每个频点都调
+/// `GraphicEq::magnitude_response_db`（同一批 biquad 系数）求值。滑块一动就重算。
+fn refresh_dsp_curve(ui: &MainWindow) {
+    let p = dsp_params_from_ui(ui);
+    let path = dsp_ui::curve_path(
+        &p,
+        DSP_CURVE_W,
+        DSP_CURVE_H,
+        DSP_CURVE_DB_MIN,
+        DSP_CURVE_DB_MAX,
+    );
+    let peak = p.gains_db.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let trough = p.gains_db.iter().copied().fold(f64::INFINITY, f64::min);
+    let note = if p.eq_bypass {
+        "EQ 旁路：整链恒等，频响平直于 0 dB".to_string()
+    } else if peak.abs() < 1.0e-9 && trough.abs() < 1.0e-9 {
+        "全 0 增益：频响平直于 0 dB".to_string()
+    } else {
+        format!(
+            "增益 {trough:+.1} .. {peak:+.1} dB · {} 点 · {:.0} Hz（vdev-dsp GraphicEq 系数）",
+            dsp_ui::CURVE_POINTS,
+            p.sample_rate
+        )
+    };
+    let g = ui.global::<AppState>();
+    g.set_dsp_curve_path(path.into());
+    g.set_dsp_curve_note(note.into());
+}
+
+/// 把 10 段增益一次性写成同一个值（「全部归零」）。
+fn set_all_gains(ui: &MainWindow, value: f32) {
+    let model = ui.global::<AppState>().get_eq_gains();
+    for i in 0..dsp_ui::EQ_BANDS {
+        model.set_row_data(i, value);
+    }
+}
+
+/// 启动时初始化 DSP 面板：频点标签直接取 vdev-dsp 的默认网格（UI 侧不另写频率表）。
+fn init_dsp_ui(ui: &MainWindow) {
+    let labels: Vec<slint::SharedString> = dsp_ui::eq_band_frequencies_hz(DSP_PREVIEW_SAMPLE_RATE)
+        .iter()
+        .map(|f| band_label(*f).into())
+        .collect();
+    let g = ui.global::<AppState>();
+    g.set_eq_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
+    g.set_eq_gains(slint::ModelRc::new(slint::VecModel::from(vec![
+        0.0_f32;
+        dsp_ui::EQ_BANDS
+    ])));
+    refresh_dsp_curve(ui);
+}
+
+/// 输出路径留空时的默认值：输入同目录下的 `<名字>_dsp.wav`。
+fn default_output_path(input: &str) -> String {
+    let p = Path::new(input);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    let dir = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("{stem}_dsp.wav"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 后台生成示例素材（零依赖合成：多音节目 + 轻节目 + 白噪声），供离线渲染对比。
+fn spawn_make_demo_wav(ui: &MainWindow, logs: &Logs) {
+    let path_s = std::env::temp_dir()
+        .join("vdev-dsp-demo.wav")
+        .to_string_lossy()
+        .into_owned();
+    append_log(
+        ui,
+        logs,
+        format!("生成示例 wav：{path_s}（48 kHz / 立体声 / 6 s）"),
+    );
+    let weak = ui.as_weak();
+    let logs2 = logs.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vdev-app-win-dsp-demo".into())
+        .spawn(move || {
+            let res = dsp_ui::synth_demo_wav(&path_s);
+            let weak2 = weak.clone();
+            let logs3 = logs2.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak2.upgrade() else { return };
+                match res {
+                    Ok(data) => {
+                        let g = ui.global::<AppState>();
+                        g.set_render_input(path_s.clone().into());
+                        if g.get_render_output().trim().is_empty() {
+                            g.set_render_output(default_output_path(&path_s).into());
+                        }
+                        g.set_render_result(
+                            format!(
+                                "示例素材已生成：{} Hz / {} 声道 / {} 帧（{:.2} s）。点「渲染并测量」跑整链。",
+                                data.sample_rate,
+                                data.channels,
+                                data.frames(),
+                                data.frames() as f64 / f64::from(data.sample_rate)
+                            )
+                            .into(),
+                        );
+                        append_log(&ui, &logs3, "✅ 示例 wav 已生成");
+                    }
+                    Err(e) => append_log(&ui, &logs3, format!("❌ 生成示例 wav 失败：{e}")),
+                }
+            });
+        });
+    if spawned.is_err() {
+        append_log(ui, logs, "❌ 创建示例素材线程失败");
+    }
+}
+
+/// 系统「打开文件」对话框挑 wav（PowerShell + WinForms，零第三方依赖）。
+fn spawn_pick_wav(ui: &MainWindow, logs: &Logs) {
+    let weak = ui.as_weak();
+    let logs2 = logs.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vdev-app-win-dsp-pick".into())
+        .spawn(move || {
+            let script = "Add-Type -AssemblyName System.Windows.Forms;\
+                $d = New-Object System.Windows.Forms.OpenFileDialog;\
+                $d.Filter = 'WAV 音频 (*.wav)|*.wav|所有文件 (*.*)|*.*';\
+                $d.Title = '选择要渲染的 wav';\
+                if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.FileName) }";
+            let picked = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-STA", "-Command", script])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            let weak2 = weak.clone();
+            let logs3 = logs2.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak2.upgrade() else { return };
+                match picked {
+                    Some(p) => {
+                        let g = ui.global::<AppState>();
+                        g.set_render_input(p.clone().into());
+                        if g.get_render_output().trim().is_empty() {
+                            g.set_render_output(default_output_path(&p).into());
+                        }
+                        append_log(&ui, &logs3, format!("已选择 wav：{p}"));
+                    }
+                    None => append_log(
+                        &ui,
+                        &logs3,
+                        "⚠️ 未选择文件（或系统对话框不可用：可直接手输路径或点「生成示例 wav」）",
+                    ),
+                }
+            });
+        });
+    if spawned.is_err() {
+        append_log(ui, logs, "❌ 创建文件选择线程失败");
+    }
+}
+
+/// 离线渲染：读 wav → 整链（EQ → 响度归一化 → 限幅）→ 写 wav + 测量。
+/// 跑在后台线程，结果回事件循环；面板上的参数就是本次渲染用的参数。
+fn spawn_dsp_render(ui: &MainWindow, logs: &Logs) {
+    let input = ui
+        .global::<AppState>()
+        .get_render_input()
+        .trim()
+        .to_string();
+    if input.is_empty() {
+        ui.global::<AppState>()
+            .set_render_result("请先选择或输入一个 wav 路径（可点「生成示例 wav」）。".into());
+        append_log(ui, logs, "⚠️ 未指定输入 wav");
+        return;
+    }
+    let out_field = ui
+        .global::<AppState>()
+        .get_render_output()
+        .trim()
+        .to_string();
+    let output = if out_field.is_empty() {
+        default_output_path(&input)
+    } else {
+        out_field
+    };
+    let params = dsp_params_from_ui(ui);
+    ui.global::<AppState>().set_render_busy(true);
+    ui.global::<AppState>()
+        .set_render_result(format!("渲染中…\n输入 {input}\n输出 {output}").into());
+    append_log(ui, logs, format!("DSP 离线渲染：{input} → {output}"));
+
+    let weak = ui.as_weak();
+    let logs2 = logs.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vdev-app-win-dsp-render".into())
+        .spawn(move || {
+            let result = dsp_ui::render_file(&input, &output, &params);
+            let weak2 = weak.clone();
+            let logs3 = logs2.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak2.upgrade() else { return };
+                ui.global::<AppState>().set_render_busy(false);
+                match result {
+                    Ok(r) => {
+                        ui.global::<AppState>().set_render_result(r.summary().into());
+                        append_log(
+                            &ui,
+                            &logs3,
+                            format!(
+                                "✅ 渲染完成：输出 RMS {:.2} dBFS / 真峰值 {:.2} dBTP / 伺服 {:+.2} dB",
+                                r.out_rms_dbfs, r.out_true_peak_dbtp, r.final_servo_gain_db
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        ui.global::<AppState>()
+                            .set_render_result(format!("渲染失败：{e}").into());
+                        append_log(&ui, &logs3, format!("❌ DSP 渲染失败：{e}"));
+                    }
+                }
+            });
+        });
+    if let Err(e) = spawned {
+        ui.global::<AppState>().set_render_busy(false);
+        ui.global::<AppState>()
+            .set_render_result(format!("创建渲染线程失败：{e}").into());
+        append_log(ui, logs, format!("创建渲染线程失败: {e}"));
+    }
+}
+
 fn wire_ui(ui: &MainWindow, logs: &Logs) {
     {
         let weak = ui.as_weak();
@@ -964,6 +1254,105 @@ fn wire_ui(ui: &MainWindow, logs: &Logs) {
                 &ui,
                 &logs,
             );
+        });
+    }
+    // ---- 音频增强（DSP）：控件改动即时重算频响曲线（真实 vdev-dsp 系数） ----
+    {
+        let weak = ui.as_weak();
+        ui.on_dsp_eq_changed(move |idx, value| {
+            let Some(ui) = weak.upgrade() else { return };
+            let clamped = f64::from(value).clamp(dsp_ui::MIN_GAIN_DB, dsp_ui::MAX_GAIN_DB) as f32;
+            let model = ui.global::<AppState>().get_eq_gains();
+            model.set_row_data(idx.max(0) as usize, clamped);
+            refresh_dsp_curve(&ui);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_bypass_toggled(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let g = ui.global::<AppState>();
+            let on = !g.get_eq_bypass();
+            g.set_eq_bypass(on);
+            refresh_dsp_curve(&ui);
+            append_log(
+                &ui,
+                &logs,
+                if on {
+                    "EQ 旁路：开（整链恒等）"
+                } else {
+                    "EQ 旁路：关"
+                },
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_zero_all(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            set_all_gains(&ui, 0.0);
+            refresh_dsp_curve(&ui);
+            append_log(&ui, &logs, "EQ 全部归零");
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_leveling_toggled(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let g = ui.global::<AppState>();
+            append_log(
+                &ui,
+                &logs,
+                format!(
+                    "响度归一化：{} · 目标 {} LUFS",
+                    if g.get_leveling_on() { "开" } else { "关" },
+                    g.get_target_lufs()
+                ),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_limiter_toggled(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let g = ui.global::<AppState>();
+            append_log(
+                &ui,
+                &logs,
+                format!(
+                    "真峰值限幅：{} · ceiling {} dBFS",
+                    if g.get_limiter_on() { "开" } else { "关" },
+                    g.get_ceiling_db()
+                ),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_pick_wav(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            spawn_pick_wav(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_make_demo(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            spawn_make_demo_wav(&ui, &logs);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let logs = logs.clone();
+        ui.on_dsp_render(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            spawn_dsp_render(&ui, &logs);
         });
     }
 }
