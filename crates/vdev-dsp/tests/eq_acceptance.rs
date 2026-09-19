@@ -12,7 +12,7 @@ mod common;
 use common::*;
 use vdev_dsp::{band_frequencies, GraphicEq, MAX_BAND_FREQ, MAX_GAIN_DB, MIN_BAND_FREQ};
 
-/// 旁路必须是逐位恒等（误差 0，而不是「小于 1e-6」）。
+/// 旁路必须是逐位恒等：每个样点的**位型**都相同（误差恒为 0），而不是「小于 1e-6」。
 #[test]
 fn bypass_is_bitwise_identity() {
     let mut eq = GraphicEq::new(FS, 2, 10);
@@ -30,6 +30,14 @@ fn bypass_is_bitwise_identity() {
         .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
         .fold(0.0_f64, f64::max);
     assert!(max_err < 1e-6, "旁路误差 {max_err}");
+    // 名实相符的强断言：逐位比较（含 -0.0 / NaN 的位型），严于上面的容差断言
+    for (i, (a, b)) in buf.iter().zip(before.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "第 {i} 个样点不是逐位恒等: {a} vs {b}"
+        );
+    }
     assert_eq!(eq.magnitude_response(1000.0), 1.0);
 }
 
